@@ -1,0 +1,335 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage[spanish,es-noshorthands]{babel}
+\usepackage[margin=2.5cm]{geometry}
+\usepackage{amsmath,amssymb,amsthm,mathtools}
+\usepackage{enumitem}
+\usepackage{booktabs}
+\usepackage{microtype}
+
+% ------------------------------------------------------------------ %
+%  Notación                                                          %
+% ------------------------------------------------------------------ %
+\newcommand{\indic}[1]{\mathbf{1}\!\left[#1\right]}
+\newcommand{\opera}{\operatorname{opera}}
+\newcommand{\dur}{\operatorname{dur}}
+\newcommand{\noct}{\operatorname{noct}}
+\newcommand{\tipo}{\operatorname{tipo}}
+\newcommand{\reqq}{\operatorname{req}}
+\newcommand{\dem}{\operatorname{dem}}
+\newcommand{\munf}{\operatorname{mun}}
+\newcommand{\fest}{\operatorname{fest}}
+\newcommand{\eleg}{\operatorname{eleg}}
+\newcommand{\avail}{\operatorname{disp}}
+\newcommand{\canDo}{\operatorname{canDo}}
+\newcommand{\wkd}{\operatorname{wd}}
+\newcommand{\sem}{\operatorname{sem}}
+\newcommand{\coef}{\operatorname{coef}}
+\newcommand{\work}{\mathit{trab}}
+\newcommand{\load}{\mathit{carga}}
+\newcommand{\dev}{\mathit{desv}}
+\newcommand{\Dom}{\mathcal{D}}
+\newcommand{\Wk}{\mathcal{W}}
+\newcommand{\Sk}{\mathcal{S}}
+\newcommand{\Zk}{\mathcal{Z}}
+\newcommand{\Qk}{\mathcal{Q}}
+\newcommand{\Mk}{\mathcal{M}}
+\newcommand{\Wfij}{\Wk_{\mathrm{fij}}}
+\newcommand{\Wpat}{\Wk_{\mathrm{pat}}}
+\newcommand{\Wcor}{\Wk_{\mathrm{cor}}}
+\newcommand{\Wmix}{\Wk_{\mathrm{mix}}}
+\newcommand{\Lv}{\mathrm{L\text{-}V}}
+\newcommand{\Rmin}{R_{\min}}
+\newcommand{\Hsiete}{H_{7}}
+\newcommand{\Cmax}{C_{\max}}
+\newcommand{\Hmin}{H_{\min}}
+\newcommand{\Hmax}{H_{\max}}
+\newcommand{\posp}[1]{\left(#1\right)^{+}}
+
+\theoremstyle{definition}
+\newtheorem{obs}{Observación}
+
+\title{\bfseries Modelo matemático para la generación de cuadrantes anuales\\[2pt]
+\large Transporte sanitario no urgente}
+\author{}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+\noindent
+Se formaliza el problema de construir un calendario anual que asigne a cada trabajador
+un turno cada día, respetando la legalidad laboral y las vacaciones, cubriendo la demanda
+de servicio del mejor modo posible y repartiendo de forma equitativa las cargas indeseables.
+El modelo es un programa lineal entero (resoluble con \textsc{CP-SAT}) con objetivo
+\emph{lexicográfico}. Se diseña en dos capas: un esqueleto congelado (patrones rotatorios y
+fijos) y una capa de reparación que solo decide las perturbaciones. La descomposición por
+horizonte rodante que se emplea para resolverlo \emph{no altera} la formulación.
+\end{abstract}
+
+\section{Conjuntos e índices}
+
+\begin{itemize}[leftmargin=2.2em]
+  \item $\Dom=\{0,1,\dots,H-1\}$: días del horizonte, cada uno con una fecha real. Se
+    derivan $\wkd(d)\in\{\mathrm{L},\mathrm{M},\mathrm{X},\mathrm{J},\mathrm{V},\mathrm{S},\mathrm{D}\}$
+    (día de la semana) y $\sem(d)=\big\lfloor (d-d_{0})/7\big\rfloor$, el índice de semana
+    respecto a un \emph{lunes ancla global} $d_{0}$. Sea $\Omega=\sem(\Dom)$ el conjunto de
+    semanas (bloques lunes--domingo).
+  \item $\Wk=\Wfij\,\dot\cup\,\Wpat\,\dot\cup\,\Wcor\,\dot\cup\,\Wmix$: trabajadores
+    (fijos, de patrón, correturnos e híbridos fijo--finde).
+  \item $\Sk$: líneas de turno. La ausencia de asignación (\emph{libre}) no es una línea.
+  \item $\Zk$: municipios. \quad $\Qk$: cualificaciones.
+  \item $\Mk=\{\textsf{noche},\textsf{finde},\textsf{festivo},\textsf{24h},\textsf{partido}\}$:
+    cargas indeseables cuyo reparto se equilibra.
+\end{itemize}
+
+\section{Parámetros}
+
+\subsection{Datos brutos}
+Por línea $s\in\Sk$: municipio $\munf(s)\in\Zk$; flags de operación
+$a_{lv}(s),a_{sab}(s),a_{dom}(s),a_{fest}(s)\in\{0,1\}$; horas de entrada y salida
+$e(s),o(s)$; cualificación requerida $\reqq(s)\in\Qk\cup\{\varnothing\}$; dotación
+$\dem(s)\in\mathbb{Z}_{\ge 1}$; indicador de turno partido $\mathrm{part}(s)\in\{0,1\}$.
+Por festivo: $\fest(d,z)\in\{0,1\}$, que vale $1$ si la fecha de $d$ aparece con ámbito
+$z$ o con ámbito \textsf{Común}.
+Por trabajador: su tipo, municipios admisibles $Z(w)\subseteq\Zk$, cualificaciones
+$Q(w)\subseteq\Qk$ y dos quincenas de vacaciones.
+
+\subsection{Magnitudes derivadas}
+\begin{align}
+  \dur(s) &= \big(o(s)-e(s)\big)\bmod 24, \\
+  \noct(s) &= \big|\,[e(s),\,e(s)+\dur(s)]\cap([22,30]\cup[46,48])\,\big|
+    \quad\text{(solape con 22:00--06:00)},\\
+  \tipo(s) &\in\{\textsf{mañana},\textsf{tarde},\textsf{noche},\textsf{24h},\textsf{partido}\}
+    \quad\text{(de $e,o,\dur$; \textsf{partido} de $\mathrm{part}$).}
+\end{align}
+La \emph{operatividad} de una línea cada día (el festivo tiene precedencia sobre el día de
+la semana):
+\begin{equation}\label{eq:opera}
+  \opera(s,d)=
+  \begin{cases}
+    a_{fest}(s) & \text{si } \fest\big(d,\munf(s)\big)=1,\\[2pt]
+    a_{lv}(s)   & \text{si } \fest\big(d,\munf(s)\big)=0 \;\wedge\; \wkd(d)\in\Lv,\\[2pt]
+    a_{sab}(s)  & \text{si } \fest\big(d,\munf(s)\big)=0 \;\wedge\; \wkd(d)=\mathrm{S},\\[2pt]
+    a_{dom}(s)  & \text{si } \fest\big(d,\munf(s)\big)=0 \;\wedge\; \wkd(d)=\mathrm{D}.
+  \end{cases}
+\end{equation}
+Disponibilidad $\avail(w,d)\in\{0,1\}$, con $\avail(w,d)=0$ en las quincenas de vacaciones
+o baja. Cualificación y localización:
+\begin{equation}\label{eq:cando}
+  \canDo(w,s)=\indic{\big(\reqq(s)=\varnothing \;\vee\; \reqq(s)\in Q(w)\big)\;\wedge\;\munf(s)\in Z(w)}.
+\end{equation}
+
+\subsection{Elegibilidad estructural por tipo de trabajador}
+La novedad central que vertebra los tipos de trabajador es hacer la elegibilidad
+\emph{dependiente del día}. Se escribe
+\begin{equation}\label{eq:eleg}
+  \eleg(w,d,s)=\canDo(w,s)\,\wedge\,\chi(w,d,s),
+\end{equation}
+donde el factor estructural $\chi$ es, según el tipo de $w$:
+\begin{center}
+\renewcommand{\arraystretch}{1.35}
+\begin{tabular}{@{}ll@{}}
+\toprule
+Tipo & $\chi(w,d,s)$ \\
+\midrule
+Correturno ($w\in\Wcor$) & $1$ \\
+Fijo ($w\in\Wfij$) & $\indic{s=\varphi(w)}$, con $\varphi(w)$ su línea constante \\
+Patrón ($w\in\Wpat$) & $1$ \;(la estructura la imponen \eqref{eq:C8b} y \eqref{eq:C10} vía $\pi$) \\
+Híbrido ($w\in\Wmix$) &
+  $\begin{cases}
+     \indic{s=\varphi_{\Lv}(w)} & \wkd(d)\in\Lv \\
+     \indic{s\in A_{\mathrm{S}}(w)} & \wkd(d)=\mathrm{S} \\
+     \indic{s\in A_{\mathrm{D}}(w)} & \wkd(d)=\mathrm{D}
+   \end{cases}$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+Para el híbrido, $\varphi_{\Lv}(w)$ es su línea fija entre semana (una sola localización) y
+$A_{\mathrm{S}}(w),A_{\mathrm{D}}(w)\subseteq\Sk$ son los conjuntos de líneas de sábado y
+domingo que puede cubrir. Como una línea ya codifica día, municipio, franja horaria y
+cualificación, estos conjuntos capturan sin ambigüedad ``solo sábados''
+($A_{\mathrm{D}}(w)=\varnothing$), las localizaciones de finde admisibles y cualquier
+restricción horaria (basta no incluir las líneas que la violan).
+
+\subsection{Esqueleto del patrón}
+Un patrón $p$ con $T_{p}$ filas tiene una matriz base
+$B_{p}:\{0,\dots,T_{p}-1\}\times\{\mathrm{L},\dots,\mathrm{D}\}\to\Sk\cup\{\textsf{libre}\}$
+que \emph{rota una fila por semana}. Si $w\in\Wpat$ pertenece al patrón $p$ con desfase
+inicial $r_{0}(w)$, su esqueleto es
+\begin{equation}\label{eq:pi}
+  \pi(w,d)=B_{p}\!\Big[\big(r_{0}(w)+\sem(d)\big)\bmod T_{p},\ \wkd(d)\Big].
+\end{equation}
+Como cada trabajador recorre las $T_{p}$ filas una vez por ciclo, todos los del patrón
+soportan idéntica carga por ciclo: \emph{equidad por construcción}.
+
+\subsection{Parámetros legales y de criticidad}
+$\Rmin$ (descanso entre jornadas), $\Hsiete$ (horas máximas en $7$ días), $\Cmax$ (días
+consecutivos), $\rho$ (días de descanso tras una guardia de $24$\,h), $[\Hmin,\Hmax]$
+(jornada anual), $\theta_{w}\in[0,1]$ (fracción de disponibilidad anual de $w$). Además
+$\kappa_{s}>0$ es el \emph{peso de criticidad} de no cubrir la línea $s$ (24h $>$ noche $>$
+tarde/partido $>$ mañana).
+
+\section{Variables de decisión}
+
+\begin{align}
+  x_{w,d,s} &\in\{0,1\}, &&(w,d,s)\in\Delta:=\big\{(w,d,s):\ \eleg(w,d,s)\wedge\opera(s,d)\wedge\avail(w,d)\big\},\\
+  \work_{w,d} &= \textstyle\sum_{s:(w,d,s)\in\Delta} x_{w,d,s}\ \in\{0,1\}, && \forall w\in\Wk,\ d\in\Dom,\\
+  u_{s,d} &\in\mathbb{Z}_{\ge 0}, && \forall (s,d):\ \opera(s,d)=1 \quad\text{(holgura de cobertura)},\\
+  \dev_{w,d} &\in\{0,1\}, && \text{(desvío respecto del patrón).}
+\end{align}
+La variable $x_{w,d,s}$ \emph{solo se crea} para las ternas admisibles $\Delta$; así la
+elegibilidad, la operatividad y la disponibilidad quedan impuestas por el propio dominio.
+
+\begin{obs}[Indexación a dos índices]
+Definir una instancia de turno $j=(s,d)$ por cada par operativo y usar $x_{i,j}$ es
+exactamente este modelo con $\Delta$ como soporte: cada columna $j$ es un par $(s,d)$ con
+$\opera(s,d)=1$. La cobertura se lee entonces como un problema de asignación,
+$\sum_{i}x_{i,j}+u_{j}=\dem_{j}$, pero el eje temporal $d$ debe conservarse porque las
+restricciones de secuencia \eqref{eq:C4}--\eqref{eq:C7} y \eqref{eq:C11} agrupan las
+instancias por día y por semana.
+\end{obs}
+
+\section{Restricciones duras}
+
+\begin{align}
+  &\textbf{(C1) Cobertura con holgura:} &&
+    \sum_{w:(w,d,s)\in\Delta} x_{w,d,s} + u_{s,d} = \dem(s),
+    && \forall (s,d):\opera(s,d)=1. \label{eq:C1}\\[2pt]
+  &\textbf{(C2) Un turno por día:} &&
+    \sum_{s:(w,d,s)\in\Delta} x_{w,d,s} \le 1, && \forall w,d. \label{eq:C2}\\[2pt]
+  &\textbf{(C3) Cualif./disp./elegibilidad:} && \text{impuesta por } \Delta. \label{eq:C3}
+\end{align}
+
+\noindent\textbf{(C4) Descanso mínimo entre jornadas.} Para días consecutivos $d,d+1$ y
+líneas $s,s'$ con hueco insuficiente,
+\begin{equation}\label{eq:C4}
+  x_{w,d,s}+x_{w,d+1,s'}\le 1
+  \qquad\text{si}\quad
+  \underbrace{\big(24+e(s')\big)-\big(e(s)+\dur(s)\big)}_{\text{horas de descanso}}<\Rmin .
+\end{equation}
+En particular esto restringe las costuras viernes$\to$sábado y domingo$\to$lunes del
+trabajador híbrido: si la línea de finde elegida es incompatible con $\varphi_{\Lv}(w)$ el
+día laborable contiguo, \eqref{eq:C4} obliga a librar ese día, que coincide con el descanso
+compensatorio de \eqref{eq:C11hib}.
+
+\begin{align}
+  &\textbf{(C5) Días consecutivos:} &&
+    \sum_{j=0}^{\Cmax}\work_{w,d+j}\le \Cmax, && \forall w,\ \forall d. \label{eq:C5}\\[2pt]
+  &\textbf{(C6) Horas en 7 días:} &&
+    \sum_{j=0}^{6}\ \sum_{s:(w,d+j,s)\in\Delta}\dur(s)\,x_{w,d+j,s}\le \Hsiete,
+    && \forall w,\ \forall d. \label{eq:C6}\\[2pt]
+  &\textbf{(C7) Descanso tras 24\,h:} &&
+    \rho\,x_{w,d,s_{24}}+\sum_{j=1}^{\rho}\work_{w,d+j}\le \rho,
+    && \forall w,\ \forall d,\ \forall s_{24}\!: \tipo(s_{24})=\textsf{24h}. \label{eq:C7}
+\end{align}
+
+\noindent\textbf{(C8) Fijos congelados.}
+\begin{equation}\label{eq:C8b}
+  x_{w,d,\varphi(w)}=1 \qquad \forall w\in\Wfij,\ \forall d:\ \opera(\varphi(w),d)\wedge\avail(w,d).
+\end{equation}
+
+\noindent\textbf{(C9) Jornada anual.}
+\begin{equation}\label{eq:C9}
+  \Hmin\,\theta_{w}\ \le\ \sum_{d\in\Dom}\ \sum_{s:(w,d,s)\in\Delta}\dur(s)\,x_{w,d,s}\ \le\ \Hmax\,\theta_{w},
+  \qquad \forall w.
+\end{equation}
+
+\noindent\textbf{(C10) Congelado de la capa 2.} Sea $P\subseteq\Wpat\times\Dom$ el conjunto
+de pares perturbados (por vacaciones, guardias de 24\,h o huecos de cobertura). Para
+$w\in\Wpat$ y $(w,d)\notin P$,
+\begin{equation}\label{eq:C10}
+  \begin{cases}
+    x_{w,d,\pi(w,d)}=1 & \text{si } \pi(w,d)\neq\textsf{libre},\\
+    \work_{w,d}=0 & \text{si } \pi(w,d)=\textsf{libre}.
+  \end{cases}
+\end{equation}
+Solo se liberan las variables de los pares perturbados; el resto queda fijado al patrón.
+Esto es lo que hace tratable el horizonte anual.
+
+\noindent\textbf{(C11) Descanso compensatorio (tope semanal).}
+\begin{equation}\label{eq:C11}
+  \sum_{d:\ \sem(d)=\omega}\work_{w,d}\ \le\ 5, \qquad \forall w\in\Wk,\ \forall \omega\in\Omega.
+\end{equation}
+\begin{obs}
+La regla ``$\ge 1$ día libre entre semana si trabaja sábado o domingo, $\ge 2$ si ambos''
+equivale exactamente a \eqref{eq:C11}: como la semana $\omega$ es el bloque lunes--domingo
+anclado en $d_{0}$, los días de finde comparten semana con los laborables que los preceden,
+y un tope duro de $5$ fuerza el descanso \emph{dentro de la misma semana} (nunca en la
+siguiente).
+\end{obs}
+
+\subsection{Restricción específica del trabajador híbrido}
+Para $w\in\Wmix$ y cada semana $\omega$, sea
+$n_{\Lv}(w,\omega)=\big|\{d:\sem(d)=\omega,\ \wkd(d)\in\Lv,\ \opera(\varphi_{\Lv}(w),d),\ \avail(w,d)\}\big|$
+el número de laborables operativos de su línea. Se impone
+\begin{equation}\label{eq:C11hib}
+  \sum_{\substack{d:\ \sem(d)=\omega\\ \wkd(d)\in\Lv}} x_{w,d,\varphi_{\Lv}(w)}
+  \;=\; n_{\Lv}(w,\omega)\;-\;\big(\work_{w,d_{\mathrm S}(\omega)}+\work_{w,d_{\mathrm D}(\omega)}\big),
+\end{equation}
+donde $d_{\mathrm S}(\omega),d_{\mathrm D}(\omega)$ son el sábado y el domingo de $\omega$.
+Es decir: cubre su línea todos los laborables salvo un día por cada día de finde trabajado.
+\eqref{eq:C11hib} implica \eqref{eq:C11} para $w$ y obliga a no faltar gratuitamente a su línea.
+
+\section{Función objetivo lexicográfica}
+
+Para cada carga $m\in\Mk$ se define la carga por trabajador y su dispersión sobre el conjunto
+de equidad $\Wk_{\mathrm{eq}}=\Wk\setminus\Wfij$ (los fijos no compiten por las cargas):
+\begin{equation}
+  \load_{w,m}=\sum_{(w,d,s)\in\Delta}\coef(m,s,d)\,x_{w,d,s},
+  \qquad
+  \Delta_{m}= \max_{w\in\Wk_{\mathrm{eq}}}\load_{w,m}\;-\;\min_{w\in\Wk_{\mathrm{eq}}}\load_{w,m},
+\end{equation}
+con $\coef(\textsf{noche},s,d)=\indic{\tipo(s)=\textsf{noche}}$,
+$\coef(\textsf{finde},s,d)=\indic{\wkd(d)\in\{\mathrm S,\mathrm D\}}$,
+$\coef(\textsf{festivo},s,d)=\indic{\fest(d,\munf(s))=1}$, etc. Los rangos $\Delta_{m}$ se
+linealizan con $\max/\min$ enteros.
+
+Las prioridades se resuelven \emph{en orden} (no como suma ponderada entre niveles):
+\begin{alignat}{2}
+  &\text{(P1) Cobertura ponderada:} &\quad& \min\ \sum_{(s,d)}\kappa_{s}\,u_{s,d}. \label{eq:P1}\\
+  &\text{(P2) Equidad:} && \min\ \sum_{m\in\Mk}\lambda_{m}\,\Delta_{m}. \label{eq:P2}\\
+  &\text{(P3) Estabilidad de localización:} && \min\ \sum_{w\in\Wk}\sum_{\omega\in\Omega}\posp{\mu_{w,\omega}-1}, \label{eq:P3}\\
+  &\text{(P4) Coste:} && \min\ \big(\text{correturnos}+\text{horas extra}\big). \label{eq:P4}\\
+  &\text{(P5) Estabilidad vs.\ patrón:} && \min\ \sum_{w,d}\dev_{w,d}. \label{eq:P5}
+\end{alignat}
+En \eqref{eq:P1}, $\kappa_{s}$ produce una \emph{degradación controlada}: cuando la plantilla
+no da para todo, se sacrifica antes una mañana que una noche. En \eqref{eq:P3},
+$\mu_{w,\omega}$ es el número de municipios distintos que $w$ trabaja en la semana $\omega$;
+penalizar $\posp{\mu_{w,\omega}-1}$ premia las semanas en una sola localización.
+
+\paragraph{Resolución lexicográfica.} Se resuelve \eqref{eq:P1} hasta su óptimo $z_{1}^{\star}$;
+se añade la restricción $\sum\kappa_{s}u_{s,d}\le z_{1}^{\star}$; se resuelve \eqref{eq:P2};
+y así sucesivamente. \textsc{CP-SAT} no optimiza lexicográficamente de forma nativa, de ahí
+la cascada.
+
+\section{Estrategia de resolución (no modifica el modelo)}
+
+El año no se resuelve de una vez: se usa un \emph{horizonte rodante} por ventanas (mes o
+quincena). Esto es una técnica de resolución, no una formulación distinta; el conjunto de
+restricciones y el objetivo son los mismos, y solo cambia qué variables están libres en cada
+pasada. Tres acoplamientos garantizan la corrección entre ventanas:
+\begin{enumerate}[leftmargin=2.2em]
+  \item \textbf{Contexto congelado (\emph{tail}).} Al resolver la ventana que empieza el día
+    $B$, los últimos $K=\max(\Cmax,7,\rho)$ días de la ventana anterior entran como
+    \emph{constantes}. Así \eqref{eq:C4}, \eqref{eq:C5}, \eqref{eq:C6}, \eqref{eq:C7} y
+    \eqref{eq:C11} —que miran hacia atrás o abarcan una semana entera— se evalúan con el
+    historial real y la costura queda exacta.
+  \item \textbf{Ancla global de semana.} $\sem(d)=\lfloor(d-d_{0})/7\rfloor$ con $d_{0}$ fijo
+    para todo el año: una ventana que empiece a mitad de semana sigue sabiendo en qué semana
+    del patrón está cada día (rotación \eqref{eq:pi} consistente) y a qué bloque $\omega$
+    pertenece (descanso compensatorio \eqref{eq:C11} correcto).
+  \item \textbf{Libro de equidad acumulada.} La carga ya repartida en ventanas previas entra
+    como desplazamiento constante en $\load_{w,m}$, de modo que las ventanas posteriores
+    compensan los desequilibrios: la equidad es anual aunque se resuelva a trozos.
+\end{enumerate}
+
+\paragraph{Criterio de aceptación.} La solución se compara con la línea base del patrón
+vigente sobre el vector $(\load_{\cdot,m},\,\mu,\dots)$. Solo se adopta si lo \emph{domina en
+Pareto} (mejora algún criterio sin empeorar ninguno relevante); en otro caso se conserva el
+patrón.
+
+\end{document}
