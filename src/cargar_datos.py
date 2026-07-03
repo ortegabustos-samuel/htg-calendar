@@ -1,10 +1,7 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
 cargar_datos.py — Capa de carga de datos del generador de cuadrantes.
 
-Lee los 6 CSV de data/input/ con pandas, deriva lo que el modelo necesita (duración,
-nocturnidad, tipo, operatividad) y expone consultas:
+Lee los 6 CSV de data/input/ con pandas, deriva lo que el modelo necesita (duración, tipo, operatividad) y expone consultas:
   * opera(turno, fecha)          — ¿la línea opera ese día? (festivo manda sobre día de semana)
   * disponible(trab, fecha)      — ¿no está de vacaciones?
   * tipo_dia(fecha, municipio)   — LV / SAB / DOM / FEST
@@ -15,100 +12,62 @@ un resumen y comprobaciones de la instancia cargada.
 """
 from __future__ import annotations
 
-import sys
-
-# --- Workaround de entorno (Anaconda) ---------------------------------------
-# pyarrow (conda) enlaza libprotobuf 5.29 y OR-Tools trae libprotobuf 6.33; cargar ambas en el
-# mismo proceso rompe la importación de ortools ("File already exists in database"). No usamos
-# pyarrow (read_csv va con el parser C de pandas), así que evitamos que pandas lo cargue. En un
-# entorno sin ese conflicto esta línea es inofensiva y se puede quitar.
-sys.modules.setdefault("pyarrow", None)
-# ----------------------------------------------------------------------------
-
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta , time
 from pathlib import Path
-
-import pandas as pd
+import csv
 
 RAIZ = Path(__file__).resolve().parents[1]
-DATOS_DEF = RAIZ / "data" / "input"
+DATA = RAIZ / "data" / "input"
 
 DIAS = ["lun", "mar", "mie", "jue", "vie", "sab", "dom"]   # patrones.csv; índice = weekday()
 LIBRE = "LIBRE"
-DUR_GUARDIA = 22          # h a partir de las cuales el turno es de guardia (24 h)
-HORAS_PARTIDO = 8         # un turno partido computa 8 h (no sabemos la duración del corte)
-HORAS_GUARDIA = 8         # una guardia de 24 h computa 8 h de trabajo efectivo (resto: pausa)
-
-
 # --------------------------------------------------------------------------- #
 #  Derivaciones horarias
 # --------------------------------------------------------------------------- #
-def hora_a_float(h: str) -> float:
-    hh, mm = str(h).strip().split(":")
-    return int(hh) + int(mm) / 60.0
+
+def duracion_turno(entrada: time, salida: time) -> float:
+    fecha_base = date(2000, 1, 1)
+
+    dt_entrada = datetime.combine(fecha_base, entrada)
+    dt_salida = datetime.combine(fecha_base, salida)
+
+    if dt_salida < dt_entrada:
+        dt_salida += timedelta(days=1)
+
+    return (dt_salida - dt_entrada).total_seconds() / 3600
 
 
-def duracion(entrada: str, salida: str) -> float:
-    d = hora_a_float(salida) - hora_a_float(entrada)
-    return d + 24 if d <= 0 else d          # la salida puede caer al día siguiente
-
-
-def nocturnidad(entrada: str, dur: float) -> float:
-    """Horas de solape con la franja nocturna 22:00-06:00 (replicada por cruce de medianoche)."""
-    ini = hora_a_float(entrada)
-    fin = ini + dur
-    return sum(max(0.0, min(fin, b) - max(ini, a)) for a, b in [(0, 6), (22, 30), (46, 48)])
-
-
-def tipo_turno(entrada: str, dur: float, partido: int) -> str:
-    e = hora_a_float(entrada)
-    if partido:
-        return "partido"
-    if dur >= DUR_GUARDIA:
+def tipo_turno(entrada: time, salida: time) -> str:
+    dur = duracion_turno(entrada,salida)
+    if dur >= 20:
         return "24h"
-    if e >= 20 or e < 6:
+    elif dur >=12:
+        return "12h"
+    elif entrada>salida:
         return "noche"
-    if e < 12:
+    elif salida>time(17):
+        return "tarde"
+    else:
         return "mañana"
-    return "tarde"
-
-
-def _fecha(texto: str) -> date:
-    return datetime.strptime(str(texto).strip(), "%d/%m/%Y").date()
-
-
-def _quincena(inicio: str) -> tuple[date, date]:
-    """Periodo de vacaciones de 15 días: (inicio, inicio + 14) a partir de su fecha de inicio."""
-    ini = _fecha(inicio)
-    return (ini, ini + timedelta(days=14))
-
-
-def _entero(valor, defecto: int) -> int:
-    """Convierte a int; devuelve el valor por defecto si la celda viene vacía."""
-    texto = str(valor).strip()
-    return int(texto) if texto else defecto
-
 
 # --------------------------------------------------------------------------- #
 #  Estructuras del dominio
 # --------------------------------------------------------------------------- #
 @dataclass
 class Turno:
-    id: str
-    municipio: str
-    lv: int
-    sab: int
-    dom: int
-    fes: int
-    hora_entrada: str
-    hora_salida: str
-    dem: int
-    partido: int
-    dur: float          # duración real (salida - entrada), para derivar tipo/nocturnidad
+    id: str             #Id del turno (lo suponemos único)
+    municipio: str      #Municipio en el que opera el turno
+    lv: int             #Flag que indica si se trabaja de lunes a viernes 0/1
+    sab: int            #Flag que indica si se trabaja de sabados 0/1
+    dom: int            #Flag que indica si se trabaja de domingos 0/1
+    fes: int            #Flag que indica si se trabaja de festivos 0/1
+    hora_entrada: time  #Hora de entrada del turno
+    hora_salida: time   #Hora de salida del turno
+    dem: int            #Demanda del turno (para valladolid es 1 siempre)
+    partido: int        #Flag que indica si es turno partido 0/1
     horas: float        # horas efectivas computables para la jornada (partido y 24h -> 8)
-    noct: float
-    tipo: str
+    tipo: str           #Tipo de turno (24h, partido, tarde, mañana, noche)
 
 
 @dataclass
@@ -121,11 +80,11 @@ class Trabajador:
 
 @dataclass
 class Capacidad:
-    lv: int
-    sab: int
-    dom: int
-    fest: int
-    v: int                          # refuerzo (cobertura de ausencias); va solo
+    lv: int                         #Trabaja de lunes a viernes flag 0/1
+    sab: int                        #Trabaja los sabados flag 0/1
+    dom: int                        #Trabaja los domingos flag 0/1
+    fest: int                       #Trabaja los festivos flag 0/1
+    v: int                          #Trabaja como cubre vacaciones 0/1
 
 
 @dataclass
@@ -140,7 +99,7 @@ class Datos:
     # -- Consultas derivadas ------------------------------------------------- #
     def es_festivo(self, f: date, municipio: str) -> bool:
         calendario = self.calendario_municipio.get(municipio, municipio)
-        return f in self.festivos.get("Comun", set()) or f in self.festivos.get(calendario, set())
+        return f in self.festivos.get("Nacional", set()) or f in self.festivos.get(calendario, set())
 
     def tipo_dia(self, f: date, municipio: str) -> str:
         if self.es_festivo(f, municipio):
@@ -187,76 +146,72 @@ def _leer(directorio: Path, nombre: str) -> pd.DataFrame:
 
 
 def _cargar_turnos(directorio: Path) -> dict[str, Turno]:
-    df = _leer(directorio, "turnos.csv")
     turnos = {}
-    for _, fila in df.iterrows():
-        entrada = fila["hora_entrada"]
-        salida = fila["hora_salida"]
-        partido = _entero(fila.get("partido", ""), 0)
-        dur = duracion(entrada, salida)
-        tipo = tipo_turno(entrada, dur, partido)
-        # Horas computables: partido y guardia de 24 h cuentan 8 h; el resto, su duración real.
-        horas = HORAS_PARTIDO if partido else HORAS_GUARDIA if tipo == "24h" else dur
-        turnos[fila["id_turno"]] = Turno(
-            id=fila["id_turno"],
-            municipio=fila["municipio"],
-            lv=int(fila["lv"]),
-            sab=int(fila["sabado"]),
-            dom=int(fila["domingo"]),
-            fes=int(fila["festivo"]),
-            hora_entrada=entrada,
-            hora_salida=salida,
-            dem=_entero(fila.get("dem", ""), 1),
-            partido=partido,
-            dur=dur,
-            horas=horas,
-            noct=nocturnidad(entrada, dur),
-            tipo=tipo,
-        )
+    with open(directorio / "turnos.csv", mode="r", encoding="utf-8",newline="") as archivo:
+        lector = csv.DictReader(archivo)
+        for fila in lector:
+            hora_entrada = datetime.strptime(fila["hora_entrada"].strip(),"%H:%M").time()
+            hora_salida = datetime.strptime(fila["hora_salida"].strip(),"%H:%M").time()
+            partido = fila.get("partido",0)
+            turnos[fila["id_turno"]] = Turno(
+                id=fila["id_turno"],
+                municipio=fila["municipio"],
+                lv=int(fila["lv"]),
+                sab=int(fila["sabado"]),
+                dom=int(fila["domingo"]),
+                fes=int(fila["festivo"]),
+                hora_entrada=hora_entrada,
+                hora_salida=hora_salida,
+                dem=fila.get("dem",1),
+                partido=partido,
+                horas=float(fila["horas_computadas"].strip()),
+                tipo=tipo_turno(hora_entrada, hora_salida) if partido==0 else "partido",
+            )
     return turnos
 
 
 def _cargar_trabajadores(directorio: Path) -> dict[str, Trabajador]:
-    df = _leer(directorio, "trabajadores.csv")
     trabajadores = {}
-    for _, fila in df.iterrows():
-        vacaciones = []
-        for columna in ("vac1_inicio", "vac2_inicio"):
-            if fila[columna].strip():
-                vacaciones.append(_quincena(fila[columna]))
-        patron = fila["patron"].strip()
-        trabajadores[fila["id_trab"]] = Trabajador(
-            id=fila["id_trab"],
-            tipo=fila["tipo"],
-            patron=patron if patron else None,
-            vacaciones=vacaciones,
-        )
+    with open(directorio / "trabajadores.csv", mode="r", encoding="utf-8",newline="") as archivo:
+        lector = csv.DictReader(archivo)
+        for fila in lector:
+            vac1 = datetime.strptime(fila["vac1_inicio"].strip(), "%d/%m/%Y").date()
+            vac2 = datetime.strptime(fila["vac2_inicio"].strip(), "%d/%m/%Y").date()
+
+            trabajadores[fila["id_trab"]] = Trabajador(
+                id=fila["id_trab"],
+                tipo=fila["tipo"],
+                patron=fila.get("patron",None),
+                vacaciones = [(vac1, vac1 + timedelta(days=14)),(vac2, vac2 + timedelta(days=14))]
+            )
     return trabajadores
 
 
 def _cargar_calendarios(directorio: Path) -> dict[str, str]:
-    df = _leer(directorio, "calendarios_municipio.csv")
     calendario = {}
-    for _, fila in df.iterrows():
-        calendario[fila["municipio"]] = fila["calendario_festivos"]
+    with open(directorio / "calendarios_municipio.csv", mode="r", encoding="utf-8",newline="") as archivo:
+        lector = csv.DictReader(archivo)
+        for fila in lector:
+            calendario[fila["municipio"]] = fila["calendario_festivos"]
     return calendario
 
 
 def _cargar_festivos(directorio: Path) -> dict[str, set[date]]:
-    df = _leer(directorio, "festivos.csv")
     festivos = {}
-    for _, fila in df.iterrows():
-        ambito = fila["ambito"].strip()
-        festivos.setdefault(ambito, set()).add(_fecha(fila["fecha"]))
+    with open(directorio / "festivos.csv", mode="r", encoding="utf-8",newline="") as archivo:
+        lector = csv.DictReader(archivo)
+        for fila in lector:
+            ambito = fila["ambito"].strip()
+            festivos.setdefault(ambito, set()).add(datetime.strptime(fila["fecha"].strip(), "%d/%m/%Y").date())
     return festivos
 
 
 def _cargar_capacidades(directorio: Path) -> dict[tuple[str, str], Capacidad]:
-    df = _leer(directorio, "capacidades.csv")
     capacidades = {}
-    for _, fila in df.iterrows():
-        clave = (fila["id_trab"], fila["id_turno"])
-        capacidades[clave] = Capacidad(
+    with open(directorio / "capacidades.csv", mode="r", encoding="utf-8",newline="") as archivo:
+        lector = csv.DictReader(archivo)
+        for fila in lector:
+            capacidades[(fila["id_trab"], fila["id_turno"])] = Capacidad(
             lv=int(fila["lv"]),
             sab=int(fila["sab"]),
             dom=int(fila["dom"]),
@@ -267,12 +222,12 @@ def _cargar_capacidades(directorio: Path) -> dict[tuple[str, str], Capacidad]:
 
 
 def _cargar_patrones(directorio: Path) -> dict[str, list[dict[str, str]]]:
-    df = _leer(directorio, "patrones.csv")
-    # Agrupamos las filas por patrón, guardando su índice para ordenarlas después.
-    sin_ordenar: dict[str, list[tuple[int, dict[str, str]]]] = {}
-    for _, fila in df.iterrows():
-        semana = {dia: fila[dia] for dia in DIAS}
-        sin_ordenar.setdefault(fila["patron"], []).append((int(fila["fila"]), semana))
+    sin_ordenar = {}
+    with open(directorio / "patrones.csv", mode="r", encoding="utf-8",newline="") as archivo:
+        lector = csv.DictReader(archivo)
+        for fila in lector:
+            semana = {dia: fila[dia] for dia in DIAS}
+            sin_ordenar.setdefault(fila["patron"], []).append((int(fila["fila"]), semana))
 
     patrones = {}
     for patron, filas in sin_ordenar.items():
@@ -281,7 +236,7 @@ def _cargar_patrones(directorio: Path) -> dict[str, list[dict[str, str]]]:
     return patrones
 
 
-def cargar(directorio: Path | str = DATOS_DEF) -> Datos:
+def cargar(directorio: Path | str = DATA) -> Datos:
     d = Path(directorio)
     return Datos(
         turnos=_cargar_turnos(d),
@@ -324,6 +279,3 @@ def _resumen(datos: Datos) -> None:
     print(f"[{w0}] vacaciones={[(a.strftime('%d/%m'), b.strftime('%d/%m')) for a, b in v]}  "
           f"disponible {v[0][0]:%d/%m}={datos.disponible(w0, v[0][0])}")
 
-
-if __name__ == "__main__":
-    _resumen(cargar())
