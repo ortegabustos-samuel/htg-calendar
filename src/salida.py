@@ -22,7 +22,8 @@ from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
 from cargar_datos import Datos, cargar
-from modelo import LAMBDA, PESO, Modelo, cp_model, rango_fechas
+from modelo import (LAMBDA, METRICAS, PESO_TURNOS, Modelo, cp_model,
+                    rango_fechas, resolver_anual)
 
 RAIZ = Path(__file__).resolve().parents[1]
 SALIDA = RAIZ / "data" / "output"
@@ -267,7 +268,7 @@ def generar(modelo: Modelo, solver, estado) -> None:
     kpis = {
         "demanda": demanda, "huecos": n_huecos, "cubiertos": demanda - n_huecos,
         "pct": 100 * (demanda - n_huecos) / demanda if demanda else 0,
-        "p1": sum(PESO[datos.turnos[t].tipo] * solver.value(u) for (t, _), u in modelo.u.items()),
+        "p1": sum(PESO_TURNOS[datos.turnos[t].tipo] * solver.value(u) for (t, _), u in modelo.u.items()),
         "p2": sum(LAMBDA[m] * solver.value(r) for m, r in modelo.rangos.items()),
         "estado": solver.status_name(estado),
     }
@@ -277,12 +278,92 @@ def generar(modelo: Modelo, solver, estado) -> None:
     resumen_consola(datos, fechas, huecos, kpis, modelo.rangos, solver)
 
 
+# --------------------------------------------------------------------------- #
+#  Salida a partir de un PLAN anual (horizonte rodante): dict {(trab,fecha):turno}
+# --------------------------------------------------------------------------- #
+def _contribuye(datos: Datos, metrica: str, turno: str, f: date) -> bool:
+    """¿La asignación (turno, día) suma a la carga indeseable 'metrica'? (réplica de Modelo)."""
+    t = datos.turnos[turno]
+    if metrica == "noche":
+        return t.tipo == "noche"
+    if metrica == "finde":
+        return f.weekday() >= 5
+    if metrica == "festivo":
+        return datos.es_festivo(f, t.municipio)
+    if metrica == "24h":
+        return t.tipo == "24h"
+    if metrica == "12h":
+        return t.tipo == "12h"
+    if metrica == "partido":
+        return t.tipo == "partido"
+    return False
+
+
+def huecos_del_plan(datos: Datos, fechas: list[date], plan: dict) -> list[tuple[date, str]]:
+    """Turnos sin cubrir del plan: por cada turno operativo, dem − asignados (una entrada/unidad)."""
+    cubiertos = defaultdict(int)
+    for (w, f), s in plan.items():
+        cubiertos[(s, f)] += 1
+    huecos = []
+    for turno, t in datos.turnos.items():
+        for f in fechas:
+            if not datos.opera(turno, f):
+                continue
+            faltan = t.dem - cubiertos.get((turno, f), 0)
+            huecos += [(f, turno)] * max(0, faltan)
+    return sorted(huecos)
+
+
+def _kpis_plan(datos: Datos, fechas: list[date], plan: dict, huecos: list, estado: str) -> dict:
+    demanda = sum(datos.turnos[t].dem for t in datos.turnos for f in fechas if datos.opera(t, f))
+    n_huecos = len(huecos)
+    p1 = sum(PESO_TURNOS[datos.turnos[s].tipo] for _, s in huecos)
+    # P2 anual (aprox.): dispersión de cargas indeseables por trabajador (fijos fuera)
+    cargas = {m: defaultdict(int) for m in METRICAS}
+    for (w, f), s in plan.items():
+        if datos.trabajadores[w].tipo == "fijo":
+            continue
+        for m in METRICAS:
+            if _contribuye(datos, m, s, f):
+                cargas[m][w] += 1
+    p2 = 0
+    for m in METRICAS:
+        vals = [cargas[m][w] for w in datos.trabajadores
+                if datos.trabajadores[w].tipo != "fijo"]
+        if len(vals) >= 2:
+            p2 += LAMBDA[m] * (max(vals) - min(vals))
+    return {
+        "demanda": demanda, "huecos": n_huecos, "cubiertos": demanda - n_huecos,
+        "pct": 100 * (demanda - n_huecos) / demanda if demanda else 0,
+        "p1": p1, "p2": p2, "estado": estado,
+    }
+
+
+def generar_anual(datos: Datos, fechas: list[date], plan: dict,
+                  estado: str = "HORIZONTE RODANTE") -> None:
+    """Vuelca a Excel/HTML/CSV el plan anual del horizonte rodante."""
+    huecos = huecos_del_plan(datos, fechas, plan)
+    kpis = _kpis_plan(datos, fechas, plan, huecos, estado)
+    escribir_csv(datos, fechas, plan, huecos)
+    escribir_html(datos, fechas, plan, huecos, kpis)
+    escribir_excel(datos, fechas, plan, huecos, kpis)
+    print(f"Estado: {kpis['estado']}")
+    print(f"Cobertura: {kpis['cubiertos']}/{kpis['demanda']} ({kpis['pct']:.1f}%)  "
+          f"| sin cubrir: {kpis['huecos']}  | P1={kpis['p1']}  P2={kpis['p2']}")
+    por_dia = defaultdict(int)
+    for d, _ in huecos:
+        por_dia[d] += 1
+    if por_dia:
+        peor = sorted(por_dia.items(), key=lambda kv: -kv[1])[:5]
+        print("Días con más huecos: " + ", ".join(f"{d:%d/%m}:{n}" for d, n in peor))
+    print(f"\nFicheros en {SALIDA.relative_to(RAIZ)}/: calendario.xlsx, calendario.html, "
+          f"calendario.csv, informe_cobertura.csv")
+
+
 if __name__ == "__main__":
     datos = cargar("data/input")
-    fechas = rango_fechas(date(2026, 1, 1), date(2026, 1, 31))
-    modelo = Modelo(datos, fechas)
-    solver, estado = modelo.resolver(segundos=1000,trabajadores_cpu=4)
-    if estado in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-        generar(modelo, solver, estado)
-    else:
-        print("Sin solución:", solver.status_name(estado))
+    inicio, fin = date(2026, 1, 1), date(2026, 12, 31)
+    plan = resolver_anual(datos, inicio, fin, dias_ventana=14, dias_cola=28,
+                          segundos=60, hilos=16, log=False)
+    fechas = rango_fechas(inicio, fin)
+    generar_anual(datos, fechas, plan)

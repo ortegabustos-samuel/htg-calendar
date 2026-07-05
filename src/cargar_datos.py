@@ -99,7 +99,7 @@ class Datos:
     # -- Consultas derivadas ------------------------------------------------- #
     def es_festivo(self, f: date, municipio: str) -> bool:
         calendario = self.calendario_municipio.get(municipio, municipio)
-        return f in self.festivos.get("Nacional", set()) or f in self.festivos.get(calendario, set())
+        return f in self.festivos.get("Comun", set()) or f in self.festivos.get(calendario, set())
 
     def tipo_dia(self, f: date, municipio: str) -> str:
         if self.es_festivo(f, municipio):

@@ -79,10 +79,25 @@ def semana(f: date) -> tuple[int, int]:
 
 
 class Modelo:
-    def __init__(self, datos: Datos, fechas: list[date]):
+    def __init__(self, datos: Datos, fechas: list[date],
+                 congelar: dict[tuple[str, date], str] | None = None,
+                 offset_equidad: dict[str, dict[str, int]] | None = None,
+                 cola: set[date] | None = None,
+                 offset_horas: dict[str, int] | None = None,
+                 objetivo_horas: dict[str, int] | None = None):
         self.datos = datos
         self.fechas = fechas
         self.m = cp_model.CpModel()
+
+        # Horizonte rodante: 'cola' = fechas de contexto (ya resueltas, no se deciden);
+        # 'congelar' = asignaciones fijas de esos días; 'offset_equidad' = carga acumulada previa.
+        # 'offset_horas' = minutos ya trabajados en ventanas previas (libro de jornada anual, C9);
+        # 'objetivo_horas' = minutos objetivo de ESTA ventana por trabajador (pacing blando, P4).
+        self.congelar = congelar or {}
+        self.offset_equidad = offset_equidad or {}
+        self.offset_horas = offset_horas or {}
+        self.objetivo_horas = objetivo_horas or {}
+        self.cola = set(cola) if cola is not None else {f for (_, f) in self.congelar}
 
         #Conjunto de las variables del modelo x_trab_fecha_turno
         self.x: dict[tuple[str, date, str], cp_model.BoolVar] = {} 
@@ -95,6 +110,7 @@ class Modelo:
         self.u: dict[tuple[str, date], cp_model.IntVar] = {}         # holgura de cobertura intVar n trabajadores se requieren (turno,fecha)
 
         self._crear_variables()
+        self._congelar_cola()          # fija los días de contexto (horizonte rodante)
         self._c1_cobertura()
         self._c2_un_turno_dia()
         self._c4_descanso()
@@ -103,6 +119,7 @@ class Modelo:
         self._c6b_horas_cuatrisemana()
         self._c7_descanso_semanal()
         self._c8_fijos()
+        self._c9_jornada_anual()                  # tope anual duro (libro de horas)
         self._warm_start_patron()                 # arranque pegado al patrón
 
     # -- Variables ----------------------------------------------------------- #
@@ -122,6 +139,18 @@ class Modelo:
     def _turnos(self, trab: str, f: date) -> list[cp_model.BoolVar]:
         return [self.x[(trab, f, s)] for s in self.turnos_wd.get((trab, f), [])]
 
+    def _congelar_cola(self) -> None:
+        """Fija los días de la cola a la solución de la ventana anterior (contexto de la costura).
+        Lo asignado -> x==1; lo no asignado ese día -> todo x==0 (descansa)."""
+        for f in self.cola:
+            for w in self.datos.trabajadores:
+                asignado = self.congelar.get((w, f))
+                if asignado is not None and (w, f, asignado) in self.x:
+                    self.m.add(self.x[(w, f, asignado)] == 1)
+                else:
+                    for s in self.turnos_wd.get((w, f), []):
+                        self.m.add(self.x[(w, f, s)] == 0)
+
 
     # -- Restricciones duras ------------------------------------------------- #
     def _c1_cobertura(self) -> None:
@@ -129,8 +158,8 @@ class Modelo:
         d = self.datos
         for turno, t in d.turnos.items():
             for f in self.fechas:
-                if not d.opera(turno, f):
-                    continue
+                if f in self.cola or not d.opera(turno, f):
+                    continue                       # la cola es contexto: no se impone cobertura
                 asignados = [self.x[(w, f, turno)] for w in d.trabajadores
                              if (w, f, turno) in self.x]
                 holgura = self.m.new_int_var(0, t.dem, f"u_{turno}_{f:%Y%m%d}")
@@ -240,7 +269,10 @@ class Modelo:
         dias_semana: dict[tuple[int, int], list[date]] = defaultdict(list)
         for f in self.fechas:
             dias_semana[semana(f)].append(f)
-        completas = sorted(s for s, ds in dias_semana.items() if len(ds) == 7)
+        # semanas completas que tengan al menos un día de ventana (las de solo-cola ya se
+        # respetaron en su ventana y están fijadas)
+        completas = sorted(s for s, ds in dias_semana.items()
+                           if len(ds) == 7 and any(f not in self.cola for f in ds))
 
         for trab in self.datos.trabajadores:
             # (a) al menos un par de días consecutivos ambos libres, por semana completa
@@ -315,6 +347,8 @@ class Modelo:
             if phi is None or self.datos.turnos[phi].horas > 8:
                 continue
             for f in self.fechas:
+                if f in self.cola:                 # la cola ya está fijada
+                    continue
                 if (w, f, phi) in self.x:
                     self.m.add(self.x[(w, f, phi)] == 1)
 
@@ -333,6 +367,8 @@ class Modelo:
             T = len(filas)
             for offset, w in enumerate(sorted(trabs)):
                 for f in self.fechas:
+                    if f in self.cola:
+                        continue
                     turno = filas[(offset + (f - ancla).days // 7) % T][DIAS[f.weekday()]]
                     if turno != LIBRE and (w, f, turno) in self.x:
                         self.m.add_hint(self.x[(w, f, turno)], 1)
@@ -358,6 +394,8 @@ class Modelo:
             peso_w = PESO_TRABAJADOR.get(trabajador.tipo, 1)
 
             for f in self.fechas:
+                if f in self.cola:
+                    continue
                 for s in self.turnos_wd.get((w, f), []):
                     for metrica in METRICAS:
                         if self._contribuye(metrica, s, f):
@@ -386,81 +424,190 @@ class Modelo:
             case _:
                 return False
 
-    def _equidad_ponderada(self) -> dict[str, cp_model.IntVar]:
-        """Para cada métrica: carga por trabajador (fijos fuera) y su rango max-min, medido
-        solo entre quienes pueden soportar esa carga."""
+    def _equidad_ponderada(self) -> tuple[dict[str, list[cp_model.IntVar]], int]:
+        """Para cada métrica: carga ACUMULADA por trabajador (offset previo del libro de equidad
+        + lo asignado en la ventana; fijos fuera) y su desviación ponderada respecto a la media.
+        Devuelve (desviaciones, cota_p2), con cota_p2 = cota superior de P2 = Σ λ·Σ desv, para
+        escalar los pesos del objetivo sin desbordar."""
         pool = [w for w, t in self.datos.trabajadores.items() if t.tipo != "fijo"]
-        n = len(self.fechas)    
+        dias = [f for f in self.fechas if f not in self.cola]     # solo la ventana, no la cola
         desviaciones: dict[str, list[cp_model.IntVar]] = {}
+        cota_p2 = 0
 
-        rangos = {}
         for metrica in METRICAS:
             cargas = []
             for w in pool:
-                trabajador = self.datos.trabajadores[w]
-                peso_w = PESO_FLEX.get(trabajador.tipo, 1)
-                terminos = [
-                                self.x[(w, f, s)]
-                                for f in self.fechas
-                                for s in self.turnos_wd.get((w, f), [])
-                                if self._contribuye(metrica, s, f)
-                            ]
-                if not terminos:
-                    continue                          # este trabajador no soporta esta carga
-                carga = self.m.new_int_var(0, n, f"carga_{metrica}_{w}")
-                self.m.add(carga == sum(terminos))
-                cargas.append((w,carga,peso_w))
-                
+                peso_w = PESO_FLEX.get(self.datos.trabajadores[w].tipo, 1)
+                off = self.offset_equidad.get(w, {}).get(metrica, 0)     # carga previa (libro)
+                terminos = [self.x[(w, f, s)] for f in dias
+                            for s in self.turnos_wd.get((w, f), [])
+                            if self._contribuye(metrica, s, f)]
+                if not terminos and off == 0:
+                    continue                          # ni carga previa ni puede en la ventana
+                cota_w = off + len(terminos)
+                carga = self.m.new_int_var(off, cota_w, f"carga_{metrica}_{w}")
+                self.m.add(carga == off + sum(terminos))
+                cargas.append((w, carga, peso_w, cota_w))
+
             if len(cargas) < 2:
                 continue                              # sin dispersión que repartir
-            peso_total = sum(peso_w for _,_,peso_w in cargas)
-            carga_total = self.m.new_int_var(0,n*len(cargas),f"total_{metrica}")
+            peso_total = sum(p for _, _, p, _ in cargas)
+            cota_total = sum(c for _, _, _, c in cargas)
+            carga_total = self.m.new_int_var(0, cota_total, f"total_{metrica}")
+            self.m.add(carga_total == sum(c for _, c, _, _ in cargas))
 
-            self.m.add(carga_total == sum(carga for _, carga, _ in cargas))
+            # |peso_total·carga_w - peso_w·carga_total| <= peso_total·carga_total <= peso_total·cota_total
+            max_desv = peso_total * cota_total
             desviaciones[metrica] = []
-
-            for w, carga_w, peso_w in cargas:    
-                """
-                Queremos minimizar la diferencia entre:
-                    carga_w / peso_w
-                y:
-                    carga_total / peso_total
-                Para evitar divisiones:
-                    peso_total * carga_w ~= peso_w * carga_total
-                """
-                expr = peso_total * carga_w - peso_w * carga_total
-                max_desv = n * peso_total
-                desv = self.m.new_int_var(0,max_desv,f"desv_{metrica}_{w}")
-                self.m.add_abs_equality(desv, expr)
+            for w, carga_w, peso_w, _ in cargas:
+                desv = self.m.new_int_var(0, max_desv, f"desv_{metrica}_{w}")
+                self.m.add_abs_equality(desv, peso_total * carga_w - peso_w * carga_total)
                 desviaciones[metrica].append(desv)
-        return desviaciones
+            cota_p2 += LAMBDA[metrica] * len(cargas) * max_desv
+        return desviaciones, cota_p2
+
+    # -- C9: jornada anual (tope duro + pacing blando) ----------------------- #
+    def _c9_jornada_anual(self) -> None:
+        """C9 (DURA): la jornada anual efectiva no supera HMAX_AÑO. Libro de horas acumuladas:
+        minutos ya trabajados en ventanas previas (offset_horas) + los de esta ventana <= tope.
+        Guarda los términos de minutos de la ventana por trabajador para el déficit blando (P4).
+        Fijos fuera: su jornada está congelada, no la decide el solver (se valida aparte)."""
+        dias = [f for f in self.fechas if f not in self.cola]     # solo la ventana
+        tope_min = HMAX_AÑO * 60
+        self._min_ventana: dict[str, list] = {}
+        for w, t in self.datos.trabajadores.items():
+            if t.tipo == "fijo":
+                continue
+            terminos = self._minutos(w, dias)
+            if not terminos:
+                continue                                          # no puede trabajar en la ventana
+            self._min_ventana[w] = terminos
+            off = self.offset_horas.get(w, 0)                     # <= tope por invariante del libro
+            self.m.add(sum(terminos) <= tope_min - off)
+
+    def _deficit_jornada(self) -> tuple[object, int]:
+        """P4 (BLANDA): penaliza no alcanzar la jornada objetivo de la ventana (objetivo_horas[w],
+        minutos, proporcional a los días disponibles). Reparte el consumo a lo largo del año
+        (evita agotar a nadie antes de tiempo) y empuja a cumplir jornada. Devuelve (déficit, cota)."""
+        deficits, cota = [], 0
+        for w, terminos in getattr(self, "_min_ventana", {}).items():
+            objetivo = self.objetivo_horas.get(w, 0)
+            if objetivo <= 0:
+                continue
+            deficit = self.m.new_int_var(0, objetivo, f"deficit_{w}")
+            self.m.add(deficit >= objetivo - sum(terminos))       # min. lo empuja a max(0, obj-horas)
+            deficits.append(deficit)
+            cota += objetivo
+        return sum(deficits), cota
 
     # -- Resolución (objetivo jerárquico por pesos) -------------------------- #
     def resolver(self, segundos: int = 120, trabajadores_cpu: int = 4, log: bool = False):
-        """Objetivo jerárquico en uno solo:  W1·P1 + W2·P2 + W3·P3, con W1 > W2 > W3.
-        P1: cobertura (turnos no cubiertos)  ->  P2: equidad ponderada  ->  P3: preferencia
-        por perfil. Los pesos garantizan que P1 domine a P2 y P2 a P3."""
+        """Objetivo jerárquico en uno solo:  W1·P1 + W2·P2 + W3·(P3+P4), con W1 > W2 > W3.
+        P1: cobertura (turnos no cubiertos)  ->  P2: equidad ponderada  ->  P3 preferencia por
+        perfil + P4 déficit de jornada (ambos desempates, comparten el nivel más bajo para no
+        inflar la torre de pesos y evitar desbordar int64). Los pesos garantizan que P1 domine
+        a P2 y P2 a (P3+P4)."""
         p1 = self._coste_cobertura()
-        desviaciones = self._equidad_ponderada()
+        desviaciones, max_p2 = self._equidad_ponderada()   # cota_p2 exacta (incluye offset)
         p2 = sum(LAMBDA[metrica] * sum(vars_desv) for metrica, vars_desv in desviaciones.items())
         p3 = self._coste_preferencia_trabajador()
+        p4, max_p4 = self._deficit_jornada()               # cota_p4 = Σ objetivo (minutos)
 
         n = len(self.fechas)
         num_trab = len(self.datos.trabajadores)
         max_lambda = sum(LAMBDA.values())
-        # Cotas conservadoras de P2 y P3 para escalar los pesos (W1 > max aporte de P2+P3).
-        max_p2 = max_lambda * n * num_trab * max(PESO_FLEX.values())
+        # Cotas conservadoras de P3 y P4 para escalar los pesos (W1 > max aporte de P2+P3+P4).
         max_p3 = max_lambda * n * num_trab * max(v for k, v in PESO_TRABAJADOR.items() if k != "fijo")
+        max_low = max_p3 + max_p4
         W3 = 1
-        W2 = max_p3 + 1
-        W1 = (max_p2 * W2) + max_p3 + 1
+        W2 = max_low + 1
+        W1 = (max_p2 * W2) + max_low + 1
 
         solver = cp_model.CpSolver()
         solver.parameters.max_time_in_seconds = segundos
         solver.parameters.num_search_workers = trabajadores_cpu
         solver.parameters.log_search_progress = log
-        self.m.minimize(W1 * p1 + W2 * p2 + W3 * p3)      # <-- el objetivo que faltaba
+        self.m.minimize(W1 * p1 + W2 * p2 + W3 * (p3 + p4))
         return solver, solver.solve(self.m)
+
+
+# --------------------------------------------------------------------------- #
+#  Horizonte rodante: resuelve el periodo por ventanas cosidas
+# --------------------------------------------------------------------------- #
+def _plan_ventana(mod: Modelo, solver, fechas_ventana: list[date]) -> dict[tuple[str, date], str]:
+    """Extrae {(trab, fecha): turno} de las decisiones de la VENTANA (ignora la cola)."""
+    dias = set(fechas_ventana)
+    return {(w, f): s for (w, f, s), var in mod.x.items()
+            if f in dias and solver.value(var)}
+
+
+def _actualizar_offset(offset: dict, mod: Modelo, plan_ventana: dict) -> None:
+    """Suma al libro de equidad las cargas indeseables asignadas en la ventana (fijos fuera)."""
+    for (w, f), turno in plan_ventana.items():
+        if mod.datos.trabajadores[w].tipo == "fijo":
+            continue
+        for metrica in METRICAS:
+            if mod._contribuye(metrica, turno, f):
+                offset.setdefault(w, {})
+                offset[w][metrica] = offset[w].get(metrica, 0) + 1
+
+
+def _actualizar_offset_horas(offset_horas: dict, datos: Datos, plan_ventana: dict) -> None:
+    """Suma al libro de jornada anual (C9) los minutos trabajados en la ventana (fijos fuera)."""
+    for (w, f), turno in plan_ventana.items():
+        if datos.trabajadores[w].tipo == "fijo":
+            continue
+        offset_horas[w] = offset_horas.get(w, 0) + round(datos.turnos[turno].horas * 60)
+
+
+def resolver_anual(datos: Datos, inicio: date, fin: date, dias_ventana: int = 14,
+                   dias_cola: int = 28, segundos: int = 60, hilos: int = 8,
+                   log: bool = False) -> dict[tuple[str, date], str]:
+    """Horizonte rodante: resuelve [inicio, fin] por ventanas alineadas a lunes, con cola
+    congelada (costura legal) y libro de equidad acumulada. Devuelve el plan completo."""
+    inicio -= timedelta(days=inicio.weekday())          # alinear a lunes
+    plan: dict[tuple[str, date], str] = {}
+    offset: dict[str, dict[str, int]] = {}
+    offset_horas: dict[str, int] = {}                   # libro de jornada anual (minutos), C9
+    # días disponibles (no vacaciones) de cada trabajador en todo el horizonte: base del prorrateo
+    dias_horizonte = rango_fechas(inicio, fin)
+    disp_año = {w: sum(datos.disponible(w, f) for f in dias_horizonte)
+                for w, t in datos.trabajadores.items() if t.tipo != "fijo"}
+    ini_v, v = inicio, 0
+    while ini_v <= fin:
+        fin_v = min(ini_v + timedelta(days=dias_ventana - 1), fin)
+        fechas_cola = [f for f in rango_fechas(ini_v - timedelta(days=dias_cola),
+                                               ini_v - timedelta(days=1)) if f >= inicio]
+        fechas_ventana = rango_fechas(ini_v, fin_v)
+        cola = set(fechas_cola)
+        congelar = {(w, f): plan[(w, f)] for (w, f) in plan if f in cola}
+
+        # Objetivo de jornada de la ventana: prorrateo de HMAX_AÑO por días disponibles (P4 blando)
+        objetivo_horas = {}
+        for w, disp_total in disp_año.items():
+            if disp_total == 0:
+                continue
+            disp_v = sum(datos.disponible(w, f) for f in fechas_ventana)
+            objetivo_horas[w] = round(HMAX_AÑO * 60 * disp_v / disp_total)
+
+        mod = Modelo(datos, fechas_cola + fechas_ventana,
+                     congelar=congelar, offset_equidad=offset, cola=cola,
+                     offset_horas=offset_horas, objetivo_horas=objetivo_horas)
+        solver, st = mod.resolver(segundos=segundos, trabajadores_cpu=hilos, log=log)
+
+        pv = _plan_ventana(mod, solver, fechas_ventana)
+        plan.update(pv)
+        _actualizar_offset(offset, mod, pv)
+        _actualizar_offset_horas(offset_horas, datos, pv)
+
+        v += 1
+        huecos = sum(solver.value(u) for u in mod.u.values())
+        dem = sum(datos.turnos[t].dem for (t, _) in mod.u)
+        print(f"ventana {v:>2}  {ini_v:%d/%m}–{fin_v:%d/%m}  {solver.status_name(st):<9} "
+              f"cobertura {100*(dem-huecos)/dem:5.1f}%  ({huecos} huecos)", flush=True)
+        ini_v = fin_v + timedelta(days=1)
+    return plan
+
 
 def imprimir_resumen(modelo: Modelo, solver: cp_model.CpSolver, status: int) -> None:
     """Imprime un resumen básico de la solución."""
