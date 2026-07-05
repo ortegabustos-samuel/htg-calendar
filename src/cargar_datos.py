@@ -32,7 +32,7 @@ def duracion_turno(entrada: time, salida: time) -> float:
     dt_entrada = datetime.combine(fecha_base, entrada)
     dt_salida = datetime.combine(fecha_base, salida)
 
-    if dt_salida < dt_entrada:
+    if dt_salida <= dt_entrada:
         dt_salida += timedelta(days=1)
 
     return (dt_salida - dt_entrada).total_seconds() / 3600

@@ -450,7 +450,7 @@ class Modelo:
         max_lambda = sum(LAMBDA.values())
         # Cotas conservadoras de P2 y P3 para escalar los pesos (W1 > max aporte de P2+P3).
         max_p2 = max_lambda * n * num_trab * max(PESO_FLEX.values())
-        max_p3 = max_lambda * n * num_trab * max(PESO_TRABAJADOR.values())
+        max_p3 = max_lambda * n * num_trab * max(v for k, v in PESO_TRABAJADOR.items() if k != "fijo")
         W3 = 1
         W2 = max_p3 + 1
         W1 = (max_p2 * W2) + max_p3 + 1

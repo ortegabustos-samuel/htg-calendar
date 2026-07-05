@@ -281,7 +281,7 @@ if __name__ == "__main__":
     datos = cargar("data/input")
     fechas = rango_fechas(date(2026, 1, 1), date(2026, 1, 31))
     modelo = Modelo(datos, fechas)
-    solver, estado = modelo.resolver(segundos=30)
+    solver, estado = modelo.resolver(segundos=1000,trabajadores_cpu=4)
     if estado in (cp_model.OPTIMAL, cp_model.FEASIBLE):
         generar(modelo, solver, estado)
     else:
