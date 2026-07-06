@@ -262,8 +262,11 @@ class Modelo:
                     self.m.add(sum(minutos) <= HMAX_4SEM * 60)
 
     def _c7_descanso_semanal(self) -> None:
-        """Descanso semanal (art. 24): (a) 2 días de descanso CONSECUTIVOS por semana;
-        (b) al menos un sábado+domingo libres en cada ventana de 4 semanas.
+        """Descanso semanal (art. 24), parte (b): al menos un sábado+domingo libres en cada
+        ventana de 4 semanas completas. El descanso de >=2 días/semana NO se impone aquí como
+        restricción dura —para permitir "sábado sí / domingo no + un día suelto entre semana", y
+        que 6 días seguidos DENTRO de una misma semana sea posible pero rarísimo— sino de forma
+        blanda y casi prohibitiva en el objetivo (_exceso_semanal).
         Solo se aplica a SEMANAS COMPLETAS del horizonte (las semanas truncadas del borde
         se ignoran; se cubren al alinear el horizonte a semanas / con el horizonte rodante)."""
         dias_semana: dict[tuple[int, int], list[date]] = defaultdict(list)
@@ -275,25 +278,6 @@ class Modelo:
                            if len(ds) == 7 and any(f not in self.cola for f in ds))
 
         for trab in self.datos.trabajadores:
-            # (a) al menos un par de días consecutivos ambos libres, por semana completa
-            for sem in completas:
-                dias = dias_semana[sem]
-                pares = []
-                for hoy, manana in zip(dias, dias[1:]):
-                    par = self.m.new_bool_var(f"descanso2_{trab}_{hoy:%Y%m%d}")
-
-                    #Define si trabaja hoy no puede pertencer al par descanso, y si pertenece al par descanso entonces 
-                    #Ni hoy ni mañana debe trabajar
-                    self.m.add(par == 0).only_enforce_if(self.trabaja[(trab,hoy)])
-                    self.m.add(par == 0).only_enforce_if(self.trabaja[(trab,manana)])
-                    self.m.add(par == 1).only_enforce_if([
-                        self.trabaja[(trab,hoy)].Not(),
-                        self.trabaja[(trab,manana)].Not(),
-                    ])
-                    pares.append(par)
-
-                self.m.add(sum(pares) >= 1)
-
             # (b) sábado+domingo libres, al menos una vez cada 4 semanas completas
             finde_libre = []
             for sem in completas:
@@ -500,14 +484,38 @@ class Modelo:
             cota += objetivo
         return sum(deficits), cota
 
+    def _exceso_semanal(self) -> tuple[object, int]:
+        """Penaliza que un trabajador supere 5 días trabajados en una semana ISO completa (=> 6
+        días seguidos DENTRO de esa semana, con un solo descanso). Las rachas de 6 que cruzan la
+        frontera domingo->lunes NO se penalizan: dejan cada semana en <=5. Va al NIVEL DE
+        COBERTURA (peso 1 < valor de cubrir un turno, >=2), así un 6-en-semana solo se acepta si
+        rescata un turno que si no quedaría sin cubrir -> posible pero rarísimo. Devuelve
+        (suma_exceso, cota)."""
+        dias_semana: dict[tuple[int, int], list[date]] = defaultdict(list)
+        for f in self.fechas:
+            dias_semana[semana(f)].append(f)
+        completas = [s for s, ds in dias_semana.items()
+                     if len(ds) == 7 and any(f not in self.cola for f in ds)]
+        excesos, cota = [], 0
+        for trab in self.datos.trabajadores:
+            for sem in completas:
+                dias = dias_semana[sem]
+                exceso = self.m.new_int_var(0, len(dias) - 5, f"exceso_{trab}_{sem[0]}w{sem[1]}")
+                self.m.add(exceso >= sum(self.trabaja[(trab, f)] for f in dias) - 5)
+                excesos.append(exceso)
+                cota += len(dias) - 5
+        return sum(excesos), cota
+
     # -- Resolución (objetivo jerárquico por pesos) -------------------------- #
     def resolver(self, segundos: int = 120, trabajadores_cpu: int = 4, log: bool = False):
-        """Objetivo jerárquico en uno solo:  W1·P1 + W2·P2 + W3·(P3+P4), con W1 > W2 > W3.
-        P1: cobertura (turnos no cubiertos)  ->  P2: equidad ponderada  ->  P3 preferencia por
-        perfil + P4 déficit de jornada (ambos desempates, comparten el nivel más bajo para no
-        inflar la torre de pesos y evitar desbordar int64). Los pesos garantizan que P1 domine
-        a P2 y P2 a (P3+P4)."""
+        """Objetivo jerárquico en uno solo:  W1·(P1+exceso) + W2·P2 + W3·(P3+P4), con W1 > W2 > W3.
+        Nivel cobertura: P1 turnos no cubiertos + penalización de 6 días seguidos dentro de una
+        semana (peso 1 < valor de cubrir un turno, así solo se acepta si rescata cobertura).
+        -> P2: equidad ponderada -> P3 preferencia por perfil + P4 déficit de jornada (ambos
+        desempates, comparten el nivel más bajo para no inflar la torre de pesos y evitar
+        desbordar int64). Los pesos garantizan que el nivel cobertura domine a P2 y P2 a (P3+P4)."""
         p1 = self._coste_cobertura()
+        p_exceso, _ = self._exceso_semanal()               # 6 días seguidos dentro de una semana
         desviaciones, max_p2 = self._equidad_ponderada()   # cota_p2 exacta (incluye offset)
         p2 = sum(LAMBDA[metrica] * sum(vars_desv) for metrica, vars_desv in desviaciones.items())
         p3 = self._coste_preferencia_trabajador()
@@ -527,7 +535,7 @@ class Modelo:
         solver.parameters.max_time_in_seconds = segundos
         solver.parameters.num_search_workers = trabajadores_cpu
         solver.parameters.log_search_progress = log
-        self.m.minimize(W1 * p1 + W2 * p2 + W3 * (p3 + p4))
+        self.m.minimize(W1 * (p1 + p_exceso) + W2 * p2 + W3 * (p3 + p4))
         return solver, solver.solve(self.m)
 
 
