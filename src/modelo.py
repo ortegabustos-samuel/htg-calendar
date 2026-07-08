@@ -44,6 +44,10 @@ PESO_ESTAB = 5
 # Fijación blanda del patrón (NIVEL DE COBERTURA): "vale" de sacar a un trabajador de patrón de su
 # rotación. < PESO_COBERTURA, así el patrón se sigue SIEMPRE salvo para rescatar una cobertura.
 PESO_DEV = 1
+
+# Etapa 4 (nivel bajo): "vale" de quitarle un día a un fijo. Pequeño, solo para que no retire días
+# gratis: retira únicamente cuando baja el exceso de horas sobre el objetivo (1776). << horas/día.
+PESO_RETIRA = 1
 # Lexicográfico por objetivo único: minimizar  W·P1 + P2, con W > max(P2). Como P2 = Σ λ·rango
 # y cada rango ≤ nº de días, max(P2) = Σλ·nº_días -> W se calcula según el horizonte
 # (W = Σλ·nº_días + 1). Así P1 domina SIEMPRE y P2 solo desempata (evita que al crecer el
@@ -67,7 +71,8 @@ class Modelo:
                  offset_equidad: dict[str, dict[str, int]] | None = None,
                  cola: set[date] | None = None,
                  offset_horas: dict[str, int] | None = None,
-                 objetivo_horas: dict[str, int] | None = None):
+                 objetivo_horas: dict[str, int] | None = None,
+                 objetivo_horas_fijo: dict[str, int] | None = None):
         self.datos = datos
         self.fechas = fechas
         self.m = cp_model.CpModel()
@@ -75,12 +80,16 @@ class Modelo:
         # Horizonte rodante: 'cola' = fechas de contexto (ya resueltas, no se deciden);
         # 'congelar' = asignaciones fijas de esos días; 'offset_equidad' = carga acumulada previa.
         # 'offset_horas' = minutos ya trabajados en ventanas previas (libro de jornada anual, C9);
-        # 'objetivo_horas' = minutos objetivo de ESTA ventana por trabajador (pacing blando, P4).
+        # 'objetivo_horas' = minutos objetivo de ESTA ventana por NO-fijo (pacing blando, P_horas);
+        # 'objetivo_horas_fijo' = objetivo ACUMULADO (min) de 1776 hasta esta ventana por fijo (Etapa 4).
         self.congelar = congelar or {}
         self.offset_equidad = offset_equidad or {}
         self.offset_horas = offset_horas or {}
         self.objetivo_horas = objetivo_horas or {}
+        self.objetivo_horas_fijo = objetivo_horas_fijo or {}
         self.cola = set(cola) if cola is not None else {f for (_, f) in self.congelar}
+        self.retira: dict[tuple[str, date], cp_model.BoolVar] = {}   # Etapa 4: día quitado a un fijo
+        self.fijos_activos: list[str] = []                          # fijos con línea congelada (retirables)
 
         #Conjunto de las variables del modelo x_trab_fecha_turno
         self.x: dict[tuple[str, date, str], cp_model.BoolVar] = {} 
@@ -305,7 +314,9 @@ class Modelo:
 
 
     def _c8_fijos(self) -> None:
-        """Fijos congelados (capa 1): trabajan su línea siempre que opere y estén disponibles."""
+        """Fijos congelados (capa 1): trabajan su línea siempre que opere y estén disponibles, con
+        el ÚNICO grado de libertad de que se les puede QUITAR un día (retira[w,f]) para cuadrar horas
+        a 1776 (Etapa 4). x = 1 − retira: su línea o LIBRE, nunca otro turno."""
         for w, t in self.datos.trabajadores.items():
             if t.tipo != "fijo":
                 continue
@@ -314,11 +325,14 @@ class Modelo:
             # (superaría 48 h/7d o 160 h/4sem): esos fijos se dejan libres, no se congelan.
             if phi is None or self.datos.turnos[phi].horas > 8:
                 continue
+            self.fijos_activos.append(w)
             for f in self.fechas:
                 if f in self.cola:                 # la cola ya está fijada
                     continue
                 if (w, f, phi) in self.x:
-                    self.m.add(self.x[(w, f, phi)] == 1)
+                    retira = self.m.new_bool_var(f"retira_{w}_{f:%Y%m%d}")
+                    self.retira[(w, f)] = retira
+                    self.m.add(self.x[(w, f, phi)] == 1 - retira)
 
     def _prescripcion_patron(self) -> dict[tuple[str, date], str]:
         """Turno que la rotación prescribe a cada (trabajador de patrón, fecha) de la ventana
@@ -442,22 +456,22 @@ class Modelo:
 
     # -- C9: jornada anual (tope duro + pacing blando) ----------------------- #
     def _c9_jornada_anual(self) -> None:
-        """C9 (DURA): la jornada anual efectiva no supera HMAX_AÑO. Libro de horas acumuladas:
-        minutos ya trabajados en ventanas previas (offset_horas) + los de esta ventana <= tope.
-        Guarda los términos de minutos de la ventana por trabajador para el déficit blando (P4).
-        Fijos fuera: su jornada está congelada, no la decide el solver (se valida aparte)."""
+        """C9 (DURA): la jornada anual efectiva no supera HMAX_AÑO (tope legal). Libro de horas
+        acumuladas: minutos previos (offset_horas) + los de esta ventana <= tope. Guarda los términos
+        de minutos por NO-fijo para la equidad de horas (P_horas). Los fijos también topan (antes
+        estaban fuera → un fijo podía superar el tope en silencio), pero NO entran en _min_ventana:
+        su jornada la cuadra _retirada_fijos quitando días (Etapa 4)."""
         dias = [f for f in self.fechas if f not in self.cola]     # solo la ventana
         self._min_ventana: dict[str, list] = {}
         for w, t in self.datos.trabajadores.items():
-            if t.tipo == "fijo":
-                continue
             terminos = self._minutos(w, dias)
             if not terminos:
                 continue                                          # no puede trabajar en la ventana
-            self._min_ventana[w] = terminos
             tope_min = round(HMAX_AÑO * t.factor_jornada * 60)    # tope escalado por reducción de jornada
             off = self.offset_horas.get(w, 0)                     # <= tope por invariante del libro
             self.m.add(sum(terminos) <= tope_min - off)
+            if t.tipo != "fijo":
+                self._min_ventana[w] = terminos                  # solo NO-fijos van a P_horas simétrica
 
     def _desviacion_jornada(self) -> tuple[object, int]:
         """P_horas (BLANDA, EQUIDAD): penaliza que los minutos de la ventana se desvíen del
@@ -479,6 +493,35 @@ class Modelo:
             cota_w = max(objetivo, max_min)                       # |Σmin − objetivo| ≤ max(objetivo, max_min)
             desv = self.m.new_int_var(0, cota_w, f"desvh_{w}")
             self.m.add_abs_equality(desv, sum(terminos) - objetivo)
+            desvs.append(desv)
+            cota += cota_w
+        return sum(desvs), cota
+
+    def _retirada_fijos(self) -> tuple[object, int]:
+        """Etapa 4 (BLANDA): cuadra la jornada de los fijos a 1776 quitándoles días (retira). Penaliza
+        la DESVIACIÓN (dos caras) de sus minutos acumulados respecto al ritmo de 1776:
+        |(off + Σmin_ventana) − objetivo_acum| = |Σmin_ventana − resto|, con resto = objetivo_acum − off
+        una CONSTANTE que absorbe los valores acumulados grandes (variable pequeña, sin desbordar).
+        Dos caras es clave: castiga pasarse (→ retira días) Y quedarse corto (→ NO over-remueve para
+        alimentar a otros). Al ser ACUMULADA dispara la retirada cuando el exceso banca ~medio día,
+        sorteando la granularidad de 8 h. El tope legal 1826 lo garantiza C9 aparte. (No pueden AÑADIR
+        días: si quedan por debajo del pace la desviación no se puede bajar más, y no se retira.)
+        Devuelve (Σ|desv|, cota)."""
+        dias = [f for f in self.fechas if f not in self.cola]
+        desvs, cota = [], 0
+        for w in self.fijos_activos:
+            objetivo_cum = self.objetivo_horas_fijo.get(w)
+            if objetivo_cum is None:
+                continue
+            terminos = self._minutos(w, dias)                     # = Σ min(phi)·(1 − retira)
+            if not terminos:
+                continue
+            max_win = len(dias) * max((round(s.horas * 60) for s in self.datos.turnos.values()), default=0)
+            resto = objetivo_cum - self.offset_horas.get(w, 0)    # constante: min "de pace" para esta ventana
+            # Σmin ∈ [0, max_win] → |Σmin − resto| ≤ max(|resto|, |max_win − resto|)
+            cota_w = max(abs(resto), abs(max_win - resto))
+            desv = self.m.new_int_var(0, cota_w, f"desvh_fijo_{w}")
+            self.m.add_abs_equality(desv, sum(terminos) - resto)
             desvs.append(desv)
             cota += cota_w
         return sum(desvs), cota
@@ -563,11 +606,13 @@ class Modelo:
         desviaciones, max_p2 = self._equidad_ponderada()   # cota_p2 exacta (incluye offset)
         self.desviaciones = desviaciones                  # expuesto para el resumen tras resolver
         p2 = sum(LAMBDA[metrica] * sum(vars_desv) for metrica, vars_desv in desviaciones.items())
-        p_horas, max_horas = self._desviacion_jornada()    # equidad de horas (|desv| respecto al objetivo)
+        p_horas, max_horas = self._desviacion_jornada()    # equidad de horas NO-fijos (|desv| vs objetivo)
+        p_ret, max_ret = self._retirada_fijos()            # Etapa 4: exceso de horas de fijos (one-sided)
+        p_retira = sum(self.retira.values())               # nº de días quitados a fijos (freno a quitar de más)
         p5, max_p5 = self._inestabilidad_mixto()           # estabilidad posicional del mixto (L-V)
 
-        # Cotas conservadoras del nivel bajo para escalar los pesos (W1 > max aporte de P2+P_horas+P5).
-        max_low = max_horas + PESO_ESTAB * max_p5
+        # Cotas conservadoras del nivel bajo para escalar los pesos (W1 > max aporte del nivel bajo).
+        max_low = max_horas + max_ret + PESO_RETIRA * len(self.retira) + PESO_ESTAB * max_p5
         W3 = 1
         W2 = max_low + 1
         W1 = (max_p2 * W2) + max_low + 1
@@ -577,7 +622,8 @@ class Modelo:
         solver.parameters.log_search_progress = log
         solver.parameters.relative_gap_limit = gap
         solver.parameters.max_time_in_seconds = tiempo
-        self.m.minimize(W1 * (p1 + p_exceso + PESO_DEV * p_dev) + W2 * p2 + W3 * (p_horas + PESO_ESTAB * p5))
+        self.m.minimize(W1 * (p1 + p_exceso + PESO_DEV * p_dev) + W2 * p2
+                        + W3 * (p_horas + p_ret + PESO_RETIRA * p_retira + PESO_ESTAB * p5))
         return solver, solver.solve(self.m)
 
 
@@ -603,11 +649,18 @@ def _actualizar_offset(offset: dict, mod: Modelo, plan_ventana: dict) -> None:
 
 
 def _actualizar_offset_horas(offset_horas: dict, datos: Datos, plan_ventana: dict) -> None:
-    """Suma al libro de jornada anual (C9) los minutos trabajados en la ventana (fijos fuera)."""
+    """Suma al libro de jornada anual (C9 + pace) los minutos trabajados en la ventana. Incluye a
+    los fijos (Etapa 4): un día retirado no aparece en el plan, así que no suma → el libro refleja
+    sus horas reales tras las retiradas."""
     for (w, f), turno in plan_ventana.items():
-        if datos.trabajadores[w].tipo == "fijo":
-            continue
         offset_horas[w] = offset_horas.get(w, 0) + round(datos.turnos[turno].horas * 60)
+
+
+def _linea_fija_de(datos: Datos, w: str) -> str | None:
+    """Única línea de capacidad normal de un fijo (versión a nivel módulo de Modelo._linea_fija)."""
+    lineas = [turno for (ww, turno), c in datos.capacidades.items()
+              if ww == w and c.v == 0 and (c.lv or c.sab or c.dom or c.fest)]
+    return lineas[0] if len(lineas) == 1 else None
 
 
 def resolver_anual(datos: Datos, inicio: date, fin: date, dias_ventana: int = 14,
@@ -623,6 +676,16 @@ def resolver_anual(datos: Datos, inicio: date, fin: date, dias_ventana: int = 14
     dias_horizonte = rango_fechas(inicio, fin)
     disp_año = {w: sum(datos.disponible(w, f) for f in dias_horizonte)
                 for w, t in datos.trabajadores.items() if t.tipo != "fijo"}
+    # Etapa 4: días ELEGIBLES de cada fijo congelado (línea ≤8h) sobre el año; base del prorrateo del
+    # objetivo 1776 acumulado (los fijos se cuadran quitando días de su propia línea).
+    fijo_elig: dict[str, list[date]] = {}
+    for w, t in datos.trabajadores.items():
+        if t.tipo != "fijo":
+            continue
+        phi = _linea_fija_de(datos, w)
+        if phi is None or datos.turnos[phi].horas > 8:
+            continue
+        fijo_elig[w] = [f for f in dias_horizonte if datos.elegible(w, phi, f)[0]]
     ini_v, v = inicio, 0
     while ini_v <= fin:
         fin_v = min(ini_v + timedelta(days=dias_ventana - 1), fin)
@@ -642,9 +705,20 @@ def resolver_anual(datos: Datos, inicio: date, fin: date, dias_ventana: int = 14
             factor = datos.trabajadores[w].factor_jornada        # reducción de jornada
             objetivo_horas[w] = round(HORAS_OBJETIVO * factor * 60 * disp_v / disp_total)
 
+        # Etapa 4: objetivo ACUMULADO (min) de 1776 de cada fijo hasta el FIN de esta ventana
+        # (prorrateo por días elegibles transcurridos). _retirada_fijos lo usa como línea de ritmo.
+        objetivo_horas_fijo = {}
+        for w, elig in fijo_elig.items():
+            if not elig:
+                continue
+            factor = datos.trabajadores[w].factor_jornada
+            elig_hasta = sum(1 for f in elig if f <= fin_v)
+            objetivo_horas_fijo[w] = round(HORAS_OBJETIVO * factor * 60 * elig_hasta / len(elig))
+
         mod = Modelo(datos, fechas_cola + fechas_ventana,
                      congelar=congelar, offset_equidad=offset, cola=cola,
-                     offset_horas=offset_horas, objetivo_horas=objetivo_horas)
+                     offset_horas=offset_horas, objetivo_horas=objetivo_horas,
+                     objetivo_horas_fijo=objetivo_horas_fijo)
         solver, st = mod.resolver(tiempo=segundos, trabajadores_cpu=hilos, log=log)
 
         pv = _plan_ventana(mod, solver, fechas_ventana)
