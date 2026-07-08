@@ -76,6 +76,7 @@ class Trabajador:
     tipo: str                       # fijo | patron | correturno | mixto
     patron: str | None              # id del patrón (solo tipo=patron)
     vacaciones: list[tuple[date, date]]
+    factor_jornada: float = 1.0     # reducción de jornada: escala objetivo (1776) y tope (1826). 1.0 = jornada completa
 
 
 @dataclass
@@ -152,7 +153,7 @@ def _cargar_turnos(directorio: Path) -> dict[str, Turno]:
         for fila in lector:
             hora_entrada = datetime.strptime(fila["hora_entrada"].strip(),"%H:%M").time()
             hora_salida = datetime.strptime(fila["hora_salida"].strip(),"%H:%M").time()
-            partido = fila.get("partido",0)
+            partido = int(fila.get("partido",0))
             turnos[fila["id_turno"]] = Turno(
                 id=fila["id_turno"],
                 municipio=fila["municipio"],
@@ -162,7 +163,7 @@ def _cargar_turnos(directorio: Path) -> dict[str, Turno]:
                 fes=int(fila["festivo"]),
                 hora_entrada=hora_entrada,
                 hora_salida=hora_salida,
-                dem=fila.get("dem",1),
+                dem=int(fila.get("dem",1)),
                 partido=partido,
                 horas=float(fila["horas_computadas"].strip()),
                 tipo=tipo_turno(hora_entrada, hora_salida) if partido==0 else "partido",
@@ -178,11 +179,20 @@ def _cargar_trabajadores(directorio: Path) -> dict[str, Trabajador]:
             vac1 = datetime.strptime(fila["vac1_inicio"].strip(), "%d/%m/%Y").date()
             vac2 = datetime.strptime(fila["vac2_inicio"].strip(), "%d/%m/%Y").date()
 
+            # factor_jornada: columna OPCIONAL (default 1.0). Reducción de jornada -> (0,1].
+            crudo = (fila.get("factor_jornada") or "").strip().replace(",", ".")
+            factor = float(crudo) if crudo else 1.0
+            if not (0 < factor <= 1):
+                raise ValueError(
+                    f"factor_jornada de {fila['id_trab']} fuera de rango (0,1]: {factor}"
+                )
+
             trabajadores[fila["id_trab"]] = Trabajador(
                 id=fila["id_trab"],
                 tipo=fila["tipo"],
                 patron=fila.get("patron",None),
-                vacaciones = [(vac1, vac1 + timedelta(days=14)),(vac2, vac2 + timedelta(days=14))]
+                vacaciones = [(vac1, vac1 + timedelta(days=14)),(vac2, vac2 + timedelta(days=14))],
+                factor_jornada=factor,
             )
     return trabajadores
 

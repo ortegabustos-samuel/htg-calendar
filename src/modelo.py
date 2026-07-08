@@ -12,11 +12,6 @@ from datetime import date, timedelta, time, datetime
 
 from cargar_datos import DIAS, DATA, LIBRE, Datos, cargar
 
-# pyarrow (conda) carga libprotobuf 5.29 y choca con el 6.33 que trae OR-Tools al importar
-# ortools (que importa pandas -> pyarrow). Se bloquea ANTES de importar ortools. Inofensivo
-# en entornos sin ese conflicto.
-sys.modules.setdefault("pyarrow", None)
-
 from ortools.sat.python import cp_model
 
 FECHA_INI = date(2026, 1, 1)
@@ -26,41 +21,29 @@ FECHA_FIN = date(2026, 1, 31)
 RMIN = 12          # descanso mínimo entre jornadas (h)          — art. 23, 31
 HMAX7 = 48         # máx. trabajo efectivo en 7 días (h)         — art. 23.2
 HMAX_4SEM = 160    # máx. trabajo efectivo en 4 semanas (h)      — art. 23 A
-HMAX_AÑO = 1776    # jornada anual efectiva (h) se aplica en el año completo, no por ventana
+HORAS_OBJETIVO = 1776  # jornada anual objetivo (h): meta de EQUIDAD (blanda), se persigue sin obligar
+HMAX_AÑO = 1826        # tope legal anual (h): límite DURO, no sobrepasable (aplica al año completo)
 CMAX = 6           # máx. días consecutivos trabajados
 
-PESO_TRABAJADOR = {
-    "correturno": 1,
-    "mixto": 2,
-    "turno": 4,
-    "fijo": 999,
-}
+# Penalización de cobertura (P1): UNIFORME por hueco (sin criticidad por tipo de turno; todo hueco
+# pesa igual). > 1 para que rescatar una cobertura domine sobre relajar una racha de 6 días o
+# desviar el patrón. (En el futuro se puede volver a diferenciar por tipo de turno.)
+PESO_COBERTURA = 10
 
-# Cargas indeseables cuya dispersión se reparte (equidad, P2) y su importancia relativa
-METRICAS = ("noche", "finde", "festivo", "12h", "24h", "partido")
-PESO_TURNOS = {
-    "24h": 10,
-    "12h": 8,
-    "noche": 6,
-    "partido": 4,
-    "tarde": 3,
-    "mañana": 2,
-}
+# Equidad (P2): se equipara al PROMEDIO el nº de findes y de festivos entre los trabajadores capaces
+# de cubrirlos. Los de SOLO L-V quedan fuera solos (nunca son elegibles en finde/festivo). Peso IGUAL
+# para todos los trabajadores (sin favorecer perfiles) y para ambas métricas (sin favorecer tipo de
+# día). LAMBDA queda como dial por si en el futuro se quiere ponderar finde vs festivo.
+METRICAS = ("finde", "festivo")
+LAMBDA = {"finde": 1, "festivo": 1}
 
-LAMBDA = {
-    "24h": 6,
-    "noche": 5,
-    "festivo": 5,
-    "12h": 4,
-    "finde": 3,
-    "partido": 2,
-}
+# P5 (desempate): "vale" de evitar que un MIXTO cambie de turno/posición dentro de una misma semana
+# laboral (L-V). Correturnos exentos (flexibles por diseño). Tunable.
+PESO_ESTAB = 5
 
-PESO_FLEX = {
-    "correturno": 4,
-    "mixto": 2,
-    "turno": 1,
-}
+# Fijación blanda del patrón (NIVEL DE COBERTURA): "vale" de sacar a un trabajador de patrón de su
+# rotación. < PESO_COBERTURA, así el patrón se sigue SIEMPRE salvo para rescatar una cobertura.
+PESO_DEV = 1
 # Lexicográfico por objetivo único: minimizar  W·P1 + P2, con W > max(P2). Como P2 = Σ λ·rango
 # y cada rango ≤ nº de días, max(P2) = Σλ·nº_días -> W se calcula según el horizonte
 # (W = Σλ·nº_días + 1). Así P1 domina SIEMPRE y P2 solo desempata (evita que al crecer el
@@ -120,6 +103,7 @@ class Modelo:
         self._c7_descanso_semanal()
         self._c8_fijos()
         self._c9_jornada_anual()                  # tope anual duro (libro de horas)
+        self.prescripcion = self._prescripcion_patron()   # turno de rotación por (patrón, fecha)
         self._warm_start_patron()                 # arranque pegado al patrón
 
     # -- Variables ----------------------------------------------------------- #
@@ -336,14 +320,17 @@ class Modelo:
                 if (w, f, phi) in self.x:
                     self.m.add(self.x[(w, f, phi)] == 1)
 
-    def _warm_start_patron(self) -> None:
-        """Siembra la búsqueda con el patrón: cada trabajador de patrón sugiere la línea que le
-        tocaría según la rotación (una fila por semana). Es un hint, no obliga."""
+    def _prescripcion_patron(self) -> dict[tuple[str, date], str]:
+        """Turno que la rotación prescribe a cada (trabajador de patrón, fecha) de la ventana
+        (incluye LIBRE). La rotación avanza una fila por semana desde el lunes de la 1ª semana;
+        cada trabajador del grupo arranca en una fila distinta (offset por orden en el grupo).
+        Fuente ÚNICA para el warm-start (_warm_start_patron) y la fijación (_fijacion_patron)."""
         ancla = self.fechas[0] - timedelta(days=self.fechas[0].weekday())   # lunes de la 1ª semana
         grupos: dict[str, list[str]] = defaultdict(list)
         for w, t in self.datos.trabajadores.items():
             if t.tipo == "patron" and t.patron:
                 grupos[t.patron].append(w)
+        pres: dict[tuple[str, date], str] = {}
         for patron, trabs in grupos.items():
             filas = self.datos.patrones.get(patron)
             if not filas:
@@ -351,42 +338,44 @@ class Modelo:
             T = len(filas)
             for offset, w in enumerate(sorted(trabs)):
                 for f in self.fechas:
-                    if f in self.cola:
-                        continue
-                    turno = filas[(offset + (f - ancla).days // 7) % T][DIAS[f.weekday()]]
-                    if turno != LIBRE and (w, f, turno) in self.x:
-                        self.m.add_hint(self.x[(w, f, turno)], 1)
+                    pres[(w, f)] = filas[(offset + (f - ancla).days // 7) % T][DIAS[f.weekday()]]
+        return pres
+
+    def _warm_start_patron(self) -> None:
+        """Siembra la búsqueda con el patrón: cada trabajador de patrón sugiere la línea que le
+        tocaría según la rotación. Es un hint, no obliga (la fijación la hace _fijacion_patron)."""
+        for (w, f), turno in self.prescripcion.items():
+            if f in self.cola:
+                continue
+            if turno != LIBRE and (w, f, turno) in self.x:
+                self.m.add_hint(self.x[(w, f, turno)], 1)
+
+    def _fijacion_patron(self) -> tuple[object, int]:
+        """Fijación BLANDA del patrón (capa 1): cada trabajador de patrón debe hacer su turno de
+        rotación. El desvío se penaliza en el NIVEL DE COBERTURA con peso PESO_DEV pequeño (<
+        valor de cubrir cualquier turno), así el patrón se sigue SIEMPRE y solo se desplaza a
+        alguien de su rotación si con ello se rescata una cobertura que si no quedaría sin cubrir
+        —única razón admitida—. Al ser BLANDA (no dura) nunca vuelve infactible una costura de
+        rotación o un festivo donde la línea no opera: simplemente lo absorbe como desvío. Quedan
+        FUERA (sin variable, no penalizan): vacaciones, festivos sin operatividad de la línea, o
+        sin capacidad ese día. Devuelve (suma_desvío, cota)."""
+        devs, cota = [], 0
+        for (w, f), turno in self.prescripcion.items():
+            if f in self.cola or turno == LIBRE:
+                continue
+            var = self.x.get((w, f, turno))
+            if var is None:
+                continue                # vacaciones / no opera / sin capacidad -> sin fijación
+            devs.append(1 - var)        # 1 si el trabajador NO hace su turno de rotación
+            cota += 1
+        return sum(devs), cota
 
 
     # -- Objetivos ----------------------------------------------------------- #
     def _coste_cobertura(self):
-        """P1: turnos no cubiertos ponderados por criticidad."""
-        return sum(PESO_TURNOS[self.datos.turnos[turno].tipo] * holgura
-                for (turno, _), holgura in self.u.items())
-
-    def _coste_preferencia_trabajador(self):
-        """
-        Penalización suave por asignar cargas indeseables a trabajadores menos flexibles.
-        No sustituye a la equidad ponderada.
-        Solo actúa como desempate.
-        """
-        coste = []
-        for w, trabajador in self.datos.trabajadores.items():
-            if trabajador.tipo == "fijo":
-                continue
-
-            peso_w = PESO_TRABAJADOR.get(trabajador.tipo, 1)
-
-            for f in self.fechas:
-                if f in self.cola:
-                    continue
-                for s in self.turnos_wd.get((w, f), []):
-                    for metrica in METRICAS:
-                        if self._contribuye(metrica, s, f):
-                            coste.append(
-                                peso_w * LAMBDA[metrica] * self.x[(w, f, s)]
-                            )
-        return sum(coste)
+        """P1: nº de turnos no cubiertos, con penalización UNIFORME por hueco (sin criticidad por
+        tipo de turno)."""
+        return PESO_COBERTURA * sum(self.u.values())
 
 
     def _contribuye(self, metrica: str, turno: str, f: date) -> bool:
@@ -409,10 +398,11 @@ class Modelo:
                 return False
 
     def _equidad_ponderada(self) -> tuple[dict[str, list[cp_model.IntVar]], int]:
-        """Para cada métrica: carga ACUMULADA por trabajador (offset previo del libro de equidad
-        + lo asignado en la ventana; fijos fuera) y su desviación ponderada respecto a la media.
-        Devuelve (desviaciones, cota_p2), con cota_p2 = cota superior de P2 = Σ λ·Σ desv, para
-        escalar los pesos del objetivo sin desbordar."""
+        """Para cada métrica (finde, festivo): carga ACUMULADA por trabajador (offset previo del
+        libro de equidad + lo asignado en la ventana; fijos fuera) y su desviación respecto a la
+        media. Equidad PLANA: peso_w=1 para todos, así se equipara el nº de findes/festivos al
+        promedio sin favorecer perfiles. Los de solo L-V no aparecen (nunca elegibles en
+        finde/festivo). Devuelve (desviaciones, cota_p2 = Σ λ·Σ desv) para escalar los pesos."""
         pool = [w for w, t in self.datos.trabajadores.items() if t.tipo != "fijo"]
         dias = [f for f in self.fechas if f not in self.cola]     # solo la ventana, no la cola
         desviaciones: dict[str, list[cp_model.IntVar]] = {}
@@ -421,7 +411,7 @@ class Modelo:
         for metrica in METRICAS:
             cargas = []
             for w in pool:
-                peso_w = PESO_FLEX.get(self.datos.trabajadores[w].tipo, 1)
+                peso_w = 1                                               # equidad PLANA: todos los capaces pesan igual
                 off = self.offset_equidad.get(w, {}).get(metrica, 0)     # carga previa (libro)
                 terminos = [self.x[(w, f, s)] for f in dias
                             for s in self.turnos_wd.get((w, f), [])
@@ -457,7 +447,6 @@ class Modelo:
         Guarda los términos de minutos de la ventana por trabajador para el déficit blando (P4).
         Fijos fuera: su jornada está congelada, no la decide el solver (se valida aparte)."""
         dias = [f for f in self.fechas if f not in self.cola]     # solo la ventana
-        tope_min = HMAX_AÑO * 60
         self._min_ventana: dict[str, list] = {}
         for w, t in self.datos.trabajadores.items():
             if t.tipo == "fijo":
@@ -466,23 +455,33 @@ class Modelo:
             if not terminos:
                 continue                                          # no puede trabajar en la ventana
             self._min_ventana[w] = terminos
+            tope_min = round(HMAX_AÑO * t.factor_jornada * 60)    # tope escalado por reducción de jornada
             off = self.offset_horas.get(w, 0)                     # <= tope por invariante del libro
             self.m.add(sum(terminos) <= tope_min - off)
 
-    def _deficit_jornada(self) -> tuple[object, int]:
-        """P4 (BLANDA): penaliza no alcanzar la jornada objetivo de la ventana (objetivo_horas[w],
-        minutos, proporcional a los días disponibles). Reparte el consumo a lo largo del año
-        (evita agotar a nadie antes de tiempo) y empuja a cumplir jornada. Devuelve (déficit, cota)."""
-        deficits, cota = [], 0
+    def _desviacion_jornada(self) -> tuple[object, int]:
+        """P_horas (BLANDA, EQUIDAD): penaliza que los minutos de la ventana se desvíen del
+        objetivo prorrateado (objetivo_horas[w], derivado de HORAS_OBJETIVO=1776) por DEBAJO o
+        por ENCIMA (desviación absoluta, simétrica). Reparte la jornada de forma pareja a lo
+        largo del año y evita que nadie derive hacia el tope duro (1826). Va al nivel bajo
+        (desempate): solo actúa cuando no cuesta cobertura ni equidad de findes. Fijos fuera
+        (su jornada se cuadra por retirada de días, Etapa 4). Devuelve (Σ|desv|, cota).
+        Nota: exceso y déficit pesan IGUAL (|·|). Si se quisiera penalizar más suave el exceso,
+        separar en dos variables (déficit / exceso) con pesos distintos."""
+        max_turno_min = max((round(t.horas * 60) for t in self.datos.turnos.values()), default=0)
+        n_dias = len([f for f in self.fechas if f not in self.cola])
+        max_min = n_dias * max_turno_min                          # cota superior de minutos en la ventana
+        desvs, cota = [], 0
         for w, terminos in getattr(self, "_min_ventana", {}).items():
             objetivo = self.objetivo_horas.get(w, 0)
             if objetivo <= 0:
                 continue
-            deficit = self.m.new_int_var(0, objetivo, f"deficit_{w}")
-            self.m.add(deficit >= objetivo - sum(terminos))       # min. lo empuja a max(0, obj-horas)
-            deficits.append(deficit)
-            cota += objetivo
-        return sum(deficits), cota
+            cota_w = max(objetivo, max_min)                       # |Σmin − objetivo| ≤ max(objetivo, max_min)
+            desv = self.m.new_int_var(0, cota_w, f"desvh_{w}")
+            self.m.add_abs_equality(desv, sum(terminos) - objetivo)
+            desvs.append(desv)
+            cota += cota_w
+        return sum(desvs), cota
 
     def _exceso_semanal(self) -> tuple[object, int]:
         """Penaliza que un trabajador supere 5 días trabajados en una semana ISO completa (=> 6
@@ -506,36 +505,79 @@ class Modelo:
                 cota += len(dias) - 5
         return sum(excesos), cota
 
+    def _inestabilidad_mixto(self) -> tuple[object, int]:
+        """P5 (BLANDA, nivel de desempate): penaliza que un MIXTO use más de un turno
+        distinto en días LABORABLES de DIARIO (L-V no festivos) dentro de una misma semana
+        ISO —romper la "misma posición de lunes a viernes"—. Se excluyen sábados, domingos
+        y festivos (por municipio del turno): ahí el mixto hace turno de finde/festivo, que
+        es flexible por diseño, no su posición de diario. Solo mixtos: correturnos son
+        flexibles por diseño y fijos/patrón ya tienen la posición determinada. Solo la
+        ventana (la cola es contexto). Un mixto con una sola posición de diario posible esa
+        semana no aporta nada (|posibles|<=1) → término ≈0 hasta que el dato dé varias
+        posiciones L-V. Penalización = nº de posiciones extra tras la 1ª. Devuelve (suma, cota)."""
+        dias_semana: dict[tuple[int, int], list[date]] = defaultdict(list)
+        for f in self.fechas:
+            if f in self.cola or f.weekday() >= 5:        # solo laborables de la ventana
+                continue
+            dias_semana[semana(f)].append(f)
+
+        self.inestab: dict[tuple[str, tuple[int, int]], cp_model.IntVar] = {}
+        penalizaciones, cota = [], 0
+        for w, t in self.datos.trabajadores.items():
+            if t.tipo != "mixto":
+                continue
+            for sem, dias in dias_semana.items():
+                # (día, turno) de diario: excluye festivos (en festivo el mixto hace turno de
+                # festivo/refuerzo, otra posición, como el finde -> no es inestabilidad)
+                pares = [(f, s) for f in dias for s in self.turnos_wd.get((w, f), [])
+                         if not self.datos.es_festivo(f, self.datos.turnos[s].municipio)]
+                posibles = sorted({s for _, s in pares})
+                if len(posibles) <= 1:
+                    continue                              # sin variabilidad posible
+                distintos = []
+                for s in posibles:
+                    usa = self.m.new_bool_var(f"usa_{w}_{sem[0]}w{sem[1]}_{s}")
+                    for f, ss in pares:
+                        if ss == s:
+                            self.m.add(usa >= self.x[(w, f, s)])   # cota inferior: basta al minimizar
+                    distintos.append(usa)
+                pen = self.m.new_int_var(0, len(posibles) - 1, f"inestab_{w}_{sem[0]}w{sem[1]}")
+                self.m.add(pen >= sum(distintos) - 1)     # posiciones extra tras la 1ª
+                self.inestab[(w, sem)] = pen
+                penalizaciones.append(pen)
+                cota += len(posibles) - 1
+        return sum(penalizaciones), cota
+
     # -- Resolución (objetivo jerárquico por pesos) -------------------------- #
-    def resolver(self, segundos: int = 120, trabajadores_cpu: int = 4, log: bool = False):
-        """Objetivo jerárquico en uno solo:  W1·(P1+exceso) + W2·P2 + W3·(P3+P4), con W1 > W2 > W3.
-        Nivel cobertura: P1 turnos no cubiertos + penalización de 6 días seguidos dentro de una
-        semana (peso 1 < valor de cubrir un turno, así solo se acepta si rescata cobertura).
-        -> P2: equidad ponderada -> P3 preferencia por perfil + P4 déficit de jornada (ambos
-        desempates, comparten el nivel más bajo para no inflar la torre de pesos y evitar
-        desbordar int64). Los pesos garantizan que el nivel cobertura domine a P2 y P2 a (P3+P4)."""
+    def resolver(self,gap:float = 0.05,tiempo:int = 600,trabajadores_cpu: int = 4, log: bool = False):
+        """Objetivo jerárquico en uno solo:  W1·(P1+exceso+desvío_patrón) + W2·P2 + W3·(P_horas+P5),
+        con W1>W2>W3. NIVEL COBERTURA (todo con peso pequeño < valor de cubrir un turno, así solo
+        se acepta si rescata cobertura): P1 turnos no cubiertos (UNIFORME, sin criticidad por tipo de
+        turno) + penalización de 6 días seguidos dentro de una semana + desvío del patrón (fijación
+        blanda). -> P2: equidad PLANA del nº de findes/festivos entre capaces (todos pesan igual) ->
+        P_horas equidad de jornada (|desv| respecto al objetivo 1776) + P5 estabilidad posicional del
+        mixto (los dos desempates comparten el nivel más bajo para no inflar la torre de pesos)."""
         p1 = self._coste_cobertura()
         p_exceso, _ = self._exceso_semanal()               # 6 días seguidos dentro de una semana
+        p_dev, _ = self._fijacion_patron()                 # desvío del patrón (fijación blanda)
         desviaciones, max_p2 = self._equidad_ponderada()   # cota_p2 exacta (incluye offset)
+        self.desviaciones = desviaciones                  # expuesto para el resumen tras resolver
         p2 = sum(LAMBDA[metrica] * sum(vars_desv) for metrica, vars_desv in desviaciones.items())
-        p3 = self._coste_preferencia_trabajador()
-        p4, max_p4 = self._deficit_jornada()               # cota_p4 = Σ objetivo (minutos)
+        p_horas, max_horas = self._desviacion_jornada()    # equidad de horas (|desv| respecto al objetivo)
+        p5, max_p5 = self._inestabilidad_mixto()           # estabilidad posicional del mixto (L-V)
 
-        n = len(self.fechas)
-        num_trab = len(self.datos.trabajadores)
-        max_lambda = sum(LAMBDA.values())
-        # Cotas conservadoras de P3 y P4 para escalar los pesos (W1 > max aporte de P2+P3+P4).
-        max_p3 = max_lambda * n * num_trab * max(v for k, v in PESO_TRABAJADOR.items() if k != "fijo")
-        max_low = max_p3 + max_p4
+        # Cotas conservadoras del nivel bajo para escalar los pesos (W1 > max aporte de P2+P_horas+P5).
+        max_low = max_horas + PESO_ESTAB * max_p5
         W3 = 1
         W2 = max_low + 1
         W1 = (max_p2 * W2) + max_low + 1
 
         solver = cp_model.CpSolver()
-        solver.parameters.max_time_in_seconds = segundos
         solver.parameters.num_search_workers = trabajadores_cpu
         solver.parameters.log_search_progress = log
-        self.m.minimize(W1 * (p1 + p_exceso) + W2 * p2 + W3 * (p3 + p4))
+        solver.parameters.relative_gap_limit = gap
+        solver.parameters.max_time_in_seconds = tiempo
+        self.m.minimize(W1 * (p1 + p_exceso + PESO_DEV * p_dev) + W2 * p2 + W3 * (p_horas + PESO_ESTAB * p5))
         return solver, solver.solve(self.m)
 
 
@@ -590,18 +632,20 @@ def resolver_anual(datos: Datos, inicio: date, fin: date, dias_ventana: int = 14
         cola = set(fechas_cola)
         congelar = {(w, f): plan[(w, f)] for (w, f) in plan if f in cola}
 
-        # Objetivo de jornada de la ventana: prorrateo de HMAX_AÑO por días disponibles (P4 blando)
+        # Objetivo de jornada de la ventana: prorrateo de HORAS_OBJETIVO (meta blanda, 1776) por
+        # días disponibles (P4). El tope duro (HMAX_AÑO, 1826) lo impone C9 aparte.
         objetivo_horas = {}
         for w, disp_total in disp_año.items():
             if disp_total == 0:
                 continue
             disp_v = sum(datos.disponible(w, f) for f in fechas_ventana)
-            objetivo_horas[w] = round(HMAX_AÑO * 60 * disp_v / disp_total)
+            factor = datos.trabajadores[w].factor_jornada        # reducción de jornada
+            objetivo_horas[w] = round(HORAS_OBJETIVO * factor * 60 * disp_v / disp_total)
 
         mod = Modelo(datos, fechas_cola + fechas_ventana,
                      congelar=congelar, offset_equidad=offset, cola=cola,
                      offset_horas=offset_horas, objetivo_horas=objetivo_horas)
-        solver, st = mod.resolver(segundos=segundos, trabajadores_cpu=hilos, log=log)
+        solver, st = mod.resolver(tiempo=segundos, trabajadores_cpu=hilos, log=log)
 
         pv = _plan_ventana(mod, solver, fechas_ventana)
         plan.update(pv)
@@ -681,7 +725,7 @@ def main() -> None:
 
     
     solver, status = modelo.resolver(
-        segundos=120,
+        tiempo=120,
         trabajadores_cpu=8,
         log=False,
     )

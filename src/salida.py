@@ -3,16 +3,12 @@
 """
 salida.py — Visualización y volcado del cuadrante resuelto.
 
-A partir de un modelo resuelto genera en data/output/:
-  * calendario.html          — rejilla visual trabajadores × días (coloreada por tipo),
-                               con vacaciones/libres, KPIs y turnos sin cubrir.
-  * calendario.csv           — asignación por trabajador y día.
-  * informe_cobertura.csv    — turnos sin cubrir (día, turno, tipo, municipio).
-También imprime un resumen por consola.
+A partir de un modelo resuelto genera en data/output/calendario.xlsx: rejilla
+trabajadores × días (coloreada por tipo), con vacaciones/libres, KPIs y turnos
+sin cubrir. También imprime un resumen por consola.
 """
 from __future__ import annotations
 
-import csv
 from collections import defaultdict
 from datetime import date
 from pathlib import Path
@@ -22,17 +18,12 @@ from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
 from cargar_datos import Datos, cargar
-from modelo import (LAMBDA, METRICAS, PESO_TURNOS, Modelo, cp_model,
-                    rango_fechas, resolver_anual)
+from modelo import LAMBDA, METRICAS, PESO_COBERTURA, Modelo, rango_fechas
 
 RAIZ = Path(__file__).resolve().parents[1]
 SALIDA = RAIZ / "data" / "output"
 
 DIA_INI = ["L", "M", "X", "J", "V", "S", "D"]
-CODIGO = {"mañana": "M", "tarde": "T", "noche": "N", "24h": "G", "partido": "P"}
-COLOR = {"mañana": "#fff3b0", "tarde": "#ffd6a5", "noche": "#a0c4ff",
-         "24h": "#ffadad", "partido": "#caffbf"}
-COLOR_LIBRE, COLOR_VAC = "#ffffff", "#e0e0e0"
 
 # Colores por categoría de día para el Excel (cuerpo / cabecera)
 CAT_FILL = {"lv": "EAF1FB", "finde": "FFF2CC", "festivo": "FCE4D6"}
@@ -54,112 +45,6 @@ def sin_cubrir(modelo: Modelo, solver) -> list[tuple[date, str]]:
     for (turno, f), u in modelo.u.items():
         huecos += [(f, turno)] * solver.value(u)
     return sorted(huecos)
-
-
-# --------------------------------------------------------------------------- #
-#  Volcado CSV
-# --------------------------------------------------------------------------- #
-def escribir_csv(datos: Datos, fechas: list[date], asign, huecos) -> None:
-    SALIDA.mkdir(parents=True, exist_ok=True)
-
-    with open(SALIDA / "calendario.csv", "w", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        w.writerow(["id_trab", "tipo"] + [d.strftime("%d/%m") for d in fechas])
-        for trab, t in datos.trabajadores.items():
-            fila = []
-            for d in fechas:
-                if not datos.disponible(trab, d):
-                    fila.append("VAC")
-                else:
-                    fila.append(asign.get((trab, d), "LIBRE"))
-            w.writerow([trab, t.tipo] + fila)
-
-    with open(SALIDA / "informe_cobertura.csv", "w", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        w.writerow(["fecha", "id_turno", "tipo", "municipio"])
-        for d, turno in huecos:
-            t = datos.turnos[turno]
-            w.writerow([d.strftime("%d/%m/%Y"), turno, t.tipo, t.municipio])
-
-
-# --------------------------------------------------------------------------- #
-#  Visualización HTML
-# --------------------------------------------------------------------------- #
-def _celda(datos: Datos, trab: str, d: date, asign) -> str:
-    if not datos.disponible(trab, d):
-        return f'<td style="background:{COLOR_VAC}" title="vacaciones">VAC</td>'
-    turno = asign.get((trab, d))
-    if turno is None:
-        return f'<td style="background:{COLOR_LIBRE};color:#ccc">·</td>'
-    t = datos.turnos[turno]
-    return (f'<td style="background:{COLOR[t.tipo]}" title="{turno} · {t.tipo} · {t.municipio}">'
-            f'{turno}</td>')
-
-
-def escribir_html(datos: Datos, fechas: list[date], asign, huecos, kpis: dict) -> None:
-    SALIDA.mkdir(parents=True, exist_ok=True)
-    filas = []
-
-    # Cabecera de días
-    cab = "".join(f'<th>{d.day}<br><small>{DIA_INI[d.weekday()]}</small></th>' for d in fechas)
-    filas.append(f"<tr><th>Trabajador</th><th>Tipo</th>{cab}</tr>")
-
-    # Una fila por trabajador (ordenados por tipo y patrón)
-    def orden(kv):
-        _, t = kv
-        return (t.tipo, t.patron or "", _)
-    for trab, t in sorted(datos.trabajadores.items(), key=orden):
-        celdas = "".join(_celda(datos, trab, d, asign) for d in fechas)
-        etiqueta = t.patron if t.tipo == "patron" else t.tipo
-        filas.append(f'<tr><th class="w">{trab}</th><td class="tp">{etiqueta}</td>{celdas}</tr>')
-
-    # Nº de turnos sin cubrir por día (fila resumen)
-    por_dia = {d: 0 for d in fechas}
-    for d, _ in huecos:
-        por_dia[d] += 1
-    resumen = "".join(f'<td class="{"h" if por_dia[d] else ""}">{por_dia[d] or ""}</td>'
-                      for d in fechas)
-    filas.append(f'<tr><th class="w">SIN CUBRIR</th><td></td>{resumen}</tr>')
-
-    # Tabla de turnos sin cubrir
-    filas_huecos = "".join(
-        f"<tr><td>{d:%d/%m}</td><td>{s}</td><td>{datos.turnos[s].tipo}</td>"
-        f"<td>{datos.turnos[s].municipio}</td></tr>" for d, s in huecos)
-
-    leyenda = " ".join(
-        f'<span style="background:{c};padding:2px 8px;border:1px solid #999">{k}</span>'
-        for k, c in COLOR.items())
-
-    html = f"""<!doctype html><html lang="es"><head><meta charset="utf-8">
-<title>Cuadrante {fechas[0]:%d/%m/%Y} – {fechas[-1]:%d/%m/%Y}</title>
-<style>
- body{{font-family:sans-serif;font-size:12px;margin:16px}}
- h1{{font-size:18px}}
- table{{border-collapse:collapse;margin-top:10px}}
- td,th{{border:1px solid #ccc;padding:2px 4px;text-align:center;white-space:nowrap}}
- th.w{{position:sticky;left:0;background:#f4f4f4;text-align:left}}
- td.tp{{color:#666;font-size:10px}}
- td.h{{background:#ff6b6b;color:#fff;font-weight:bold}}
- .kpi{{display:inline-block;background:#f4f4f4;border:1px solid #ddd;padding:6px 12px;margin:4px}}
- .cal{{overflow:auto;max-height:80vh;border:1px solid #ddd}}
-</style></head><body>
-<h1>Cuadrante {fechas[0]:%d/%m/%Y} – {fechas[-1]:%d/%m/%Y}</h1>
-<div>
- <span class="kpi">Cobertura: <b>{kpis['cubiertos']}/{kpis['demanda']}</b> ({kpis['pct']:.1f}%)</span>
- <span class="kpi">Sin cubrir: <b>{kpis['huecos']}</b></span>
- <span class="kpi">P1 coste: <b>{kpis['p1']}</b></span>
- <span class="kpi">P2 equidad: <b>{kpis['p2']}</b></span>
- <span class="kpi">Estado: <b>{kpis['estado']}</b></span>
-</div>
-<p>Leyenda: {leyenda}
- <span style="background:{COLOR_VAC};padding:2px 8px;border:1px solid #999">VAC</span>
- <span style="border:1px solid #999;padding:2px 8px">· libre</span></p>
-<div class="cal"><table>{''.join(filas)}</table></div>
-<h2>Turnos sin cubrir ({len(huecos)})</h2>
-<table><tr><th>Fecha</th><th>Turno</th><th>Tipo</th><th>Municipio</th></tr>{filas_huecos}</table>
-</body></html>"""
-    (SALIDA / "calendario.html").write_text(html, encoding="utf-8")
-
 
 # --------------------------------------------------------------------------- #
 #  Excel (formato de la empresa)
@@ -240,12 +125,13 @@ def escribir_excel(datos: Datos, fechas: list[date], asign, huecos, kpis: dict) 
 #  Resumen por consola
 # --------------------------------------------------------------------------- #
 def resumen_consola(datos: Datos, fechas: list[date], huecos, kpis: dict,
-                    rangos, solver) -> None:
+                    desviaciones, solver) -> None:
     print(f"Estado: {kpis['estado']}")
     print(f"Cobertura: {kpis['cubiertos']}/{kpis['demanda']} ({kpis['pct']:.1f}%)  "
           f"| sin cubrir: {kpis['huecos']}  | P1={kpis['p1']}  P2={kpis['p2']}")
-    print("Equidad (rango max-min por métrica): "
-          + ", ".join(f"{m}={solver.value(r)}" for m, r in rangos.items()))
+    print("Equidad (desviación ponderada por métrica): "
+          + ", ".join(f"{m}={sum(solver.value(v) for v in vars_desv)}"
+                      for m, vars_desv in desviaciones.items()))
     # sin cubrir por día
     por_dia = {}
     for d, _ in huecos:
@@ -253,8 +139,7 @@ def resumen_consola(datos: Datos, fechas: list[date], huecos, kpis: dict,
     if por_dia:
         peor = sorted(por_dia.items(), key=lambda kv: -kv[1])[:5]
         print("Días con más huecos: " + ", ".join(f"{d:%d/%m}:{n}" for d, n in peor))
-    print(f"\nFicheros en {SALIDA.relative_to(RAIZ)}/: calendario.xlsx, calendario.html, "
-          f"calendario.csv, informe_cobertura.csv")
+    print(f"\nFichero en {SALIDA.relative_to(RAIZ)}/: calendario.xlsx")
 
 
 # --------------------------------------------------------------------------- #
@@ -268,14 +153,13 @@ def generar(modelo: Modelo, solver, estado) -> None:
     kpis = {
         "demanda": demanda, "huecos": n_huecos, "cubiertos": demanda - n_huecos,
         "pct": 100 * (demanda - n_huecos) / demanda if demanda else 0,
-        "p1": sum(PESO_TURNOS[datos.turnos[t].tipo] * solver.value(u) for (t, _), u in modelo.u.items()),
-        "p2": sum(LAMBDA[m] * solver.value(r) for m, r in modelo.rangos.items()),
+        "p1": PESO_COBERTURA * sum(solver.value(u) for u in modelo.u.values()),
+        "p2": sum(LAMBDA[m] * sum(solver.value(v) for v in vars_desv)
+                  for m, vars_desv in modelo.desviaciones.items()),
         "estado": solver.status_name(estado),
     }
-    escribir_csv(datos, fechas, asign, huecos)
-    escribir_html(datos, fechas, asign, huecos, kpis)
     escribir_excel(datos, fechas, asign, huecos, kpis)
-    resumen_consola(datos, fechas, huecos, kpis, modelo.rangos, solver)
+    resumen_consola(datos, fechas, huecos, kpis, modelo.desviaciones, solver)
 
 
 # --------------------------------------------------------------------------- #
@@ -317,7 +201,7 @@ def huecos_del_plan(datos: Datos, fechas: list[date], plan: dict) -> list[tuple[
 def _kpis_plan(datos: Datos, fechas: list[date], plan: dict, huecos: list, estado: str) -> dict:
     demanda = sum(datos.turnos[t].dem for t in datos.turnos for f in fechas if datos.opera(t, f))
     n_huecos = len(huecos)
-    p1 = sum(PESO_TURNOS[datos.turnos[s].tipo] for _, s in huecos)
+    p1 = PESO_COBERTURA * len(huecos)
     # P2 anual (aprox.): dispersión de cargas indeseables por trabajador (fijos fuera)
     cargas = {m: defaultdict(int) for m in METRICAS}
     for (w, f), s in plan.items():
@@ -341,11 +225,9 @@ def _kpis_plan(datos: Datos, fechas: list[date], plan: dict, huecos: list, estad
 
 def generar_anual(datos: Datos, fechas: list[date], plan: dict,
                   estado: str = "HORIZONTE RODANTE") -> None:
-    """Vuelca a Excel/HTML/CSV el plan anual del horizonte rodante."""
+    """Vuelca a Excel el plan anual del horizonte rodante."""
     huecos = huecos_del_plan(datos, fechas, plan)
     kpis = _kpis_plan(datos, fechas, plan, huecos, estado)
-    escribir_csv(datos, fechas, plan, huecos)
-    escribir_html(datos, fechas, plan, huecos, kpis)
     escribir_excel(datos, fechas, plan, huecos, kpis)
     print(f"Estado: {kpis['estado']}")
     print(f"Cobertura: {kpis['cubiertos']}/{kpis['demanda']} ({kpis['pct']:.1f}%)  "
@@ -356,14 +238,16 @@ def generar_anual(datos: Datos, fechas: list[date], plan: dict,
     if por_dia:
         peor = sorted(por_dia.items(), key=lambda kv: -kv[1])[:5]
         print("Días con más huecos: " + ", ".join(f"{d:%d/%m}:{n}" for d, n in peor))
-    print(f"\nFicheros en {SALIDA.relative_to(RAIZ)}/: calendario.xlsx, calendario.html, "
-          f"calendario.csv, informe_cobertura.csv")
+    print(f"\nFichero en {SALIDA.relative_to(RAIZ)}/: calendario.xlsx")
 
 
 if __name__ == "__main__":
+    # Prueba de resolución COMPLETA (sin horizonte rodante ni ventanas): todo el
+    # mes se decide en un único modelo, para ver hasta dónde llega el solver en
+    # un tiempo razonable. Para producción (año completo) usar resolver_anual.
     datos = cargar("data/input")
-    inicio, fin = date(2026, 1, 1), date(2026, 12, 31)
-    plan = resolver_anual(datos, inicio, fin, dias_ventana=14, dias_cola=28,
-                          segundos=60, hilos=16, log=False)
+    inicio, fin = date(2026, 1, 1), date(2026, 1, 31)
     fechas = rango_fechas(inicio, fin)
-    generar_anual(datos, fechas, plan)
+    modelo = Modelo(datos, fechas)
+    solver, estado = modelo.resolver(trabajadores_cpu=16, log=True)
+    generar(modelo, solver, estado)
