@@ -85,6 +85,8 @@ class Trabajador:
     patron: str | None              # id del patrón (solo tipo=patron)
     vacaciones: list[tuple[date, date]]
     factor_jornada: float = 1.0     # reducción de jornada: escala objetivo (1776) y tope (1826). 1.0 = jornada completa
+    grupo: str | None = None        # grupo de EQUIDAD: mismos `grupo` se equiparan entre sí (findes/festivos).
+                                    # Lo asigna la empresa; None = sin grupo (no entra en equidad de grupo)
 
 
 @dataclass
@@ -207,6 +209,7 @@ def _cargar_trabajadores(directorio: Path) -> dict[str, Trabajador]:
                 patron=fila.get("patron",None),
                 vacaciones = [(vac1, vac1 + timedelta(days=14)),(vac2, vac2 + timedelta(days=14))],
                 factor_jornada=factor,
+                grupo=(fila.get("grupo") or "").strip() or None,   # columna OPCIONAL de grupo de equidad
             )
     return trabajadores
 
