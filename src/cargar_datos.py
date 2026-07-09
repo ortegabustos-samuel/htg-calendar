@@ -22,6 +22,10 @@ DATA = RAIZ / "data" / "input"
 
 DIAS = ["lun", "mar", "mie", "jue", "vie", "sab", "dom"]   # patrones.csv; índice = weekday()
 LIBRE = "LIBRE"
+# Consumo de capacidad de un turno LOCALIZADO 24h para la EQUIDAD (no lo legal): una quincena de
+# localizado son 7 turnos (2 días una semana + 5 la otra) y equivale a una quincena normal de
+# 80 h (8h·5días·2sem) → cada turno localizado "consume" 80/7 h. (Calibrar con el patrón real.)
+CONSUMO_LOCALIZADO = 80 / 7
 # --------------------------------------------------------------------------- #
 #  Derivaciones horarias
 # --------------------------------------------------------------------------- #
@@ -40,7 +44,7 @@ def duracion_turno(entrada: time, salida: time) -> float:
 
 def tipo_turno(entrada: time, salida: time) -> str:
     dur = duracion_turno(entrada,salida)
-    if dur >= 20:
+    if dur >= 22:
         return "24h"
     elif dur >=12:
         return "12h"
@@ -66,8 +70,12 @@ class Turno:
     hora_salida: time   #Hora de salida del turno
     dem: int            #Demanda del turno (para valladolid es 1 siempre)
     partido: int        #Flag que indica si es turno partido 0/1
-    horas: float        # horas efectivas computables para la jornada (partido y 24h -> 8)
+    horas: float        # horas COMPUTADAS (jornada legal; partido y 24h -> 8). Para el tope 1826.
     tipo: str           #Tipo de turno (24h, partido, tarde, mañana, noche)
+    prioridad: int = 1  # prioridad de cobertura: coste de dejarlo SIN cubrir (entero >=1, mayor = más crítico)
+    horas_consumo: float = 0.0  # horas que CONSUME de la capacidad anual (para la EQUIDAD, no lo legal).
+                                # Localizado 24h -> CONSUMO_LOCALIZADO (una quincena de 7 = quincena normal 80h);
+                                # normal -> = horas computadas. Lo deriva el cargador.
 
 
 @dataclass
@@ -154,6 +162,10 @@ def _cargar_turnos(directorio: Path) -> dict[str, Turno]:
             hora_entrada = datetime.strptime(fila["hora_entrada"].strip(),"%H:%M").time()
             hora_salida = datetime.strptime(fila["hora_salida"].strip(),"%H:%M").time()
             partido = int(fila.get("partido",0))
+            horas = float(fila["horas_computadas"].strip())
+            tipo = tipo_turno(hora_entrada, hora_salida) if partido==0 else "partido"
+            # Consumo para la EQUIDAD: un localizado 24h consume más capacidad que sus 8 h computadas
+            consumo = CONSUMO_LOCALIZADO if tipo == "24h" else horas
             turnos[fila["id_turno"]] = Turno(
                 id=fila["id_turno"],
                 municipio=fila["municipio"],
@@ -165,8 +177,10 @@ def _cargar_turnos(directorio: Path) -> dict[str, Turno]:
                 hora_salida=hora_salida,
                 dem=int(fila.get("dem",1)),
                 partido=partido,
-                horas=float(fila["horas_computadas"].strip()),
-                tipo=tipo_turno(hora_entrada, hora_salida) if partido==0 else "partido",
+                horas=horas,
+                tipo=tipo,
+                prioridad=int(fila.get("prioridad", 1)),
+                horas_consumo=consumo,
             )
     return turnos
 

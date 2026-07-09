@@ -387,9 +387,11 @@ class Modelo:
 
     # -- Objetivos ----------------------------------------------------------- #
     def _coste_cobertura(self):
-        """P1: nº de turnos no cubiertos, con penalización UNIFORME por hueco (sin criticidad por
-        tipo de turno)."""
-        return PESO_COBERTURA * sum(self.u.values())
+        """P1: coste de turnos no cubiertos, PONDERADO por la prioridad de cobertura del turno
+        (PESO_COBERTURA·prioridad·hueco). Mayor prioridad = más caro dejarlo sin cubrir → cuando hay
+        que dejar huecos, caen en los turnos menos prioritarios."""
+        return sum(PESO_COBERTURA * self.datos.turnos[turno].prioridad * holgura
+                   for (turno, _), holgura in self.u.items())
 
 
     def _contribuye(self, metrica: str, turno: str, f: date) -> bool:
@@ -626,6 +628,64 @@ class Modelo:
                         + W3 * (p_horas + p_ret + PESO_RETIRA * p_retira + PESO_ESTAB * p5))
         return solver, solver.solve(self.m)
 
+    # -- Resolución LEXICOGRÁFICA (por pasadas; no desborda a ningún horizonte) ---------- #
+    def resolver_lexicografico(self, tiempos: tuple[int, int, int] = (900, 600, 600),
+                               trabajadores_cpu: int = 8, gap: float = 0.0, log: bool = False):
+        """Objetivo lexicográfico por PASADAS (sin torre de pesos → no desborda int64 ni con el año
+        completo). Tres niveles en orden estricto de prioridad, cada uno con sus coeficientes
+        NATURALES (pequeños); la prioridad se impone CONGELANDO cada nivel con una restricción
+        (nivel ≤ su óptimo) antes de optimizar el siguiente:
+          1) cobertura: huecos + 6-días-seguidos + desvío del patrón
+          2) equidad:   nº de findes/festivos entre capaces
+          3) horas:     desviación de jornada (no-fijos) + retirada de fijos + estabilidad del mixto
+        Cada pasada arranca warm-started con la solución de la anterior. Devuelve (solver, estado)."""
+        p1 = self._coste_cobertura()
+        p_exceso, _ = self._exceso_semanal()
+        p_dev, _ = self._fijacion_patron()
+        desviaciones, _ = self._equidad_ponderada()
+        self.desviaciones = desviaciones
+        p2 = sum(LAMBDA[m] * sum(v) for m, v in desviaciones.items())
+        p_horas, _ = self._desviacion_jornada()
+        p_ret, _ = self._retirada_fijos()
+        p_retira = sum(self.retira.values())
+        p5, _ = self._inestabilidad_mixto()
+
+        niveles = [
+            ("cobertura", p1 + p_exceso + PESO_DEV * p_dev),
+            ("equidad", p2),
+            ("horas", p_horas + p_ret + PESO_RETIRA * p_retira + PESO_ESTAB * p5),
+        ]
+
+        solver = cp_model.CpSolver()
+        solver.parameters.num_search_workers = trabajadores_cpu
+        solver.parameters.log_search_progress = log
+        if gap > 0:
+            solver.parameters.relative_gap_limit = gap
+
+        self.plan_lexico: dict[tuple[str, date], str] = {}   # última solución COMPLETA buena
+        st = cp_model.UNKNOWN
+        for i, (nombre, expr) in enumerate(niveles):
+            solver.parameters.max_time_in_seconds = tiempos[i]
+            self.m.minimize(expr)
+            st = solver.solve(self.m)
+            if st not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+                print(f"  nivel {nombre}: {solver.status_name(st)} — me quedo con la solución del "
+                      f"nivel previo ({len(self.plan_lexico)} asignaciones)", flush=True)
+                return solver, st
+            self.plan_lexico = {(w, f): s for (w, f, s), v in self.x.items() if solver.value(v)}
+            val = round(solver.objective_value)
+            print(f"  nivel {nombre}: óptimo={val}  ({solver.status_name(st)}, {solver.wall_time:.0f}s)",
+                  flush=True)
+            if not isinstance(expr, int):
+                self.m.add(expr <= val)                       # congela este nivel (prioridad estricta)
+            if i + 1 < len(niveles):                          # warm-start de la siguiente pasada
+                asignados = [self.x[k] for k in self.x if solver.value(self.x[k])]
+                quitados = [self.retira[k] for k in self.retira if solver.value(self.retira[k])]
+                self.m.clear_hints()
+                for var in asignados + quitados:
+                    self.m.add_hint(var, 1)
+        return solver, st
+
 
 # --------------------------------------------------------------------------- #
 #  Horizonte rodante: resuelve el periodo por ventanas cosidas
@@ -733,6 +793,37 @@ def resolver_anual(datos: Datos, inicio: date, fin: date, dias_ventana: int = 14
               f"cobertura {100*(dem-huecos)/dem:5.1f}%  ({huecos} huecos)", flush=True)
         ini_v = fin_v + timedelta(days=1)
     return plan
+
+
+def resolver_monolitico(datos: Datos, inicio: date, fin: date,
+                        tiempos: tuple[int, int, int] = (900, 600, 600), hilos: int = 8,
+                        warm_plan: dict[tuple[str, date], str] | None = None,
+                        log: bool = False) -> tuple[dict[tuple[str, date], str], Modelo,
+                                                    cp_model.CpSolver, int]:
+    """Modelo de AÑO COMPLETO (sin ventanas) resuelto por lexicográfico secuencial: ve todo el
+    horizonte → reparte huecos y horas por todo el año (sin acantilado de fin de año) y no desborda
+    int64. Opcionalmente WARM-STARTED con un plan (p.ej. el del rodante): parte de esa solución y
+    solo la pule. Sin cola ni libros: todo se decide de una; objetivos = anuales completos (el tope
+    duro 1826 lo impone C9 directamente, off=0). Devuelve (plan, modelo, solver, estado)."""
+    inicio -= timedelta(days=inicio.weekday())          # alinear a lunes (restricciones semanales)
+    fechas = rango_fechas(inicio, fin)
+    objetivo_horas, objetivo_horas_fijo = {}, {}
+    for w, t in datos.trabajadores.items():
+        obj = round(HORAS_OBJETIVO * t.factor_jornada * 60)     # objetivo anual completo
+        if t.tipo == "fijo":
+            objetivo_horas_fijo[w] = obj                # cumulativo hasta fin de año = objetivo pleno
+        else:
+            objetivo_horas[w] = obj
+    mod = Modelo(datos, fechas, objetivo_horas=objetivo_horas, objetivo_horas_fijo=objetivo_horas_fijo)
+    if warm_plan:
+        mod.m.clear_hints()                             # sustituye el hint del patrón por el plan dado
+        for (w, f), s in warm_plan.items():
+            if (w, f, s) in mod.x:
+                mod.m.add_hint(mod.x[(w, f, s)], 1)
+    print(f"monolítico {fechas[0]:%d/%m/%Y}–{fechas[-1]:%d/%m/%Y}  ({len(mod.x):,} vars, "
+          f"warm_start={'sí' if warm_plan else 'no'})", flush=True)
+    solver, st = mod.resolver_lexicografico(tiempos=tiempos, trabajadores_cpu=hilos, log=log)
+    return mod.plan_lexico, mod, solver, st        # última solución COMPLETA buena (no basura si un nivel falla)
 
 
 def imprimir_resumen(modelo: Modelo, solver: cp_model.CpSolver, status: int) -> None:

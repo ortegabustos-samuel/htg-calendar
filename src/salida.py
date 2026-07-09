@@ -153,7 +153,8 @@ def generar(modelo: Modelo, solver, estado) -> None:
     kpis = {
         "demanda": demanda, "huecos": n_huecos, "cubiertos": demanda - n_huecos,
         "pct": 100 * (demanda - n_huecos) / demanda if demanda else 0,
-        "p1": PESO_COBERTURA * sum(solver.value(u) for u in modelo.u.values()),
+        "p1": sum(PESO_COBERTURA * datos.turnos[t].prioridad * solver.value(u)
+                  for (t, _), u in modelo.u.items()),
         "p2": sum(LAMBDA[m] * sum(solver.value(v) for v in vars_desv)
                   for m, vars_desv in modelo.desviaciones.items()),
         "estado": solver.status_name(estado),
@@ -201,7 +202,7 @@ def huecos_del_plan(datos: Datos, fechas: list[date], plan: dict) -> list[tuple[
 def _kpis_plan(datos: Datos, fechas: list[date], plan: dict, huecos: list, estado: str) -> dict:
     demanda = sum(datos.turnos[t].dem for t in datos.turnos for f in fechas if datos.opera(t, f))
     n_huecos = len(huecos)
-    p1 = PESO_COBERTURA * len(huecos)
+    p1 = sum(PESO_COBERTURA * datos.turnos[s].prioridad for _, s in huecos)
     # P2 anual (aprox.): dispersión de cargas indeseables por trabajador (fijos fuera)
     cargas = {m: defaultdict(int) for m in METRICAS}
     for (w, f), s in plan.items():
