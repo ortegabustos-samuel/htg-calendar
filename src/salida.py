@@ -9,6 +9,7 @@ sin cubrir. También imprime un resumen por consola.
 """
 from __future__ import annotations
 
+import csv
 from collections import defaultdict
 from datetime import date
 from pathlib import Path
@@ -18,7 +19,7 @@ from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
 from cargar_datos import Datos, cargar
-from modelo import LAMBDA, METRICAS, PESO_COBERTURA, Modelo, rango_fechas
+from modelo import LAMBDA, METRICAS, Modelo, peso_cobertura, rango_fechas
 
 RAIZ = Path(__file__).resolve().parents[1]
 SALIDA = RAIZ / "data" / "output"
@@ -153,7 +154,7 @@ def generar(modelo: Modelo, solver, estado) -> None:
     kpis = {
         "demanda": demanda, "huecos": n_huecos, "cubiertos": demanda - n_huecos,
         "pct": 100 * (demanda - n_huecos) / demanda if demanda else 0,
-        "p1": sum(PESO_COBERTURA * datos.turnos[t].prioridad * solver.value(u)
+        "p1": sum(peso_cobertura(datos.turnos[t]) * solver.value(u)
                   for (t, _), u in modelo.u.items()),
         "p2": sum(LAMBDA[m] * sum(solver.value(v) for v in vars_desv)
                   for m, vars_desv in modelo.desviaciones.items()),
@@ -202,7 +203,17 @@ def huecos_del_plan(datos: Datos, fechas: list[date], plan: dict) -> list[tuple[
 def _kpis_plan(datos: Datos, fechas: list[date], plan: dict, huecos: list, estado: str) -> dict:
     demanda = sum(datos.turnos[t].dem for t in datos.turnos for f in fechas if datos.opera(t, f))
     n_huecos = len(huecos)
-    p1 = sum(PESO_COBERTURA * datos.turnos[s].prioridad for _, s in huecos)
+    p1 = sum(peso_cobertura(datos.turnos[s]) for _, s in huecos)
+    # Huecos en turnos COMODÍN (prioridad 0, p.ej. REF CAL: herramienta de horas de ayuda, no
+    # cobertura real): se siguen incentivando en el objetivo (peso_cobertura ya no les da coste
+    # cero), pero para el REPORT no cuentan como fallo de cobertura — es un KPI distinto (¿se están
+    # aprovechando para repartir horas?), no "¿falló la cobertura?". Se muestran aparte.
+    n_comodin = sum(1 for _, s in huecos if datos.turnos[s].prioridad == 0)
+    n_prio = n_huecos - n_comodin
+    demanda_prio = sum(datos.turnos[t].dem for t in datos.turnos for f in fechas
+                       if datos.opera(t, f) and datos.turnos[t].prioridad >= 1)
+    demanda_comodin = sum(datos.turnos[t].dem for t in datos.turnos for f in fechas
+                          if datos.opera(t, f) and datos.turnos[t].prioridad == 0)
     # P2 anual (aprox.): dispersión de cargas indeseables por trabajador (fijos fuera)
     cargas = {m: defaultdict(int) for m in METRICAS}
     for (w, f), s in plan.items():
@@ -219,26 +230,159 @@ def _kpis_plan(datos: Datos, fechas: list[date], plan: dict, huecos: list, estad
             p2 += LAMBDA[m] * (max(vals) - min(vals))
     return {
         "demanda": demanda, "huecos": n_huecos, "cubiertos": demanda - n_huecos,
-        "pct": 100 * (demanda - n_huecos) / demanda if demanda else 0,
+        "pct": 100 * (demanda_prio - n_prio) / demanda_prio if demanda_prio else 100,
+        "huecos_prio": n_prio, "demanda_prio": demanda_prio,
+        "huecos_comodin": n_comodin, "demanda_comodin": demanda_comodin,
         "p1": p1, "p2": p2, "estado": estado,
     }
 
 
+def _carga_por_trabajador(datos: Datos, plan: dict) -> dict[str, dict]:
+    """Por trabajador: horas COMPUTADAS (legales), horas de CONSUMO (capacidad, localizados ×80/7),
+    y nº de findes y festivos trabajados. Base del report de equidad."""
+    carga = {w: {"comp": 0.0, "cons": 0.0, "finde": 0, "festivo": 0}
+             for w in datos.trabajadores}
+    for (w, f), s in plan.items():
+        t = datos.turnos[s]
+        carga[w]["comp"] += t.horas
+        carga[w]["cons"] += t.horas_consumo
+        if f.weekday() >= 5:
+            carga[w]["finde"] += 1
+        if datos.es_festivo(f, t.municipio):
+            carga[w]["festivo"] += 1
+    return carga
+
+
+def _resumen(vals: list[float]) -> str:
+    """min–max (media ±σ) de una lista; '—' si vacía."""
+    import statistics as st
+    if not vals:
+        return "—"
+    sigma = st.pstdev(vals) if len(vals) > 1 else 0.0
+    return f"{min(vals):.0f}–{max(vals):.0f} (μ={st.mean(vals):.0f} σ={sigma:.1f})"
+
+
+def reporte_equidad(datos: Datos, fechas: list[date], plan: dict) -> None:
+    """Etapa 6: report de equidad por GRUPO. Para cada grupo de equidad (columna `grupo`; los
+    sin grupo caen en '—' = pool global) muestra la dispersión de horas de CONSUMO y del nº de
+    findes/festivos entre sus miembros — lo que el modelo intenta igualar. Los fijos van aparte
+    (jornada cuadrada por retirada de días; deben rondar 1776 h computadas). Objetivo = 1776 h."""
+    from modelo import HORAS_OBJETIVO
+
+    carga = _carga_por_trabajador(datos, plan)
+
+    # -- No-fijos: agrupados por grupo de equidad --------------------------- #
+    grupos: dict[str, list[str]] = defaultdict(list)
+    for w, t in datos.trabajadores.items():
+        if t.tipo == "fijo":
+            continue
+        grupos[t.grupo or "—"].append(w)
+
+    print("\n" + "=" * 78)
+    print(f"EQUIDAD  (objetivo {HORAS_OBJETIVO} h/año · consumo = capacidad, localizado 24h ×80/7)")
+    print("=" * 78)
+    print(f"{'grupo':<10} {'n':>3}  {'horas consumo':<24} {'findes':<20} {'festivos'}")
+    print("-" * 78)
+    for gid in sorted(grupos):
+        miembros = grupos[gid]
+        cons = [carga[w]["cons"] for w in miembros]
+        fin = [float(carga[w]["finde"]) for w in miembros]
+        fes = [float(carga[w]["festivo"]) for w in miembros]
+        print(f"{gid:<10} {len(miembros):>3}  {_resumen(cons):<24} "
+              f"{_resumen(fin):<20} {_resumen(fes)}")
+
+    # -- Fijos: horas computadas (deben rondar 1776) ------------------------ #
+    fijos = [w for w, t in datos.trabajadores.items() if t.tipo == "fijo"]
+    if fijos:
+        print("-" * 78)
+        print("Fijos (horas COMPUTADAS, deben rondar 1776):")
+        for w in sorted(fijos):
+            c = carga[w]
+            print(f"  {w:<12} {c['comp']:>6.0f} h   findes={c['finde']:<3} festivos={c['festivo']}")
+
+    # -- No-fijos más alejados de 1776 en consumo --------------------------- #
+    desv = sorted(((abs(carga[w]["cons"] - HORAS_OBJETIVO), w)
+                   for g in grupos.values() for w in g), reverse=True)[:8]
+    if desv:
+        print("-" * 78)
+        print("No-fijos más alejados de 1776 (consumo):")
+        for _, w in desv:
+            c = carga[w]
+            print(f"  {w:<12} {datos.trabajadores[w].tipo:<10} consumo={c['cons']:>6.0f}  "
+                  f"computadas={c['comp']:>6.0f}  (Δ{c['cons']-HORAS_OBJETIVO:+.0f})")
+    print("=" * 78)
+
+
+def metricas_trabajadores(datos: Datos, plan: dict) -> list[dict]:
+    """Por trabajador: nº de turnos en SÁBADO, DOMINGO y FESTIVO, y horas COMPUTADAS totales.
+    Las tres cuentas de día son INDEPENDIENTES (un turno en festivo que caiga en sábado/domingo
+    suma en las dos columnas que le apliquen). Escribe data/output/metricas_trabajadores.csv
+    (una fila por trabajador) y devuelve las filas para el resumen por consola."""
+    m = {w: {"sab": 0, "dom": 0, "fes": 0, "horas": 0.0} for w in datos.trabajadores}
+    for (w, f), s in plan.items():
+        t = datos.turnos[s]
+        if f.weekday() == 5:
+            m[w]["sab"] += 1
+        if f.weekday() == 6:
+            m[w]["dom"] += 1
+        if datos.es_festivo(f, t.municipio):
+            m[w]["fes"] += 1
+        m[w]["horas"] += t.horas
+
+    filas = []
+    for w, t in datos.trabajadores.items():
+        filas.append({
+            "id_trab": w, "tipo": t.tipo, "grupo": t.grupo or (t.patron or ""),
+            "sabados": m[w]["sab"], "domingos": m[w]["dom"], "festivos": m[w]["fes"],
+            "horas_totales": round(m[w]["horas"]),
+        })
+    filas.sort(key=lambda r: (r["tipo"], r["grupo"], r["id_trab"]))
+
+    SALIDA.mkdir(parents=True, exist_ok=True)
+    ruta = SALIDA / "metricas_trabajadores.csv"
+    with open(ruta, "w", newline="", encoding="utf-8") as fh:
+        wr = csv.DictWriter(fh, fieldnames=["id_trab", "tipo", "grupo", "sabados",
+                                            "domingos", "festivos", "horas_totales"])
+        wr.writeheader()
+        wr.writerows(filas)
+
+    # resumen por consola (tabla completa; una línea por trabajador)
+    print("\n" + "=" * 78)
+    print("MÉTRICAS POR TRABAJADOR  (sáb / dom / fes independientes; horas = computadas)")
+    print("=" * 78)
+    print(f"{'id_trab':<12} {'tipo':<11} {'grupo':<16} {'sáb':>4} {'dom':>4} {'fes':>4} {'horas':>6}")
+    print("-" * 78)
+    for r in filas:
+        print(f"{r['id_trab']:<12} {r['tipo']:<11} {r['grupo']:<16} "
+              f"{r['sabados']:>4} {r['domingos']:>4} {r['festivos']:>4} {r['horas_totales']:>6}")
+    print(f"\nCSV: {ruta.relative_to(RAIZ)}")
+    return filas
+
+
 def generar_anual(datos: Datos, fechas: list[date], plan: dict,
                   estado: str = "HORIZONTE RODANTE") -> None:
-    """Vuelca a Excel el plan anual del horizonte rodante."""
+    """Vuelca a Excel el plan anual del horizonte rodante e imprime el report de equidad."""
     huecos = huecos_del_plan(datos, fechas, plan)
     kpis = _kpis_plan(datos, fechas, plan, huecos, estado)
     escribir_excel(datos, fechas, plan, huecos, kpis)
     print(f"Estado: {kpis['estado']}")
-    print(f"Cobertura: {kpis['cubiertos']}/{kpis['demanda']} ({kpis['pct']:.1f}%)  "
-          f"| sin cubrir: {kpis['huecos']}  | P1={kpis['p1']}  P2={kpis['p2']}")
+    print(f"Cobertura PRIORITARIA: {kpis['demanda_prio']-kpis['huecos_prio']}/{kpis['demanda_prio']} "
+          f"({kpis['pct']:.1f}%)  | huecos que importan: {kpis['huecos_prio']}  | P2={kpis['p2']}")
+    if kpis['demanda_comodin']:
+        cubiertos_comodin = kpis['demanda_comodin'] - kpis['huecos_comodin']
+        pct_comodin = 100 * cubiertos_comodin / kpis['demanda_comodin']
+        print(f"Comodín (prioridad 0, ayuda de horas): {cubiertos_comodin}/{kpis['demanda_comodin']} "
+              f"({pct_comodin:.1f}%) aprovechados")
+    # Días con más huecos QUE IMPORTAN (los comodín no cuentan)
     por_dia = defaultdict(int)
-    for d, _ in huecos:
-        por_dia[d] += 1
+    for d, s in huecos:
+        if datos.turnos[s].prioridad >= 1:
+            por_dia[d] += 1
     if por_dia:
         peor = sorted(por_dia.items(), key=lambda kv: -kv[1])[:5]
-        print("Días con más huecos: " + ", ".join(f"{d:%d/%m}:{n}" for d, n in peor))
+        print("Días con más huecos prioritarios: " + ", ".join(f"{d:%d/%m}:{n}" for d, n in peor))
+    reporte_equidad(datos, fechas, plan)
+    metricas_trabajadores(datos, plan)
     print(f"\nFichero en {SALIDA.relative_to(RAIZ)}/: calendario.xlsx")
 
 

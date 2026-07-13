@@ -10,7 +10,7 @@ import sys
 from collections import defaultdict
 from datetime import date, timedelta, time, datetime
 
-from cargar_datos import DIAS, DATA, LIBRE, Datos, cargar
+from cargar_datos import DIAS, DATA, LIBRE, Datos, Turno, cargar
 
 from ortools.sat.python import cp_model
 
@@ -18,17 +18,39 @@ FECHA_INI = date(2026, 1, 1)
 FECHA_FIN = date(2026, 1, 31)
 
 # Parámetros legales (V Convenio CyL)
-RMIN = 12          # descanso mínimo entre jornadas (h)          — art. 23, 31
-HMAX7 = 48         # máx. trabajo efectivo en 7 días (h)         — art. 23.2
-HMAX_4SEM = 160    # máx. trabajo efectivo en 4 semanas (h)      — art. 23 A
+RMIN = 12          # descanso mínimo entre jornadas (h)
+HMAX7 = 48         # máx. trabajo efectivo en 7 días (h)
+HMAX_4SEM = 160    # máx. trabajo efectivo en 4 semanas (h)
 HORAS_OBJETIVO = 1776  # jornada anual objetivo (h): meta de EQUIDAD (blanda), se persigue sin obligar
 HMAX_AÑO = 1826        # tope legal anual (h): límite DURO, no sobrepasable (aplica al año completo)
 CMAX = 6           # máx. días consecutivos trabajados
+
+# Cap PRORRATEADO (dos funciones a la vez): además del tope legal duro (1826), la jornada acumulada
+# de cada NO-fijo hasta el fin de cada ventana se limita al ritmo lineal hacia el OBJETIVO 1776
+# (prorrateado por días disponibles transcurridos) + COLCHON_PACE_H. Efecto doble: (a) anti
+# front-loading → nadie agota horas antes de diciembre (mata el acantilado, reparte huecos homogéneo);
+# (b) 1776 pasa a ser un TECHO BLANDO → casi nadie lo cruza y, si lo hace, por poco (≤ colchón) y solo
+# cuando cubrir lo exige. COLCHON_PACE_H = h que se permite POR ENCIMA del ritmo de 1776 (el "por
+# poco"; también da holgura para picos de demanda). El tope legal 1826 (C9) sigue como respaldo duro.
+# Subir el colchón = más cobertura pero más gente por encima de 1776; bajarlo = lo contrario.
+COLCHON_PACE_H = 24
 
 # Penalización de cobertura (P1): UNIFORME por hueco (sin criticidad por tipo de turno; todo hueco
 # pesa igual). > 1 para que rescatar una cobertura domine sobre relajar una racha de 6 días o
 # desviar el patrón. (En el futuro se puede volver a diferenciar por tipo de turno.)
 PESO_COBERTURA = 10
+
+
+def peso_cobertura(t: Turno) -> int:
+    """Coste de dejar SIN cubrir una unidad de este turno (P1). Usa (prioridad+1), NO prioridad
+    directamente: si se multiplicase por prioridad a secas, un turno con prioridad=0 costaría
+    SIEMPRE cero → el modelo no se molestaría nunca en cubrirlo (comprobado: 0% cubierto a
+    propósito). Con +1, prioridad=0 sigue siendo el escalón más bajo (dominado por CUALQUIER
+    turno de prioridad>=1) pero con incentivo NO NULO: se cubre cuando sobra margen, que es
+    justamente la función de un turno "comodín" (p.ej. REF CAL: herramienta para asignar horas
+    de ayuda a quien las necesite, no cobertura real). El orden relativo entre prioridades se
+    conserva (0<1<3 → 10<20<40); no requiere tocar turnos.csv ni casos especiales por turno."""
+    return PESO_COBERTURA * (t.prioridad + 1)
 
 # Equidad (P2): se equipara al PROMEDIO el nº de findes y de festivos entre los trabajadores capaces
 # de cubrirlos. Los de SOLO L-V quedan fuera solos (nunca son elegibles en finde/festivo). Peso IGUAL
@@ -41,13 +63,31 @@ LAMBDA = {"finde": 1, "festivo": 1}
 # laboral (L-V). Correturnos exentos (flexibles por diseño). Tunable.
 PESO_ESTAB = 5
 
-# Fijación blanda del patrón (NIVEL DE COBERTURA): "vale" de sacar a un trabajador de patrón de su
-# rotación. < PESO_COBERTURA, así el patrón se sigue SIEMPRE salvo para rescatar una cobertura.
-PESO_DEV = 1
+# Fijación del patrón (NIVEL DE COBERTURA): "vale" de sacar a un trabajador de patrón de su rotación.
+# Los patrones están PACTADOS con los sindicatos: se priorizan por ENCIMA de cobertura y equidad,
+# salvo vacaciones u otra imposibilidad. > máximo peso_cobertura posible (PESO_COBERTURA·(prioridad
+# máx.+1)) para que desviar a alguien de su patrón sea SIEMPRE más caro que dejar sin cubrir incluso
+# el turno más crítico. BLANDO, no restricción dura: las leyes SÍ siguen mandando (descanso, días
+# consecutivos, horas/semana no se tocan; si la rotación choca con una de ellas, el patrón cede ahí,
+# nunca al revés) — evita que una semana concreta imposible vuelva INFACTIBLE toda la ventana.
+# Con datos reales (2026-07-10) el peso simétrico (=1) dejaba un turno localizado UVI compartido por
+# 2 dedicados + un tercero-comodín: el tercero cubría 39/368 días aun con AMBOS dedicados disponibles
+# y libres, porque desviar a cualquiera de su patrón costaba casi nada frente al valor de cobertura.
+PESO_DEV = 100
 
 # Etapa 4 (nivel bajo): "vale" de quitarle un día a un fijo. Pequeño, solo para que no retire días
 # gratis: retira únicamente cuando baja el exceso de horas sobre el objetivo (1776). << horas/día.
 PESO_RETIRA = 1
+
+# Etapa 4 (ASIMÉTRICO): coste por minuto de que un fijo quede POR DEBAJO del ritmo hacia 1776 (falta)
+# frente a por ENCIMA (exceso). falta >> exceso: su línea es SUYA por defecto — solo la cede una vez
+# alcanzado/superado el ritmo, nunca mientras va corto. Con datos reales (2026-07-10) el peso simétrico
+# (ambos=1) dejaba su línea como recurso COMPARTIDO ordinario, indiferente en cobertura a quién la haga:
+# un fijo perdió 42 días/año (-272h de 1776) porque cederlos ayudaba la equidad de otros tanto como le
+# perjudicaba a él. Con falta≫exceso, ceder estando corto es casi siempre más caro que cualquier
+# beneficio ajeno en ese nivel. El tope legal 1826 lo garantiza C9 aparte, independiente de este peso.
+PESO_FALTA_FIJO = 10
+PESO_EXCESO_FIJO = 1
 # Lexicográfico por objetivo único: minimizar  W·P1 + P2, con W > max(P2). Como P2 = Σ λ·rango
 # y cada rango ≤ nº de días, max(P2) = Σλ·nº_días -> W se calcula según el horizonte
 # (W = Σλ·nº_días + 1). Así P1 domina SIEMPRE y P2 solo desempata (evita que al crecer el
@@ -72,10 +112,18 @@ class Modelo:
                  cola: set[date] | None = None,
                  offset_horas: dict[str, int] | None = None,
                  objetivo_horas: dict[str, int] | None = None,
-                 objetivo_horas_fijo: dict[str, int] | None = None):
+                 objetivo_horas_fijo: dict[str, int] | None = None,
+                 tope_paced: dict[str, int] | None = None,
+                 ancla_patron: date | None = None):
         self.datos = datos
         self.fechas = fechas
         self.m = cp_model.CpModel()
+        # Ancla GLOBAL de la rotación de patrones: fecha fija (misma para todas las ventanas del
+        # horizonte) desde la que se cuenta la semana de rotación. IMPRESCINDIBLE que sea global: si se
+        # tomara el inicio de cada ventana, el desfase ventana-ancla se queda constante y la rotación se
+        # CONGELA (cada trabajador repite 1-2 filas todo el año). Si None, cae al inicio de la ventana
+        # (solo válido para un modelo de una sola ventana, p.ej. la prueba de __main__).
+        self.ancla_patron = ancla_patron
 
         # Horizonte rodante: 'cola' = fechas de contexto (ya resueltas, no se deciden);
         # 'congelar' = asignaciones fijas de esos días; 'offset_equidad' = carga acumulada previa.
@@ -87,6 +135,7 @@ class Modelo:
         self.offset_horas = offset_horas or {}
         self.objetivo_horas = objetivo_horas or {}
         self.objetivo_horas_fijo = objetivo_horas_fijo or {}
+        self.tope_paced = tope_paced or {}   # cap prorrateado acumulado (min) hasta el fin de la ventana, por NO-fijo
         self.cola = set(cola) if cola is not None else {f for (_, f) in self.congelar}
         self.retira: dict[tuple[str, date], cp_model.BoolVar] = {}   # Etapa 4: día quitado a un fijo
         self.fijos_activos: list[str] = []                          # fijos con línea congelada (retirables)
@@ -226,29 +275,53 @@ class Modelo:
 
         return incompatibles
 
+    def _exento_legal(self, trab: str) -> bool:
+        """¿El trabajador está exento de los límites legales GENÉRICOS (C5 días consecutivos, C6/C6b
+        horas semanales/cuatrisemanales, C7 descanso semanal)? Los de PATRÓN sí: su rotación es una
+        CONCILIACIÓN pactada que por diseño puede superar esos límites (p.ej. las noches encadenan 7
+        días / 77 h una semana de cada dos). Siguen sujetos a C4 (descanso mínimo entre turnos) y C9
+        (tope anual duro 1826), que NO se relajan."""
+        return self.datos.trabajadores[trab].tipo == "patron"
+
     def _c5_dias_consecutivos(self) -> None:
-        """Como mucho CMAX días trabajados seguidos."""
+        """Como mucho CMAX días trabajados seguidos. Los de patrón quedan exentos (su rotación
+        pactada puede encadenar más; ver _exento_legal)."""
         for trab in self.datos.trabajadores:
+            if self._exento_legal(trab):
+                continue
             for i in range(len(self.fechas) - CMAX):
                 ventana = self.fechas[i:i + CMAX + 1]
                 self.m.add(sum(self.trabaja[(trab, f)] for f in ventana) <= CMAX)
 
     def _minutos(self, trab: str, dias: list[date]) -> list:
-        """Términos horas(s)*x (en minutos efectivos computables) del trabajador en esos días."""
+        """Términos horas(s)*x (en minutos efectivos COMPUTABLES = jornada legal) del trabajador en
+        esos días. Base del tope duro 1826 (C9) y de la retirada de fijos."""
         return [round(self.datos.turnos[s].horas * 60) * self.x[(trab, f, s)]
                 for f in dias for s in self.turnos_wd.get((trab, f), [])]
 
+    def _minutos_consumo(self, trab: str, dias: list[date]) -> list:
+        """Términos horas_consumo(s)*x (minutos de CONSUMO de capacidad) del trabajador en esos días.
+        Base de la EQUIDAD de jornada (no de lo legal): un localizado 24h consume CONSUMO_LOCALIZADO
+        (≈11.43 h), no sus 8 h computadas, así el localizado puro y quien lo cubre de forma excepcional
+        quedan ~1776 de CONSUMO y no se les penaliza el defecto de horas computadas."""
+        return [round(self.datos.turnos[s].horas_consumo * 60) * self.x[(trab, f, s)]
+                for f in dias for s in self.turnos_wd.get((trab, f), [])]
+
     def _c6_horas_semana(self) -> None:
-        """<= 48 h de trabajo efectivo en cualquier ventana de 7 días."""
+        """<= 48 h de trabajo efectivo en cualquier ventana de 7 días. Patrón exento (ver _exento_legal)."""
         for trab in self.datos.trabajadores:
+            if self._exento_legal(trab):
+                continue
             for i in range(len(self.fechas) - 6):
                 minutos = self._minutos(trab, self.fechas[i:i + 7])
                 if minutos:
                     self.m.add(sum(minutos) <= HMAX7 * 60)
 
     def _c6b_horas_cuatrisemana(self) -> None:
-        """<= 160 h de trabajo efectivo en cualquier ventana de 28 días."""
+        """<= 160 h de trabajo efectivo en cualquier ventana de 28 días. Patrón exento (ver _exento_legal)."""
         for trab in self.datos.trabajadores:
+            if self._exento_legal(trab):
+                continue
             for i in range(len(self.fechas) - 27):
                 minutos = self._minutos(trab, self.fechas[i:i + 28])
                 if minutos:
@@ -271,6 +344,8 @@ class Modelo:
                            if len(ds) == 7 and any(f not in self.cola for f in ds))
 
         for trab in self.datos.trabajadores:
+            if self._exento_legal(trab):
+                continue                       # patrón: su descanso lo define la rotación pactada
             # (b) sábado+domingo libres, al menos una vez cada 4 semanas completas
             finde_libre = []
             for sem in completas:
@@ -336,10 +411,12 @@ class Modelo:
 
     def _prescripcion_patron(self) -> dict[tuple[str, date], str]:
         """Turno que la rotación prescribe a cada (trabajador de patrón, fecha) de la ventana
-        (incluye LIBRE). La rotación avanza una fila por semana desde el lunes de la 1ª semana;
-        cada trabajador del grupo arranca en una fila distinta (offset por orden en el grupo).
-        Fuente ÚNICA para el warm-start (_warm_start_patron) y la fijación (_fijacion_patron)."""
-        ancla = self.fechas[0] - timedelta(days=self.fechas[0].weekday())   # lunes de la 1ª semana
+        (incluye LIBRE). La rotación avanza una fila por semana desde el ANCLA GLOBAL (lunes fijo,
+        igual para todas las ventanas); cada trabajador del grupo arranca en una fila distinta (offset
+        por orden en el grupo). Fuente ÚNICA para el warm-start (_warm_start_patron) y la fijación
+        (_fijacion_patron)."""
+        base = self.ancla_patron or self.fechas[0]           # ancla global (rodante) o inicio de ventana (1 sola)
+        ancla = base - timedelta(days=base.weekday())        # lunes de la semana ancla
         grupos: dict[str, list[str]] = defaultdict(list)
         for w, t in self.datos.trabajadores.items():
             if t.tipo == "patron" and t.patron:
@@ -388,9 +465,9 @@ class Modelo:
     # -- Objetivos ----------------------------------------------------------- #
     def _coste_cobertura(self):
         """P1: coste de turnos no cubiertos, PONDERADO por la prioridad de cobertura del turno
-        (PESO_COBERTURA·prioridad·hueco). Mayor prioridad = más caro dejarlo sin cubrir → cuando hay
+        (peso_cobertura(turno)·hueco). Mayor prioridad = más caro dejarlo sin cubrir → cuando hay
         que dejar huecos, caen en los turnos menos prioritarios."""
-        return sum(PESO_COBERTURA * self.datos.turnos[turno].prioridad * holgura
+        return sum(peso_cobertura(self.datos.turnos[turno]) * holgura
                    for (turno, _), holgura in self.u.items())
 
 
@@ -413,47 +490,57 @@ class Modelo:
             case _:
                 return False
 
+    def _grupos_equidad(self) -> dict[str, list[str]]:
+        """Partición de los NO-fijos por grupo de equidad (columna `grupo` de trabajadores.csv).
+        Mismos `grupo` se equiparan ENTRE SÍ (findes/festivos); los sin grupo (None) caen en un
+        único pool compartido "__global__" → cuando la empresa aún no define grupos, la equidad es
+        global (comportamiento anterior). Con grupos definidos, cada grupo se iguala por separado
+        (p.ej. localizados en su grupo, sin arrastrar a los demás)."""
+        grupos: dict[str, list[str]] = defaultdict(list)
+        for w, t in self.datos.trabajadores.items():
+            if t.tipo == "fijo":
+                continue
+            grupos[t.grupo or "__global__"].append(w)
+        return grupos
+
     def _equidad_ponderada(self) -> tuple[dict[str, list[cp_model.IntVar]], int]:
-        """Para cada métrica (finde, festivo): carga ACUMULADA por trabajador (offset previo del
-        libro de equidad + lo asignado en la ventana; fijos fuera) y su desviación respecto a la
-        media. Equidad PLANA: peso_w=1 para todos, así se equipara el nº de findes/festivos al
-        promedio sin favorecer perfiles. Los de solo L-V no aparecen (nunca elegibles en
-        finde/festivo). Devuelve (desviaciones, cota_p2 = Σ λ·Σ desv) para escalar los pesos."""
-        pool = [w for w, t in self.datos.trabajadores.items() if t.tipo != "fijo"]
+        """Para cada métrica (finde, festivo) y cada GRUPO de equidad: carga ACUMULADA por trabajador
+        (offset previo del libro + lo asignado en la ventana; fijos fuera) y su desviación respecto a
+        la media DE SU GRUPO. Equidad PLANA dentro del grupo (todos pesan igual). Los de solo L-V no
+        aparecen (nunca elegibles en finde/festivo). Devuelve (desviaciones por métrica, cota_p2)."""
         dias = [f for f in self.fechas if f not in self.cola]     # solo la ventana, no la cola
-        desviaciones: dict[str, list[cp_model.IntVar]] = {}
+        desviaciones: dict[str, list[cp_model.IntVar]] = {m: [] for m in METRICAS}
         cota_p2 = 0
 
         for metrica in METRICAS:
-            cargas = []
-            for w in pool:
-                peso_w = 1                                               # equidad PLANA: todos los capaces pesan igual
-                off = self.offset_equidad.get(w, {}).get(metrica, 0)     # carga previa (libro)
-                terminos = [self.x[(w, f, s)] for f in dias
-                            for s in self.turnos_wd.get((w, f), [])
-                            if self._contribuye(metrica, s, f)]
-                if not terminos and off == 0:
-                    continue                          # ni carga previa ni puede en la ventana
-                cota_w = off + len(terminos)
-                carga = self.m.new_int_var(off, cota_w, f"carga_{metrica}_{w}")
-                self.m.add(carga == off + sum(terminos))
-                cargas.append((w, carga, peso_w, cota_w))
+            for gid, miembros in self._grupos_equidad().items():
+                cargas = []
+                for w in miembros:
+                    off = self.offset_equidad.get(w, {}).get(metrica, 0)     # carga previa (libro)
+                    terminos = [self.x[(w, f, s)] for f in dias
+                                for s in self.turnos_wd.get((w, f), [])
+                                if self._contribuye(metrica, s, f)]
+                    if not terminos and off == 0:
+                        continue                      # ni carga previa ni puede en la ventana
+                    cota_w = off + len(terminos)
+                    carga = self.m.new_int_var(off, cota_w, f"carga_{metrica}_{w}")
+                    self.m.add(carga == off + sum(terminos))
+                    cargas.append((w, carga, cota_w))
 
-            if len(cargas) < 2:
-                continue                              # sin dispersión que repartir
-            peso_total = sum(p for _, _, p, _ in cargas)
-            cota_total = sum(c for _, _, _, c in cargas)
-            carga_total = self.m.new_int_var(0, cota_total, f"total_{metrica}")
-            self.m.add(carga_total == sum(c for _, c, _, _ in cargas))
+                if len(cargas) < 2:
+                    continue                          # sin dispersión que repartir en el grupo
+                n = len(cargas)                       # equipara al promedio del grupo (peso plano)
+                cota_total = sum(c for _, _, c in cargas)
+                carga_total = self.m.new_int_var(0, cota_total, f"total_{metrica}_{gid}")
+                self.m.add(carga_total == sum(c for _, c, _ in cargas))
 
-            # |peso_total·carga_w - peso_w·carga_total| <= peso_total·carga_total <= peso_total·cota_total
-            max_desv = peso_total * cota_total
-            desviaciones[metrica] = []
-            for w, carga_w, peso_w, _ in cargas:
-                desv = self.m.new_int_var(0, max_desv, f"desv_{metrica}_{w}")
-                self.m.add_abs_equality(desv, peso_total * carga_w - peso_w * carga_total)
-                desviaciones[metrica].append(desv)
-            cota_p2 += LAMBDA[metrica] * len(cargas) * max_desv
+                # |n·carga_w − carga_total| = n·|carga_w − media| ≤ n·cota_total
+                max_desv = n * cota_total
+                for w, carga_w, _ in cargas:
+                    desv = self.m.new_int_var(0, max_desv, f"desv_{metrica}_{w}")
+                    self.m.add_abs_equality(desv, n * carga_w - carga_total)
+                    desviaciones[metrica].append(desv)
+                cota_p2 += LAMBDA[metrica] * n * max_desv
         return desviaciones, cota_p2
 
     # -- C9: jornada anual (tope duro + pacing blando) ----------------------- #
@@ -471,27 +558,34 @@ class Modelo:
                 continue                                          # no puede trabajar en la ventana
             tope_min = round(HMAX_AÑO * t.factor_jornada * 60)    # tope escalado por reducción de jornada
             off = self.offset_horas.get(w, 0)                     # <= tope por invariante del libro
-            self.m.add(sum(terminos) <= tope_min - off)
+            cap = tope_min
+            paced = self.tope_paced.get(w)                        # cap prorrateado (anti front-loading, no-fijos)
+            if paced is not None:
+                cap = min(cap, paced)                             # rige el más restrictivo de los dos
+            self.m.add(sum(terminos) <= max(0, cap - off))        # max(0,·): si va por delante del ritmo, descansa
             if t.tipo != "fijo":
                 self._min_ventana[w] = terminos                  # solo NO-fijos van a P_horas simétrica
 
     def _desviacion_jornada(self) -> tuple[object, int]:
-        """P_horas (BLANDA, EQUIDAD): penaliza que los minutos de la ventana se desvíen del
+        """P_horas (BLANDA, EQUIDAD): penaliza que los minutos de CONSUMO de la ventana se desvíen del
         objetivo prorrateado (objetivo_horas[w], derivado de HORAS_OBJETIVO=1776) por DEBAJO o
-        por ENCIMA (desviación absoluta, simétrica). Reparte la jornada de forma pareja a lo
-        largo del año y evita que nadie derive hacia el tope duro (1826). Va al nivel bajo
-        (desempate): solo actúa cuando no cuesta cobertura ni equidad de findes. Fijos fuera
-        (su jornada se cuadra por retirada de días, Etapa 4). Devuelve (Σ|desv|, cota).
+        por ENCIMA (desviación absoluta, simétrica). Se mide sobre CONSUMO (no computado): un
+        localizado 24h consume ≈11.43 h por su naturaleza aunque compute 8 → así no arrastra un
+        falso déficit de horas. Reparte la jornada de forma pareja a lo largo del año y evita que
+        nadie derive hacia el tope duro (1826). Va al nivel bajo (desempate): solo actúa cuando no
+        cuesta cobertura ni equidad de findes. Fijos fuera (su jornada se cuadra por retirada de
+        días, Etapa 4). Devuelve (Σ|desv|, cota).
         Nota: exceso y déficit pesan IGUAL (|·|). Si se quisiera penalizar más suave el exceso,
         separar en dos variables (déficit / exceso) con pesos distintos."""
-        max_turno_min = max((round(t.horas * 60) for t in self.datos.turnos.values()), default=0)
-        n_dias = len([f for f in self.fechas if f not in self.cola])
-        max_min = n_dias * max_turno_min                          # cota superior de minutos en la ventana
+        dias = [f for f in self.fechas if f not in self.cola]
+        max_turno_min = max((round(t.horas_consumo * 60) for t in self.datos.turnos.values()), default=0)
+        max_min = len(dias) * max_turno_min                       # cota superior de minutos de consumo
         desvs, cota = [], 0
-        for w, terminos in getattr(self, "_min_ventana", {}).items():
+        for w in getattr(self, "_min_ventana", {}):               # no-fijos con jornada en la ventana
             objetivo = self.objetivo_horas.get(w, 0)
             if objetivo <= 0:
                 continue
+            terminos = self._minutos_consumo(w, dias)             # EQUIDAD sobre CONSUMO, no computado
             cota_w = max(objetivo, max_min)                       # |Σmin − objetivo| ≤ max(objetivo, max_min)
             desv = self.m.new_int_var(0, cota_w, f"desvh_{w}")
             self.m.add_abs_equality(desv, sum(terminos) - objetivo)
@@ -500,17 +594,18 @@ class Modelo:
         return sum(desvs), cota
 
     def _retirada_fijos(self) -> tuple[object, int]:
-        """Etapa 4 (BLANDA): cuadra la jornada de los fijos a 1776 quitándoles días (retira). Penaliza
-        la DESVIACIÓN (dos caras) de sus minutos acumulados respecto al ritmo de 1776:
-        |(off + Σmin_ventana) − objetivo_acum| = |Σmin_ventana − resto|, con resto = objetivo_acum − off
-        una CONSTANTE que absorbe los valores acumulados grandes (variable pequeña, sin desbordar).
-        Dos caras es clave: castiga pasarse (→ retira días) Y quedarse corto (→ NO over-remueve para
-        alimentar a otros). Al ser ACUMULADA dispara la retirada cuando el exceso banca ~medio día,
-        sorteando la granularidad de 8 h. El tope legal 1826 lo garantiza C9 aparte. (No pueden AÑADIR
-        días: si quedan por debajo del pace la desviación no se puede bajar más, y no se retira.)
-        Devuelve (Σ|desv|, cota)."""
+        """Etapa 4 (BLANDA, ASIMÉTRICA): cuadra la jornada de los fijos a 1776 quitándoles días
+        (retira). Separa la desviación de sus minutos acumulados respecto al ritmo de 1776 en dos
+        partes con PESO DISTINTO: falta = cuánto queda POR DEBAJO del ritmo (PESO_FALTA_FIJO, grande)
+        y exceso = cuánto se pasa POR ENCIMA (PESO_EXCESO_FIJO, pequeño):
+        Σmin_ventana − resto = exceso − falta, con resto = objetivo_acum − off una CONSTANTE que
+        absorbe los valores acumulados grandes (variables pequeñas, sin desbordar). La asimetría es
+        clave: su línea es SUYA por defecto (falta cara → casi nunca cede estando corto), y solo una
+        vez alcanzado/superado el ritmo se vuelve barato cederla (exceso barato → sí puede entonces).
+        El tope legal 1826 lo garantiza C9 aparte, independiente de este peso. Devuelve (Σ costes,
+        cota)."""
         dias = [f for f in self.fechas if f not in self.cola]
-        desvs, cota = [], 0
+        costes, cota = [], 0
         for w in self.fijos_activos:
             objetivo_cum = self.objetivo_horas_fijo.get(w)
             if objetivo_cum is None:
@@ -520,13 +615,14 @@ class Modelo:
                 continue
             max_win = len(dias) * max((round(s.horas * 60) for s in self.datos.turnos.values()), default=0)
             resto = objetivo_cum - self.offset_horas.get(w, 0)    # constante: min "de pace" para esta ventana
-            # Σmin ∈ [0, max_win] → |Σmin − resto| ≤ max(|resto|, |max_win − resto|)
-            cota_w = max(abs(resto), abs(max_win - resto))
-            desv = self.m.new_int_var(0, cota_w, f"desvh_fijo_{w}")
-            self.m.add_abs_equality(desv, sum(terminos) - resto)
-            desvs.append(desv)
-            cota += cota_w
-        return sum(desvs), cota
+            falta_max = max(0, resto)                             # Σmin=0 -> falta máxima = resto (si resto>0)
+            exceso_max = max(0, max_win - resto)                  # Σmin=max_win -> exceso máximo
+            falta = self.m.new_int_var(0, falta_max, f"falta_fijo_{w}")
+            exceso = self.m.new_int_var(0, exceso_max, f"exceso_fijo_{w}")
+            self.m.add(sum(terminos) - resto == exceso - falta)
+            costes.append(PESO_FALTA_FIJO * falta + PESO_EXCESO_FIJO * exceso)
+            cota += PESO_FALTA_FIJO * falta_max + PESO_EXCESO_FIJO * exceso_max
+        return sum(costes), cota
 
     def _exceso_semanal(self) -> tuple[object, int]:
         """Penaliza que un trabajador supere 5 días trabajados en una semana ISO completa (=> 6
@@ -609,7 +705,7 @@ class Modelo:
         self.desviaciones = desviaciones                  # expuesto para el resumen tras resolver
         p2 = sum(LAMBDA[metrica] * sum(vars_desv) for metrica, vars_desv in desviaciones.items())
         p_horas, max_horas = self._desviacion_jornada()    # equidad de horas NO-fijos (|desv| vs objetivo)
-        p_ret, max_ret = self._retirada_fijos()            # Etapa 4: exceso de horas de fijos (one-sided)
+        p_ret, max_ret = self._retirada_fijos()            # Etapa 4: horas de fijos (asimétrico: falta≫exceso)
         p_retira = sum(self.retira.values())               # nº de días quitados a fijos (freno a quitar de más)
         p5, max_p5 = self._inestabilidad_mixto()           # estabilidad posicional del mixto (L-V)
 
@@ -775,10 +871,23 @@ def resolver_anual(datos: Datos, inicio: date, fin: date, dias_ventana: int = 14
             elig_hasta = sum(1 for f in elig if f <= fin_v)
             objetivo_horas_fijo[w] = round(HORAS_OBJETIVO * factor * 60 * elig_hasta / len(elig))
 
+        # Cap PRORRATEADO (no-fijos): jornada acumulada hasta el FIN de esta ventana <= ritmo lineal
+        # hacia el OBJETIVO 1776 por días DISPONIBLES transcurridos + colchón. Tope DURO por ventana:
+        # (a) evita agotar horas antes de diciembre (reparte huecos homogéneo) y (b) hace de 1776 un
+        # techo blando (se cruza como mucho por el colchón). El tope legal 1826 lo impone C9 aparte.
+        tope_paced = {}
+        for w, disp_total in disp_año.items():
+            if disp_total == 0:
+                continue
+            disp_hasta = sum(datos.disponible(w, f) for f in rango_fechas(inicio, fin_v))
+            factor = datos.trabajadores[w].factor_jornada
+            tope_paced[w] = round((HORAS_OBJETIVO * disp_hasta / disp_total + COLCHON_PACE_H) * factor * 60)
+
         mod = Modelo(datos, fechas_cola + fechas_ventana,
                      congelar=congelar, offset_equidad=offset, cola=cola,
                      offset_horas=offset_horas, objetivo_horas=objetivo_horas,
-                     objetivo_horas_fijo=objetivo_horas_fijo)
+                     objetivo_horas_fijo=objetivo_horas_fijo, tope_paced=tope_paced,
+                     ancla_patron=inicio)   # ancla GLOBAL fija: la rotación es consistente entre ventanas
         solver, st = mod.resolver(tiempo=segundos, trabajadores_cpu=hilos, log=log)
 
         pv = _plan_ventana(mod, solver, fechas_ventana)
