@@ -284,14 +284,20 @@ class Modelo:
         return self.datos.trabajadores[trab].tipo == "patron"
 
     def _c5_dias_consecutivos(self) -> None:
-        """Como mucho CMAX días trabajados seguidos. Los de patrón quedan exentos (su rotación
-        pactada puede encadenar más; ver _exento_legal)."""
+        """Como mucho CMAX días trabajados por SEMANA ISO (lunes-domingo), NO ventana deslizante: un
+        tramo puede cruzar el domingo→lunes (p.ej. jue-dom + lun-jue) y se cuenta por separado en cada
+        semana, mientras cada semana deje >=1 día libre. Solo semanas completas (7 días) del horizonte;
+        las ventanas del rodante son 2 semanas ISO completas, así que el conteo es limpio. Los de
+        patrón quedan exentos (rotación pactada; ver _exento_legal)."""
+        dias_semana: dict[tuple[int, int], list[date]] = defaultdict(list)
+        for f in self.fechas:
+            dias_semana[semana(f)].append(f)
+        semanas = [ds for ds in dias_semana.values() if len(ds) == 7]
         for trab in self.datos.trabajadores:
             if self._exento_legal(trab):
                 continue
-            for i in range(len(self.fechas) - CMAX):
-                ventana = self.fechas[i:i + CMAX + 1]
-                self.m.add(sum(self.trabaja[(trab, f)] for f in ventana) <= CMAX)
+            for dias in semanas:
+                self.m.add(sum(self.trabaja[(trab, f)] for f in dias) <= CMAX)
 
     def _minutos(self, trab: str, dias: list[date]) -> list:
         """Términos horas(s)*x (en minutos efectivos COMPUTABLES = jornada legal) del trabajador en
@@ -308,12 +314,17 @@ class Modelo:
                 for f in dias for s in self.turnos_wd.get((trab, f), [])]
 
     def _c6_horas_semana(self) -> None:
-        """<= 48 h de trabajo efectivo en cualquier ventana de 7 días. Patrón exento (ver _exento_legal)."""
+        """<= 48 h de trabajo efectivo por SEMANA ISO (lunes-domingo), NO ventana deslizante (igual
+        criterio que C5). Solo semanas completas. Patrón exento (noches pactadas; ver _exento_legal)."""
+        dias_semana: dict[tuple[int, int], list[date]] = defaultdict(list)
+        for f in self.fechas:
+            dias_semana[semana(f)].append(f)
+        semanas = [ds for ds in dias_semana.values() if len(ds) == 7]
         for trab in self.datos.trabajadores:
             if self._exento_legal(trab):
                 continue
-            for i in range(len(self.fechas) - 6):
-                minutos = self._minutos(trab, self.fechas[i:i + 7])
+            for dias in semanas:
+                minutos = self._minutos(trab, dias)
                 if minutos:
                     self.m.add(sum(minutos) <= HMAX7 * 60)
 
