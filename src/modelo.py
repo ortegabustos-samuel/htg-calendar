@@ -139,6 +139,21 @@ class Modelo:
         self.cola = set(cola) if cola is not None else {f for (_, f) in self.congelar}
         self.retira: dict[tuple[str, date], cp_model.BoolVar] = {}   # Etapa 4: día quitado a un fijo
         self.fijos_activos: list[str] = []                          # fijos con línea congelada (retirables)
+        # Clasificación de patrones por tipo de turno, para el trato de HORAS:
+        #  - NOCHE (rotación solo de turnos noche): se pasan de 1776; se recortan liberando QUINCENAS
+        #    enteras (activo por ciclo de 14 días), nunca días sueltos.
+        #  - UVI (localizado 24h, ciclo corto): sus horas de patrón+vacaciones se ACEPTAN aunque excedan
+        #    el límite; NO se recortan (su consumo alto es la naturaleza del localizado).
+        #  - resto (largos): se recortan a 1776 como el pool flexible (cap prorrateado, días sueltos ok).
+        self.patrones_noche: set[str] = set()
+        self.patrones_uvi: set[str] = set()
+        for p, filas in datos.patrones.items():
+            tipos = {datos.turnos[s].tipo for fila in filas for s in fila.values()
+                     if s and s != LIBRE and s in datos.turnos}
+            if tipos and tipos <= {"noche"}:
+                self.patrones_noche.add(p)
+            elif "24h" in tipos and len(filas) <= 2:
+                self.patrones_uvi.add(p)
 
         #Conjunto de las variables del modelo x_trab_fecha_turno
         self.x: dict[tuple[str, date, str], cp_model.BoolVar] = {} 
@@ -161,6 +176,7 @@ class Modelo:
         self._c8_fijos()
         self._c9_jornada_anual()                  # tope anual duro (libro de horas)
         self.prescripcion = self._prescripcion_patron()   # turno de rotación por (patrón, fecha)
+        self._activo_patron()                     # noches: acopla su rotación por QUINCENA (ciclo 14d)
         self._warm_start_patron()                 # arranque pegado al patrón
 
     # -- Variables ----------------------------------------------------------- #
@@ -221,10 +237,15 @@ class Modelo:
 
     
     def _c4_descanso(self) -> None:
-        """Descanso >= RMIN horas entre el turno de un día y el del siguiente. De manera que de como mucho sea 1"""
+        """Descanso >= RMIN horas entre el turno de un día y el del siguiente. DURA para la plantilla
+        general, pero los PATRONES quedan exentos (conciliación pactada, ver _exento_legal): los
+        localizados UVI son 24h on-call (22:00→22:00) y su rotación encadena días consecutivos que
+        dejarían <12h; sin la exención, C4 rompía el localizado a día sí/día no."""
         incompatibles = self._pares_incompatibles()
-        
+
         for trab in self.datos.trabajadores:
+            if self._exento_legal(trab):
+                continue
             for hoy, manana in zip(self.fechas, self.fechas[1:]):
                 for s1 in self.turnos_wd.get((trab, hoy), []):
                     for s2 in self.turnos_wd.get((trab, manana), []):
@@ -434,6 +455,42 @@ class Modelo:
                     pres[(w, f)] = filas[(offset + (f - ancla).days // 7) % T][DIAS[f.weekday()]]
         return pres
 
+    def _activo_patron(self) -> None:
+        """SOLO patrones de NOCHE. Acopla su rotación a nivel de CICLO de 14 días (las dos filas =
+        quincena, su unidad real): `activo[w, ciclo]` ∈ {0,1}, y para cada día prescrito del ciclo,
+        x[w,f,phi] == activo[w,ciclo]. Así la QUINCENA se hace ENTERA o se libra ENTERA — nunca media
+        quincena ni días sueltos. Además el nochero hace SOLO su rotación (x=0 en lo no prescrito). Qué
+        quincenas se liberan lo decide el recorte de horas hacia 1776 (cap prorrateado + P_horas); la
+        quincena liberada la cubre el pool. Los demás patrones NO pasan por aquí (fijación blanda)."""
+        self.activo: dict[tuple[str, int], cp_model.BoolVar] = {}
+        base = self.ancla_patron or self.fechas[0]
+        ancla = base - timedelta(days=base.weekday())     # mismo lunes ancla que la rotación
+        prescritos: set[tuple[str, date, str]] = set()
+        por_ciclo: dict[tuple[str, int], list] = defaultdict(list)
+        for (w, f), turno in self.prescripcion.items():
+            if self.datos.trabajadores[w].patron not in self.patrones_noche:
+                continue                                  # solo noches
+            if f in self.cola or turno == LIBRE:
+                continue
+            var = self.x.get((w, f, turno))
+            if var is None:
+                continue                                  # no opera / no elegible / vacaciones
+            prescritos.add((w, f, turno))
+            ciclo = ((f - ancla).days // 7) // 2          # índice del ciclo de 14 días (quincena)
+            por_ciclo[(w, ciclo)].append(var)
+        for (w, ciclo), vars_dias in por_ciclo.items():
+            activo = self.m.new_bool_var(f"activo_{w}_c{ciclo}")
+            self.activo[(w, ciclo)] = activo
+            for var in vars_dias:
+                self.m.add(var == activo)                 # toda la quincena sigue el mismo activo
+        # El nochero hace SOLO su rotación: cualquier otra x suya (turno extra o su turno en día LIBRE
+        # de su fila) = 0. Su cobertura (vacaciones, quincenas liberadas) la asume el pool.
+        for (w, f, turno), var in self.x.items():
+            if f in self.cola:
+                continue
+            if self.datos.trabajadores[w].patron in self.patrones_noche and (w, f, turno) not in prescritos:
+                self.m.add(var == 0)
+
     def _warm_start_patron(self) -> None:
         """Siembra la búsqueda con el patrón: cada trabajador de patrón sugiere la línea que le
         tocaría según la rotación. Es un hint, no obliga (la fijación la hace _fijacion_patron)."""
@@ -454,6 +511,8 @@ class Modelo:
         sin capacidad ese día. Devuelve (suma_desvío, cota)."""
         devs, cota = [], 0
         for (w, f), turno in self.prescripcion.items():
+            if self.datos.trabajadores[w].patron in self.patrones_noche:
+                continue                # noches: las gobierna activo (quincena), no la fijación blanda
             if f in self.cola or turno == LIBRE:
                 continue
             var = self.x.get((w, f, turno))
@@ -565,8 +624,10 @@ class Modelo:
             if paced is not None:
                 cap = min(cap, paced)                             # rige el más restrictivo de los dos
             self.m.add(sum(terminos) <= max(0, cap - off))        # max(0,·): si va por delante del ritmo, descansa
-            if t.tipo != "fijo":
-                self._min_ventana[w] = terminos                  # solo NO-fijos van a P_horas simétrica
+            # Equidad de jornada hacia 1776: todos los NO-fijos salvo los patrones UVI (sus horas de
+            # patrón+vacaciones se aceptan aunque excedan; no se recortan). Fijos aparte (retirada).
+            if t.tipo != "fijo" and t.patron not in self.patrones_uvi:
+                self._min_ventana[w] = terminos
 
     def _desviacion_jornada(self) -> tuple[object, int]:
         """P_horas (BLANDA, EQUIDAD): penaliza que los minutos de CONSUMO de la ventana se desvíen del
@@ -821,6 +882,18 @@ def _linea_fija_de(datos: Datos, w: str) -> str | None:
     return lineas[0] if len(lineas) == 1 else None
 
 
+def _patrones_uvi(datos: Datos) -> set[str]:
+    """Patrones UVI (localizado 24h, ciclo corto <=2 filas): sus horas de patrón se ACEPTAN, no se
+    recortan a 1776 (mismo criterio que Modelo, versión a nivel módulo para resolver_anual)."""
+    uvi = set()
+    for p, filas in datos.patrones.items():
+        tipos = {datos.turnos[s].tipo for fila in filas for s in fila.values()
+                 if s and s != LIBRE and s in datos.turnos}
+        if "24h" in tipos and len(filas) <= 2:
+            uvi.add(p)
+    return uvi
+
+
 def resolver_anual(datos: Datos, inicio: date, fin: date, dias_ventana: int = 14,
                    dias_cola: int = 28, segundos: int = 60, hilos: int = 8,
                    log: bool = False) -> dict[tuple[str, date], str]:
@@ -832,8 +905,9 @@ def resolver_anual(datos: Datos, inicio: date, fin: date, dias_ventana: int = 14
     offset_horas: dict[str, int] = {}                   # libro de jornada anual (minutos), C9
     # días disponibles (no vacaciones) de cada trabajador en todo el horizonte: base del prorrateo
     dias_horizonte = rango_fechas(inicio, fin)
+    uvi = _patrones_uvi(datos)                          # UVI: horas de patrón aceptadas, no se recortan
     disp_año = {w: sum(datos.disponible(w, f) for f in dias_horizonte)
-                for w, t in datos.trabajadores.items() if t.tipo != "fijo"}
+                for w, t in datos.trabajadores.items() if t.tipo != "fijo" and t.patron not in uvi}
     # Etapa 4: días ELEGIBLES de cada fijo congelado (línea ≤8h) sobre el año; base del prorrateo del
     # objetivo 1776 acumulado (los fijos se cuadran quitando días de su propia línea).
     fijo_elig: dict[str, list[date]] = {}
