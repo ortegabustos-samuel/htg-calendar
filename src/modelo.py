@@ -362,9 +362,11 @@ class Modelo:
                     self.trabaja[(trab,dom)].Not(),
                 ])
                 finde_libre.append(fl)
-            # En cada ventana de 4 semanas completas, al menos un finde completo libre
-        for i in range(len(finde_libre) - 3):
-            self.m.add(sum(finde_libre[i:i + 4]) >= 1)
+            # En cada ventana de 4 semanas completas, al menos un finde completo libre. (Antes este
+            # bucle estaba FUERA del de trabajadores → solo obligaba al último no-patrón; ahora aplica
+            # a todos, cerrando el incumplimiento del art. 24.)
+            for i in range(len(finde_libre) - 3):
+                self.m.add(sum(finde_libre[i:i + 4]) >= 1)
 
     def _linea_fija(self, trab: str) -> str | None:
         """Devuelve la única línea de capacidad normal de un fijo, si existe."""
