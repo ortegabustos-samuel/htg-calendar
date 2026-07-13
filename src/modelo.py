@@ -18,9 +18,9 @@ FECHA_INI = date(2026, 1, 1)
 FECHA_FIN = date(2026, 1, 31)
 
 # Parámetros legales (V Convenio CyL)
-RMIN = 12          # descanso mínimo entre jornadas (h)
-HMAX7 = 48         # máx. trabajo efectivo en 7 días (h)
-HMAX_4SEM = 160    # máx. trabajo efectivo en 4 semanas (h)
+RMIN = 12          # descanso mínimo entre jornadas (h)                    — C4
+HMAX7 = 48         # máx. trabajo efectivo por semana ISO (h)              — C6
+# (El antiguo límite cuatrisemanal de 160 h se eliminó: redundante con el semanal para este convenio.)
 HORAS_OBJETIVO = 1776  # jornada anual objetivo (h): meta de EQUIDAD (blanda), se persigue sin obligar
 HMAX_AÑO = 1826        # tope legal anual (h): límite DURO, no sobrepasable (aplica al año completo)
 CMAX = 6           # máx. días consecutivos trabajados
@@ -157,7 +157,6 @@ class Modelo:
         self._c4_descanso()
         self._c5_dias_consecutivos()
         self._c6_horas_semana()
-        self._c6b_horas_cuatrisemana()
         self._c7_descanso_semanal()
         self._c8_fijos()
         self._c9_jornada_anual()                  # tope anual duro (libro de horas)
@@ -327,16 +326,6 @@ class Modelo:
                 minutos = self._minutos(trab, dias)
                 if minutos:
                     self.m.add(sum(minutos) <= HMAX7 * 60)
-
-    def _c6b_horas_cuatrisemana(self) -> None:
-        """<= 160 h de trabajo efectivo en cualquier ventana de 28 días. Patrón exento (ver _exento_legal)."""
-        for trab in self.datos.trabajadores:
-            if self._exento_legal(trab):
-                continue
-            for i in range(len(self.fechas) - 27):
-                minutos = self._minutos(trab, self.fechas[i:i + 28])
-                if minutos:
-                    self.m.add(sum(minutos) <= HMAX_4SEM * 60)
 
     def _c7_descanso_semanal(self) -> None:
         """Descanso semanal (art. 24), parte (b): al menos un sábado+domingo libres en cada
