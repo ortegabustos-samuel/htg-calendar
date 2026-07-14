@@ -894,6 +894,21 @@ def _patrones_uvi(datos: Datos) -> set[str]:
     return uvi
 
 
+def _patrones_noche(datos: Datos) -> set[str]:
+    """Patrones de NOCHE (rotación solo turnos noche): se recortan por QUINCENAS enteras (activo por
+    ciclo), granularidad GRUESA. Por eso quedan FUERA del cap prorrateado (tope duro por hora, que los
+    sobre-recortaría al forzar una quincena de más): los recorta la equidad blanda hacia 1776, que
+    aterriza en la quincena más cercana (1760). No tienen fijación ni hacen front-loading, así que el
+    cap duro no les hace falta. Versión módulo para resolver_anual."""
+    noche = set()
+    for p, filas in datos.patrones.items():
+        tipos = {datos.turnos[s].tipo for fila in filas for s in fila.values()
+                 if s and s != LIBRE and s in datos.turnos}
+        if tipos and tipos <= {"noche"}:
+            noche.add(p)
+    return noche
+
+
 def resolver_anual(datos: Datos, inicio: date, fin: date, dias_ventana: int = 14,
                    dias_cola: int = 28, segundos: int = 60, hilos: int = 8,
                    gap: float = 0.0, log: bool = False) -> dict[tuple[str, date], str]:
@@ -951,13 +966,21 @@ def resolver_anual(datos: Datos, inicio: date, fin: date, dias_ventana: int = 14
         # hacia el OBJETIVO 1776 por días DISPONIBLES transcurridos + colchón. Tope DURO por ventana:
         # (a) evita agotar horas antes de diciembre (reparte huecos homogéneo) y (b) hace de 1776 un
         # techo blando (se cruza como mucho por el colchón). El tope legal 1826 lo impone C9 aparte.
+        # Las NOCHES quedan FUERA del cap duro: recortan por QUINCENA (granularidad gruesa) y el cap
+        # duro las sobre-recortaría al forzar una quincena de más; las cuadra la equidad blanda (Alt 2).
+        noche = _patrones_noche(datos)
         tope_paced = {}
         for w, disp_total in disp_año.items():
-            if disp_total == 0:
+            t = datos.trabajadores[w]
+            if disp_total == 0 or t.patron in noche:
                 continue
             disp_hasta = sum(datos.disponible(w, f) for f in rango_fechas(inicio, fin_v))
-            factor = datos.trabajadores[w].factor_jornada
-            tope_paced[w] = round((HORAS_OBJETIVO * disp_hasta / disp_total + COLCHON_PACE_H) * factor * 60)
+            factor = t.factor_jornada
+            # Colchón (adelanto sobre el ritmo de 1776) SOLO para el pool flexible: les da holgura para
+            # picos de cobertura. Los PATRONES largos no lo necesitan (rotación fija, no hacen
+            # front-loading) → colchón 0 los deja en ~1776 en vez de clavados en 1800 (=1776+24).
+            colchon = 0 if t.tipo == "patron" else COLCHON_PACE_H
+            tope_paced[w] = round((HORAS_OBJETIVO * disp_hasta / disp_total + colchon) * factor * 60)
 
         mod = Modelo(datos, fechas_cola + fechas_ventana,
                      congelar=congelar, offset_equidad=offset, cola=cola,
