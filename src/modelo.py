@@ -896,7 +896,7 @@ def _patrones_uvi(datos: Datos) -> set[str]:
 
 def resolver_anual(datos: Datos, inicio: date, fin: date, dias_ventana: int = 14,
                    dias_cola: int = 28, segundos: int = 60, hilos: int = 8,
-                   log: bool = False) -> dict[tuple[str, date], str]:
+                   gap: float = 0.0, log: bool = False) -> dict[tuple[str, date], str]:
     """Horizonte rodante: resuelve [inicio, fin] por ventanas alineadas a lunes, con cola
     congelada (costura legal) y libro de equidad acumulada. Devuelve el plan completo."""
     inicio -= timedelta(days=inicio.weekday())          # alinear a lunes
@@ -964,7 +964,7 @@ def resolver_anual(datos: Datos, inicio: date, fin: date, dias_ventana: int = 14
                      offset_horas=offset_horas, objetivo_horas=objetivo_horas,
                      objetivo_horas_fijo=objetivo_horas_fijo, tope_paced=tope_paced,
                      ancla_patron=inicio)   # ancla GLOBAL fija: la rotación es consistente entre ventanas
-        solver, st = mod.resolver(tiempo=segundos, trabajadores_cpu=hilos, log=log)
+        solver, st = mod.resolver(tiempo=segundos, trabajadores_cpu=hilos, gap=gap, log=log)
 
         pv = _plan_ventana(mod, solver, fechas_ventana)
         plan.update(pv)
