@@ -186,12 +186,17 @@ def _contribuye(datos: Datos, metrica: str, turno: str, f: date) -> bool:
 
 
 def huecos_del_plan(datos: Datos, fechas: list[date], plan: dict) -> list[tuple[date, str]]:
-    """Turnos sin cubrir del plan: por cada turno operativo, dem − asignados (una entrada/unidad)."""
+    """Turnos con DEMANDA real sin cubrir del plan: por cada turno operativo de prioridad>=1,
+    dem − asignados (una entrada/unidad). Los turnos COMODÍN (prioridad 0, p.ej. REF CAL) NO son
+    demanda —son relleno de horas opcional (ver modelo._c1_cobertura)— así que sus plazas sin asignar
+    NO son huecos: no ensucian el listado de 'sin cubrir'."""
     cubiertos = defaultdict(int)
     for (w, f), s in plan.items():
         cubiertos[(s, f)] += 1
     huecos = []
     for turno, t in datos.turnos.items():
+        if t.prioridad == 0:
+            continue                       # comodín: sin demanda -> nunca es hueco
         for f in fechas:
             if not datos.opera(turno, f):
                 continue
@@ -201,19 +206,18 @@ def huecos_del_plan(datos: Datos, fechas: list[date], plan: dict) -> list[tuple[
 
 
 def _kpis_plan(datos: Datos, fechas: list[date], plan: dict, huecos: list, estado: str) -> dict:
-    demanda = sum(datos.turnos[t].dem for t in datos.turnos for f in fechas if datos.opera(t, f))
+    # 'huecos' ya viene SOLO con demanda real (prioridad>=1): los comodín REF CAL no son demanda
+    # (relleno de horas opcional, ver huecos_del_plan). Así la demanda del KPI es la prioritaria.
+    demanda = sum(datos.turnos[t].dem for t in datos.turnos for f in fechas
+                  if datos.opera(t, f) and datos.turnos[t].prioridad >= 1)
     n_huecos = len(huecos)
     p1 = sum(peso_cobertura(datos.turnos[s]) for _, s in huecos)
-    # Huecos en turnos COMODÍN (prioridad 0, p.ej. REF CAL: herramienta de horas de ayuda, no
-    # cobertura real): se siguen incentivando en el objetivo (peso_cobertura ya no les da coste
-    # cero), pero para el REPORT no cuentan como fallo de cobertura — es un KPI distinto (¿se están
-    # aprovechando para repartir horas?), no "¿falló la cobertura?". Se muestran aparte.
-    n_comodin = sum(1 for _, s in huecos if datos.turnos[s].prioridad == 0)
-    n_prio = n_huecos - n_comodin
-    demanda_prio = sum(datos.turnos[t].dem for t in datos.turnos for f in fechas
-                       if datos.opera(t, f) and datos.turnos[t].prioridad >= 1)
-    demanda_comodin = sum(datos.turnos[t].dem for t in datos.turnos for f in fechas
-                          if datos.opera(t, f) and datos.turnos[t].prioridad == 0)
+    # Refuerzos de calendario (comodín, prioridad 0) EFECTIVAMENTE asignados: excedente aprovechado
+    # para repartir horas. No es cobertura (no tenían demanda) -> se informa como conteo, por turno.
+    refuerzos: dict[str, int] = defaultdict(int)
+    for (w, f), s in plan.items():
+        if datos.turnos[s].prioridad == 0:
+            refuerzos[s] += 1
     # P2 anual (aprox.): dispersión de cargas indeseables por trabajador (fijos fuera)
     cargas = {m: defaultdict(int) for m in METRICAS}
     for (w, f), s in plan.items():
@@ -230,9 +234,9 @@ def _kpis_plan(datos: Datos, fechas: list[date], plan: dict, huecos: list, estad
             p2 += LAMBDA[m] * (max(vals) - min(vals))
     return {
         "demanda": demanda, "huecos": n_huecos, "cubiertos": demanda - n_huecos,
-        "pct": 100 * (demanda_prio - n_prio) / demanda_prio if demanda_prio else 100,
-        "huecos_prio": n_prio, "demanda_prio": demanda_prio,
-        "huecos_comodin": n_comodin, "demanda_comodin": demanda_comodin,
+        "pct": 100 * (demanda - n_huecos) / demanda if demanda else 100,
+        "huecos_prio": n_huecos, "demanda_prio": demanda,
+        "refuerzos": dict(refuerzos),
         "p1": p1, "p2": p2, "estado": estado,
     }
 
@@ -368,11 +372,11 @@ def generar_anual(datos: Datos, fechas: list[date], plan: dict,
     print(f"Estado: {kpis['estado']}")
     print(f"Cobertura PRIORITARIA: {kpis['demanda_prio']-kpis['huecos_prio']}/{kpis['demanda_prio']} "
           f"({kpis['pct']:.1f}%)  | huecos que importan: {kpis['huecos_prio']}  | P2={kpis['p2']}")
-    if kpis['demanda_comodin']:
-        cubiertos_comodin = kpis['demanda_comodin'] - kpis['huecos_comodin']
-        pct_comodin = 100 * cubiertos_comodin / kpis['demanda_comodin']
-        print(f"Comodín (prioridad 0, ayuda de horas): {cubiertos_comodin}/{kpis['demanda_comodin']} "
-              f"({pct_comodin:.1f}%) aprovechados")
+    if kpis['refuerzos']:
+        total_ref = sum(kpis['refuerzos'].values())
+        detalle = ", ".join(f"{s}: {n}" for s, n in sorted(kpis['refuerzos'].items()))
+        print(f"Refuerzos de calendario asignados (relleno de horas, sin demanda): {total_ref}  "
+              f"({detalle})")
     # Días con más huecos QUE IMPORTAN (los comodín no cuentan)
     por_dia = defaultdict(int)
     for d, s in huecos:

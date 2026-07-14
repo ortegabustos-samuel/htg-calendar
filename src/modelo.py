@@ -229,9 +229,17 @@ class Modelo:
 
     # -- Restricciones duras ------------------------------------------------- #
     def _c1_cobertura(self) -> None:
-        """Cada turno operativo se cubre con su demanda; la holgura u recoge lo no cubierto."""
+        """Cada turno con DEMANDA real (prioridad>=1) se cubre con su demanda; la holgura u recoge lo
+        no cubierto. Los turnos COMODÍN (prioridad 0, p.ej. REF CAL M/T) NO tienen demanda: son relleno
+        de horas OPCIONAL — un trabajador con excedente los coge para acercarse a 1776 (lo dispara la
+        equidad de horas), no hay 'demanda incumplida' que reportar. Siguen siendo asignables (sus x
+        existen y compiten por C2/un-turno-al-día y C4/descanso, que deciden mañana vs tarde según los
+        turnos vecinos); simplemente no generan holgura ni cuentan como cobertura -> no ensucian el
+        listado de huecos con excedente que nunca fue demanda."""
         d = self.datos
         for turno, t in d.turnos.items():
+            if t.prioridad == 0:
+                continue                           # comodín: sin demanda ni holgura (relleno de horas)
             for f in self.fechas:
                 if f in self.cola or not d.opera(turno, f):
                     continue                       # la cola es contexto: no se impone cobertura
@@ -1013,16 +1021,12 @@ def resolver_anual(datos: Datos, inicio: date, fin: date, dias_ventana: int = 14
         _actualizar_offset_horas(offset_horas, datos, pv)
 
         v += 1
-        # Cobertura PRIORITARIA: solo turnos reales (prioridad>=1). Los comodín REF CAL (prioridad 0)
-        # NO son objetivo de cobertura (relleno de horas): sus slots vacíos son excedente, no huecos —
-        # incluirlos hundiría el % (con dem alta quedan casi todos vacíos a propósito).
-        prio = [(t, u) for (t, _), u in mod.u.items() if datos.turnos[t].prioridad >= 1]
-        huecos = sum(solver.value(u) for _, u in prio)
-        dem = sum(datos.turnos[t].dem for t, _ in prio)
-        comodin = sum(solver.value(u) for (t, _), u in mod.u.items() if datos.turnos[t].prioridad == 0)
+        # u ya solo contiene turnos con DEMANDA real: los comodín REF CAL no generan holgura
+        # (ver _c1_cobertura), así que esta cobertura es directamente la prioritaria.
+        huecos = sum(solver.value(u) for u in mod.u.values())
+        dem = sum(datos.turnos[t].dem for (t, _) in mod.u)
         print(f"ventana {v:>2}  {ini_v:%d/%m}–{fin_v:%d/%m}  {solver.status_name(st):<9} "
-              f"cobertura {100*(dem-huecos)/dem:5.1f}%  ({huecos} huecos"
-              f"{f', +{comodin} REF CAL de relleno' if comodin else ''})", flush=True)
+              f"cobertura {100*(dem-huecos)/dem:5.1f}%  ({huecos} huecos)", flush=True)
         ini_v = fin_v + timedelta(days=1)
     return plan
 
