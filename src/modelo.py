@@ -34,6 +34,13 @@ CMAX = 6           # máx. días consecutivos trabajados
 # poco"; también da holgura para picos de demanda). El tope legal 1826 (C9) sigue como respaldo duro.
 # Subir el colchón = más cobertura pero más gente por encima de 1776; bajarlo = lo contrario.
 COLCHON_PACE_H = 24
+# Colchón del cap para las NOCHES. Recortan por QUINCENA ENTERA (activo, granularidad gruesa ≈77 h),
+# no por horas sueltas: con colchón 0 el cap las sobre-recortaría (forzaría una quincena de más); SIN
+# cap (excluidas del todo) la equidad blanda por ventana prefiere trabajar TODA quincena (77 h ≈ meta
+# 68 h/14d) y solo libran al FINAL forzadas por el tope anual → se amontonan las libranzas en diciembre.
+# Un colchón de ~media quincena hace que el cap BINDE a mitad de año (obliga a librar cuando la jornada
+# acumulada se adelanta al ritmo) → REPARTE las libranzas por el año, sin sobre-recortar el nivel.
+COLCHON_NOCHE_H = 40
 
 # Penalización de cobertura (P1): PONDERADA por prioridad, en TRES escalones respecto a PESO_DEV (el
 # coste de sacar a un trabajador de su patrón). Así la criticidad del turno decide si se toca o no un
@@ -992,20 +999,27 @@ def resolver_anual(datos: Datos, inicio: date, fin: date, dias_ventana: int = 14
         # hacia el OBJETIVO 1776 por días DISPONIBLES transcurridos + colchón. Tope DURO por ventana:
         # (a) evita agotar horas antes de diciembre (reparte huecos homogéneo) y (b) hace de 1776 un
         # techo blando (se cruza como mucho por el colchón). El tope legal 1826 lo impone C9 aparte.
-        # Las NOCHES quedan FUERA del cap duro: recortan por QUINCENA (granularidad gruesa) y el cap
-        # duro las sobre-recortaría al forzar una quincena de más; las cuadra la equidad blanda (Alt 2).
+        # Las NOCHES TAMBIÉN entran (colchón de ~media quincena, COLCHON_NOCHE_H): así el cap las obliga
+        # a librar cuando se adelantan al ritmo → REPARTE las libranzas por el año en vez de al final.
         noche = _patrones_noche(datos)
         tope_paced = {}
         for w, disp_total in disp_año.items():
             t = datos.trabajadores[w]
-            if disp_total == 0 or t.patron in noche:
+            if disp_total == 0:
                 continue
             disp_hasta = sum(datos.disponible(w, f) for f in rango_fechas(inicio, fin_v))
             factor = t.factor_jornada
-            # Colchón (adelanto sobre el ritmo de 1776) SOLO para el pool flexible: les da holgura para
-            # picos de cobertura. Los PATRONES largos no lo necesitan (rotación fija, no hacen
-            # front-loading) → colchón 0 los deja en ~1776 en vez de clavados en 1800 (=1776+24).
-            colchon = 0 if t.tipo == "patron" else COLCHON_PACE_H
+            # Colchón (adelanto permitido sobre el ritmo de 1776), por tipo:
+            #  · NOCHES: ~media quincena → el cap binde a mitad de año y reparte las libranzas (quincena
+            #    entera) sin sobre-recortar el nivel (colchón 0 las hundía; sin cap se amontonaban al final).
+            #  · PATRONES largos: 0 → rotación fija, no hacen front-loading; los deja en ~1776 (no 1800).
+            #  · POOL flexible: COLCHON_PACE_H, holgura para picos de cobertura.
+            if t.patron in noche:
+                colchon = COLCHON_NOCHE_H
+            elif t.tipo == "patron":
+                colchon = 0
+            else:
+                colchon = COLCHON_PACE_H
             tope_paced[w] = round((HORAS_OBJETIVO * disp_hasta / disp_total + colchon) * factor * 60)
 
         mod = Modelo(datos, fechas_cola + fechas_ventana,
