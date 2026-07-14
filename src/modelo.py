@@ -35,22 +35,39 @@ CMAX = 6           # máx. días consecutivos trabajados
 # Subir el colchón = más cobertura pero más gente por encima de 1776; bajarlo = lo contrario.
 COLCHON_PACE_H = 24
 
-# Penalización de cobertura (P1): UNIFORME por hueco (sin criticidad por tipo de turno; todo hueco
-# pesa igual). > 1 para que rescatar una cobertura domine sobre relajar una racha de 6 días o
-# desviar el patrón. (En el futuro se puede volver a diferenciar por tipo de turno.)
-PESO_COBERTURA = 10
+# Penalización de cobertura (P1): PONDERADA por prioridad, en TRES escalones respecto a PESO_DEV (el
+# coste de sacar a un trabajador de su patrón). Así la criticidad del turno decide si se toca o no un
+# patrón para cubrirlo:
+#   - prioridad 0 (COMODÍN, p.ej. REF CAL M/T): peso 0. NO es un objetivo de cobertura -> son relleno
+#     para dar horas y absorber excedente; los llena SOLO la equidad de horas (W3), nunca a costa de un
+#     turno real ("de sobrar, que sobren refuerzos"). La estacionalidad sale sola: en verano hay menos
+#     gente disponible -> menos REF CAL; en otoño/primavera más.
+#   - prioridad 1 (NORMAL): PESO_COBERTURA·prio, POR DEBAJO de PESO_DEV -> el patrón es INTOCABLE por
+#     estos turnos (nunca se saca a nadie de su rotación para cubrir un turno normal).
+#   - prioridad >=2 (CRÍTICO, p.ej. líneas de noche y UVI 24h): PESO_CRITICO·prio, POR ENCIMA de
+#     PESO_DEV -> el turno DEBE cubrirse aunque haya que sacar a su cubridor especial de su patrón (y
+#     su turno pase a un correturno). Prefiere igualmente al cubridor de 0-desvío (dedicado/prescrito) y
+#     solo paga PESO_DEV cuando no hay ninguno disponible; si tampoco lo hay, queda como hueco marcado.
+PESO_COBERTURA = 10      # peso por unidad de prioridad de un turno NORMAL   (prio 1 -> 10  < PESO_DEV)
+PESO_CRITICO = 100       # peso por unidad de prioridad de un turno CRÍTICO  (prio 3 -> 300 > PESO_DEV)
 
 
 def peso_cobertura(t: Turno) -> int:
-    """Coste de dejar SIN cubrir una unidad de este turno (P1). Usa (prioridad+1), NO prioridad
-    directamente: si se multiplicase por prioridad a secas, un turno con prioridad=0 costaría
-    SIEMPRE cero → el modelo no se molestaría nunca en cubrirlo (comprobado: 0% cubierto a
-    propósito). Con +1, prioridad=0 sigue siendo el escalón más bajo (dominado por CUALQUIER
-    turno de prioridad>=1) pero con incentivo NO NULO: se cubre cuando sobra margen, que es
-    justamente la función de un turno "comodín" (p.ej. REF CAL: herramienta para asignar horas
-    de ayuda a quien las necesite, no cobertura real). El orden relativo entre prioridades se
-    conserva (0<1<3 → 10<20<40); no requiere tocar turnos.csv ni casos especiales por turno."""
-    return PESO_COBERTURA * (t.prioridad + 1)
+    """Coste de dejar SIN cubrir una unidad de este turno (P1), en tres escalones respecto a PESO_DEV
+    (coste de sacar a alguien de su patrón, ver más abajo):
+      · prioridad 0 (comodín REF CAL): 0 -> no es objetivo de cobertura; lo llena la equidad de horas.
+        (Antes se usaba (prio+1) para que no valiese 0; ahora se quiere EXACTAMENTE 0: relleno puro.)
+      · prioridad 1 (normal): PESO_COBERTURA·prio, POR DEBAJO de PESO_DEV -> el patrón no se toca.
+      · prioridad>=2 (crítico: noche, UVI 24h): PESO_CRITICO·prio, POR ENCIMA de PESO_DEV -> se saca al
+        cubridor especial de su patrón para cubrirlo y su turno cae a un correturno; se prefiere igual al
+        cubridor de 0-desvío (prescrito) y solo se paga PESO_DEV si no hay otro.
+    El orden relativo se conserva (0 < normal < crítico) y la criticidad se declara en turnos.csv
+    (prioridad), sin casos especiales por turno concreto en el código."""
+    if t.prioridad <= 0:
+        return 0
+    if t.prioridad >= 2:
+        return PESO_CRITICO * t.prioridad
+    return PESO_COBERTURA * t.prioridad
 
 # Equidad (P2): se equipara al PROMEDIO el nº de findes y de festivos entre los trabajadores capaces
 # de cubrirlos. Los de SOLO L-V quedan fuera solos (nunca son elegibles en finde/festivo). Peso IGUAL
@@ -64,10 +81,11 @@ LAMBDA = {"finde": 1, "festivo": 1}
 PESO_ESTAB = 5
 
 # Fijación del patrón (NIVEL DE COBERTURA): "vale" de sacar a un trabajador de patrón de su rotación.
-# Los patrones están PACTADOS con los sindicatos: se priorizan por ENCIMA de cobertura y equidad,
-# salvo vacaciones u otra imposibilidad. > máximo peso_cobertura posible (PESO_COBERTURA·(prioridad
-# máx.+1)) para que desviar a alguien de su patrón sea SIEMPRE más caro que dejar sin cubrir incluso
-# el turno más crítico. BLANDO, no restricción dura: las leyes SÍ siguen mandando (descanso, días
+# Los patrones están PACTADOS con los sindicatos: se priorizan por ENCIMA de la cobertura de turnos
+# NORMALES (peso_cobertura(prio 1) = 10 < 100) y de la equidad, salvo vacaciones u otra imposibilidad.
+# Deliberadamente QUEDA POR DEBAJO de la cobertura de turnos CRÍTICOS (peso_cobertura(prio>=2) >= 200 >
+# 100): una línea de noche o UVI SÍ justifica sacar a su cubridor especial del patrón (su turno lo
+# recoge un correturno). BLANDO, no restricción dura: las leyes SÍ siguen mandando (descanso, días
 # consecutivos, horas/semana no se tocan; si la rotación choca con una de ellas, el patrón cede ahí,
 # nunca al revés) — evita que una semana concreta imposible vuelva INFACTIBLE toda la ventana.
 # Con datos reales (2026-07-10) el peso simétrico (=1) dejaba un turno localizado UVI compartido por
@@ -995,10 +1013,16 @@ def resolver_anual(datos: Datos, inicio: date, fin: date, dias_ventana: int = 14
         _actualizar_offset_horas(offset_horas, datos, pv)
 
         v += 1
-        huecos = sum(solver.value(u) for u in mod.u.values())
-        dem = sum(datos.turnos[t].dem for (t, _) in mod.u)
+        # Cobertura PRIORITARIA: solo turnos reales (prioridad>=1). Los comodín REF CAL (prioridad 0)
+        # NO son objetivo de cobertura (relleno de horas): sus slots vacíos son excedente, no huecos —
+        # incluirlos hundiría el % (con dem alta quedan casi todos vacíos a propósito).
+        prio = [(t, u) for (t, _), u in mod.u.items() if datos.turnos[t].prioridad >= 1]
+        huecos = sum(solver.value(u) for _, u in prio)
+        dem = sum(datos.turnos[t].dem for t, _ in prio)
+        comodin = sum(solver.value(u) for (t, _), u in mod.u.items() if datos.turnos[t].prioridad == 0)
         print(f"ventana {v:>2}  {ini_v:%d/%m}–{fin_v:%d/%m}  {solver.status_name(st):<9} "
-              f"cobertura {100*(dem-huecos)/dem:5.1f}%  ({huecos} huecos)", flush=True)
+              f"cobertura {100*(dem-huecos)/dem:5.1f}%  ({huecos} huecos"
+              f"{f', +{comodin} REF CAL de relleno' if comodin else ''})", flush=True)
         ini_v = fin_v + timedelta(days=1)
     return plan
 
