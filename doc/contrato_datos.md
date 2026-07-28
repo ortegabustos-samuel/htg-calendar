@@ -63,18 +63,27 @@ id_trab,id_turno,lv,sab,dom,fest,v
 71152292K,H,0,0,0,0,1
 ```
 
-Contiene exclusivamente:
+Contiene exclusivamente (hoy 329 filas, de las 2.575 que llegó a tener):
 
-1. **Mixtos**: sus líneas, con los días de cada una. Es su fuente principal.
-2. **Correturnos**: sus líneas (por ahora explícitas; ver "pendiente" abajo).
-3. **Coberturas excepcionales `v=1`**: quién puede tapar una línea que no es suya (los cubridores
-   de las noches y del UVI, por ejemplo). `v=1` habilita el turno aunque los flags de día digan
-   que no.
-4. **Trabajadores de patrón con turnos AJENOS a su patrón**: capacidades reales que ninguna
-   rotación declara (hoy 207 filas, sobre todo VADN004/005/008/026/151).
+1. **Mixtos**: sus líneas, con los días de cada una (103 filas). Es su fuente principal y no se
+   deriva de nada: cada mixto tiene entre 4 y 32 líneas, sin regla común.
+2. **Coberturas designadas `v>=1`**: quién puede tapar una línea que no es suya, **con orden de
+   preferencia** (12 filas). Habilita el turno aunque los flags de día digan que no.
+3. **Trabajadores de patrón con turnos AJENOS a su patrón**: capacidades que ninguna rotación
+   declara (207 filas, sobre todo VADN004/005/008/026/151, que comparten los 38 de
+   PAT_GRANDE_VALL).
+4. **Excepciones de correturno** (7 filas): los que solo cubren VADN022 en finde, porque entre
+   semana la lleva su fijo.
 
-Lo que **no** debe aparecer: las líneas de los fijos (van en `trabajadores.csv`) ni los turnos
-que un trabajador de patrón ya hace dentro de su rotación (se derivan de `patrones.csv`).
+Lo que **no** debe aparecer, porque se deriva: las líneas de los fijos (van en
+`trabajadores.csv`), los turnos que un trabajador de patrón hace dentro de su rotación (salen de
+`patrones.csv`) y las líneas ordinarias de los correturnos (pueden con cualquiera).
+
+**Un correturno NO alcanza las líneas con cubridor designado.** La frontera sale sola de los
+datos: si una línea tiene alguien con `v>=1`, es que hay que estar designado para ella. Se probó
+a darles acceso como "último recurso" y la cobertura del año cayó del 98.9% al 97.5% — el orden
+de preferencia vive en el nivel bajo del objetivo y no puede competir con el coste, en el nivel
+de cobertura, de sacar al designado de su patrón. Ver `_anadir_capacidades_correturno`.
 
 > Una fila con los cuatro días a 0 y `v=0` **no habilita nada**: equivale a no existir. Si
 > aparece, es un error de datos.
@@ -105,9 +114,9 @@ Conviene tenerlas presentes porque explican por qué ciertos flags no hacen falt
 
 ## Pendiente
 
-- **Correturnos sin filas**: pueden hacer casi cualquier turno (67 de 73), así que sus 723 filas
-  podrían derivarse. Hay que marcar antes, en `turnos.csv`, qué líneas exigen autorización
-  expresa — hoy les faltan exactamente H, VADN039 y las cuatro críticas (VADN051, VADN052,
-  VADP003, VADU47127), y darles esas por defecto vaciaría de sentido a los cubridores designados.
+- **Las 190 filas de patrón repetidas**: cinco líneas (VADN004/005/008/026/151) declaradas 38
+  veces, una por cada miembro de PAT_GRANDE_VALL. Es un hecho de GRUPO escrito 190 veces; cabría
+  asociarlo al patrón en vez de a cada persona y el fichero bajaría a ~145 filas. Antes hay que
+  medirlo: engordar o adelgazar el modelo tiene efectos grandes y poco intuitivos en la cobertura.
 - **`src/validar_datos.py` está roto** desde el commit inicial (importa `DATOS_DEF`, que no
   existe). Es justo la herramienta que debería vigilar este contrato.
