@@ -20,12 +20,18 @@ FECHA_FIN = date(2026, 1, 31)
 # Parámetros legales (V Convenio CyL)
 RMIN = 12          # descanso mínimo entre jornadas (h)                    — C4
 HMAX7 = 48         # máx. trabajo efectivo por semana ISO (h)              — C6
-# Jornada anual: 1776 h es a la vez el OBJETIVO de equidad y el TOPE DURO — no se pasa de ahí.
-# (Antes el tope era 1826 y por eso media plantilla derivaba a 1808-1834: el modelo tenía permiso.)
-# Consecuencia a tener presente: quien solo puede recortar en BLOQUES (una quincena de noche = 77 h)
-# no puede aterrizar justo en 1776, así que cae al múltiplo inmediatamente inferior — cede de más,
-# nunca de menos.
+# Jornada anual objetivo. Es el techo de TODO lo que no sea cubrir: la equidad apunta aquí, las
+# cesiones de bloque aterrizan por debajo y el relleno de refuerzos (rellenar_refuerzos) para en seco
+# al llegar. (Antes el tope era 1826 y por eso media plantilla derivaba a 1808-1834.)
 HORAS_OBJETIVO = 1776
+# Tolerancia POR ENCIMA del objetivo, y solo para C9 (el tope duro anual). Es un margen para CUBRIR,
+# no un cupo que rellenar: al vivir únicamente en C9, lo puede gastar un turno real que si no quedaría
+# vacío, pero NUNCA un refuerzo de calendario, porque el relleno topa en HORAS_OBJETIVO.
+# Sin ella el año 2026 dejaba una noche crítica sin cubrir (VADN052 el 13/06): su cubridor estaba en
+# 1771 h y el turno son 11, así que le faltaban 5 horas de margen. 12 h cubren un turno de cualquier
+# tipo (el más largo son las 11 h de una noche) sin dar pie a acumular.
+TOLERANCIA_H = 12
+HMAX_AÑO = HORAS_OBJETIVO + TOLERANCIA_H   # tope anual DURO (h): solo alcanzable cubriendo
 CMAX = 6           # máx. días trabajados por semana ISO (tope general) — C5
 
 # Tope de días por semana para la plantilla FLEXIBLE (correturnos y mixtos)
@@ -730,7 +736,10 @@ class Modelo:
 
     # -- C9: jornada anual (tope duro + pacing blando) ----------------------- #
     def _c9_jornada_anual(self) -> None:
-        """C9 (DURA): la jornada anual no supera HORAS_OBJETIVO (1776, tope duro). Libro de
+        """C9 (DURA): la jornada anual no supera HMAX_AÑO (objetivo + TOLERANCIA_H). Este es el ÚNICO
+        sitio donde la tolerancia existe: es margen para cubrir un turno que si no quedaría vacío. El
+        resto del sistema (equidad, cesiones, relleno de refuerzos) topa en HORAS_OBJETIVO, así que
+        nadie llega al límite a base de refuerzos de calendario. Libro de
         horas acumuladas: minutos previos (offset_horas) + los de esta ventana <= tope. Guarda los
         términos de minutos por NO-fijo para la equidad de horas (P_horas). Los fijos también topan
         (antes estaban fuera → un fijo podía superar el tope en silencio), pero NO entran en
@@ -744,7 +753,7 @@ class Modelo:
             terminos = self._minutos(w, dias)
             if not terminos:
                 continue                                          # no puede trabajar en la ventana
-            tope_min = round(HORAS_OBJETIVO * t.factor_jornada * 60)    # tope escalado por reducción de jornada
+            tope_min = round(HMAX_AÑO * t.factor_jornada * 60)     # objetivo + tolerancia, escalado
             off = self.offset_horas.get(w, 0)                     # <= tope por invariante del libro
             cap = tope_min
             paced = self.tope_paced.get(w)                        # cap prorrateado (anti front-loading, no-fijos)
