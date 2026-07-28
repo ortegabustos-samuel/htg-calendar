@@ -359,7 +359,22 @@ def metricas_trabajadores(datos: Datos, plan: dict) -> list[dict]:
     for r in filas:
         print(f"{r['id_trab']:<12} {r['tipo']:<11} {r['grupo']:<16} "
               f"{r['sabados']:>4} {r['domingos']:>4} {r['festivos']:>4} {r['horas_totales']:>6}")
-    print(f"\nCSV: {ruta.relative_to(RAIZ)}")
+    try:
+        print(f"\nCSV: {ruta.relative_to(RAIZ)}")
+    except ValueError:                      # SALIDA fuera del repo (pruebas): ruta absoluta
+        print(f"\nCSV: {ruta}")
+
+    # Aviso de tope: si alguien supera el tope anual duro, el plan NO es válido — casi siempre
+    # significa que una ventana del rodante se resolvió sin solución y se cosieron valores basura.
+    from modelo import HORAS_OBJETIVO
+    excedidos = [(r["id_trab"], r["horas_totales"],
+                  round(HORAS_OBJETIVO * datos.trabajadores[r["id_trab"]].factor_jornada))
+                 for r in filas
+                 if r["horas_totales"] > HORAS_OBJETIVO * datos.trabajadores[r["id_trab"]].factor_jornada]
+    if excedidos:
+        print(f"\n*** AVISO: {len(excedidos)} trabajador(es) SUPERAN el tope anual ***")
+        for w, h, tope in sorted(excedidos, key=lambda x: -x[1]):
+            print(f"  {w:<12} {h} h  (tope {tope} h, +{h-tope})")
     return filas
 
 
