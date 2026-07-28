@@ -123,7 +123,13 @@ class Capacidad:
     sab: int                        #Trabaja los sabados flag 0/1
     dom: int                        #Trabaja los domingos flag 0/1
     fest: int                       #Trabaja los festivos flag 0/1
-    v: int                          #Trabaja como cubre vacaciones 0/1
+    v: int                          # Cobertura excepcional, con ORDEN de preferencia:
+                                    #   0 = no es cubridor de esta línea (capacidad normal)
+                                    #   1 = cubridor PRINCIPAL — el que el gestor prefiere para ella
+                                    #   2, 3… = suplentes, por orden: solo entran si el principal no
+                                    #           puede (vacaciones, ya ocupado, descanso obligado).
+                                    # El orden es una preferencia BLANDA (ver _preferencia_cubridor):
+                                    # nunca deja una línea sin cubrir por respetarlo.
 
 
 @dataclass
@@ -174,7 +180,7 @@ class Datos:
         normal = {"LV": cap.lv, "SAB": cap.sab, "DOM": cap.dom, "FEST": cap.fest}[td] == 1
         if normal:
             return (True, False)
-        if cap.v == 1:
+        if cap.v >= 1:          # cubridor: principal (v=1) o suplente (v>=2); el orden lo pesa el modelo
             return (True, True)
         return (False, False)
 

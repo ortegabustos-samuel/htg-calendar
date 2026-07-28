@@ -92,6 +92,14 @@ LAMBDA = {"finde": 1, "festivo": 1}
 # laboral (L-V). Correturnos exentos (flexibles por diseño). Tunable.
 PESO_ESTAB = 5
 
+# P7 (desempate): "vale" de tirar de un cubridor SUPLENTE existiendo uno principal para esa línea.
+# El gestor designa quién hace mejor cada línea (v=1) y quién la cubre solo si aquel no puede (v=2,
+# 3…); esto es una preferencia de CALIDAD, no una regla legal, así que va en el nivel bajo: si el
+# principal no está disponible, el suplente entra sin discusión antes que dejar la línea sin cubrir.
+# En la escala de P_horas (minutos), 120 ≈ 2 h de desviación de jornada por día cubierto: suficiente
+# para decidir cuando ambos pueden, insuficiente para mover cobertura o equidad.
+PESO_ORDEN = 120
+
 # Fijación del patrón (NIVEL DE COBERTURA): "vale" de sacar a un trabajador de patrón de su rotación.
 # Los patrones están PACTADOS con los sindicatos: se priorizan por ENCIMA de la cobertura de turnos
 # NORMALES (peso_cobertura(prio 1) = 10 < 100) y de la equidad, salvo vacaciones u otra imposibilidad.
@@ -835,6 +843,27 @@ class Modelo:
                 cota += len(dias) - 5
         return sum(excesos), cota
 
+    def _preferencia_cubridor(self) -> tuple[object, int]:
+        """P7 (BLANDA): respeta el ORDEN entre los cubridores de una misma línea. El gestor designa
+        un cubridor PRINCIPAL (v=1) porque considera que hace mejor esa línea, y suplentes (v=2, 3…)
+        que solo deberían entrar si el principal no puede. Aquí se penaliza cada día cubierto por un
+        suplente, con peso proporcional a lo lejos que esté del principal.
+
+        Blanda a propósito: es una preferencia de calidad, no una restricción. Cuando el principal
+        está de vacaciones, ya ocupado o descansando, el suplente entra sin más — antes eso que un
+        hueco. Y al vivir en el nivel bajo, nunca desplaza cobertura ni equidad de findes.
+        Devuelve (Σ (v−1)·x, cota)."""
+        terminos, cota = [], 0
+        for (w, f, s), var in self.x.items():
+            if f in self.cola:
+                continue
+            cap = self.datos.capacidades.get((w, s))
+            if cap is None or cap.v <= 1:
+                continue                          # titular o cubridor principal: sin coste
+            terminos.append((cap.v - 1) * var)
+            cota += cap.v - 1
+        return sum(terminos), cota
+
     def _inestabilidad_mixto(self) -> tuple[object, int]:
         """P5 (BLANDA, nivel de desempate): penaliza que un MIXTO use más de un turno
         distinto en días LABORABLES de DIARIO (L-V no festivos) dentro de una misma semana
@@ -897,9 +926,11 @@ class Modelo:
         p_ret, max_ret = self._retirada_fijos()            # Etapa 4: horas de fijos (asimétrico: falta≫exceso)
         p_retira = sum(self.retira.values())               # nº de días quitados a fijos (freno a quitar de más)
         p5, max_p5 = self._inestabilidad_mixto()           # estabilidad posicional del mixto (L-V)
+        p7, max_p7 = self._preferencia_cubridor()          # orden de preferencia entre cubridores
 
         # Cotas conservadoras del nivel bajo para escalar los pesos (W1 > max aporte del nivel bajo).
-        max_low = max_horas + max_ret + PESO_RETIRA * len(self.retira) + PESO_ESTAB * max_p5
+        max_low = (max_horas + max_ret + PESO_RETIRA * len(self.retira) + PESO_ESTAB * max_p5
+                   + PESO_ORDEN * max_p7)
         W3 = 1
         W2 = max_low + 1
         W1 = (max_p2 * W2) + max_low + 1
@@ -910,7 +941,8 @@ class Modelo:
         solver.parameters.relative_gap_limit = gap
         solver.parameters.max_time_in_seconds = tiempo
         self.m.minimize(W1 * (p1 + p_exceso + PESO_DEV * p_dev) + W2 * p2
-                        + W3 * (p_horas + p_ret + PESO_RETIRA * p_retira + PESO_ESTAB * p5))
+                        + W3 * (p_horas + p_ret + PESO_RETIRA * p_retira + PESO_ESTAB * p5
+                                + PESO_ORDEN * p7))
         return solver, solver.solve(self.m)
 
     # -- Resolución LEXICOGRÁFICA (por pasadas; no desborda a ningún horizonte) ---------- #
@@ -934,11 +966,13 @@ class Modelo:
         p_ret, _ = self._retirada_fijos()
         p_retira = sum(self.retira.values())
         p5, _ = self._inestabilidad_mixto()
+        p7, _ = self._preferencia_cubridor()
 
         niveles = [
             ("cobertura", p1 + p_exceso + PESO_DEV * p_dev),
             ("equidad", p2),
-            ("horas", p_horas + p_ret + PESO_RETIRA * p_retira + PESO_ESTAB * p5),
+            ("horas", p_horas + p_ret + PESO_RETIRA * p_retira + PESO_ESTAB * p5
+                      + PESO_ORDEN * p7),
         ]
 
         solver = cp_model.CpSolver()
