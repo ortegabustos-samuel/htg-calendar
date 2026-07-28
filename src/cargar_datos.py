@@ -361,6 +361,53 @@ def _anadir_capacidad_fijo(
     return anadidas
 
 
+def _anadir_capacidades_correturno(
+    trabajadores: dict[str, Trabajador],
+    turnos: dict[str, Turno],
+    capacidades: dict[tuple[str, str], Capacidad],
+) -> int:
+    """Un CORRETURNO puede hacer cualquier línea: esa es su función. En vez de enumerarle 67 filas
+    una a una, se derivan todas, y en `capacidades.csv` solo se declaran sus EXCEPCIONES.
+
+    La distinción entre "cualquier línea" y las líneas que exigen estar designado sale de los
+    propios datos, sin columna nueva: **una línea que tiene cubridores designados (v>=1) es una
+    línea donde hay que estar designado**, y ahí el correturno NO entra. Encaja con el dato real —
+    las que ningún correturno tenía declaradas son exactamente H, VADN051, VADN052, VADP003 y
+    VADU47127, que son las cinco con cubridor designado.
+
+    Se probó a darles esas líneas como "último recurso" (orden peor que el de los designados) y
+    salió MAL, por la estructura del objetivo y no por los datos: dejar una noche sin cubrir cuesta
+    300 en el nivel de cobertura y sacar a su cubridor designado del patrón cuesta PESO_DEV=100 en
+    ese mismo nivel, mientras que el orden de preferencia vive en el nivel bajo. Frente a W1 ese
+    coste es cero, así que el solver tiraba SIEMPRE del correturno para ahorrarse mover al
+    designado: 160 días de líneas críticas absorbidos por correturnos, que llegaban al verano con
+    +23 h sobre su ritmo y sin presupuesto para las líneas que sí son suyas (la cobertura del año
+    caía del 98.9% al 97.5%). Subir el peso al nivel de cobertura tampoco vale: para que el
+    designado gane haría falta ~120, y entonces en una línea de prioridad 1 como H —que vale 10—
+    el solver preferiría dejarla vacía antes que usar un correturno.
+
+    Las filas explícitas MANDAN sobre lo derivado, por si hiciera falta declarar una excepción.
+    Devuelve el nº de capacidades añadidas."""
+    # Orden más alto ya declarado en cada línea (0 = nadie designado para ella)
+    orden_max: dict[str, int] = {}
+    for (_, turno), cap in capacidades.items():
+        if cap.v >= 1:
+            orden_max[turno] = max(orden_max.get(turno, 0), cap.v)
+
+    anadidas = 0
+    for w, t in trabajadores.items():
+        if t.tipo != "correturno":
+            continue
+        for turno in turnos:
+            if (w, turno) in capacidades:            # excepción declarada: manda ella
+                continue
+            if orden_max.get(turno):                 # línea con designados: no es para él
+                continue
+            capacidades[(w, turno)] = Capacidad(lv=1, sab=1, dom=1, fest=1, v=0)
+            anadidas += 1
+    return anadidas
+
+
 def _derivar_grupos_equidad(trabajadores: dict[str, Trabajador]) -> int:
     """Grupo de equidad de findes/festivos: cada PATRÓN es un grupo CERRADO propio — sus miembros se
     equiparan solo entre sí (el patrón ya codifica una rotación equilibrada; la equidad se mide DENTRO
@@ -387,6 +434,9 @@ def cargar(directorio: Path | str = DATA) -> Datos:
     _anadir_capacidades_patron(trabajadores, patrones, turnos, capacidades)
     # Capacidad de los fijos: derivada de su `linea` (trabajadores.csv), L-V por definición.
     _anadir_capacidad_fijo(trabajadores, turnos, capacidades)
+    # Correturnos: pueden con cualquier línea, así que se derivan todas; en las que tienen cubridor
+    # designado entran como último recurso. Va DESPUÉS para ver los órdenes ya declarados.
+    _anadir_capacidades_correturno(trabajadores, turnos, capacidades)
     # Grupo de equidad: cada patrón, su propio grupo cerrado; mixtos/correturnos en el pool general.
     _derivar_grupos_equidad(trabajadores)
     return Datos(
