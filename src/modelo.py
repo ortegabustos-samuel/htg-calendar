@@ -480,25 +480,10 @@ class Modelo:
                 self.m.add(sum(finde_libre[i:i + 4]) >= 1)
 
     def _linea_fija(self, trab: str) -> str | None:
-        """Devuelve la única línea de capacidad normal de un fijo, si existe."""
-        turnos = []
-
-        for (w, turno), cap in self.datos.capacidades.items():
-            if w != trab:
-                continue
-
-            if cap.v == 0 and (cap.lv or cap.sab or cap.dom or cap.fest):
-                turnos.append(turno)
-
-        if not turnos:
-            return None
-
-        if len(turnos) > 1:
-            raise ValueError(
-                f"El trabajador fijo {trab} tiene más de una línea fija: {turnos}"
-            )
-
-        return turnos[0]
+        """Línea que cubre un fijo. La declara él mismo en trabajadores.csv (columna `linea`), igual
+        que un trabajador de patrón declara su patrón. Antes se deducía rebuscando en capacidades
+        cuál era su única fila con v=0, y reventaba si encontraba dos."""
+        return self.datos.trabajadores[trab].linea
 
 
     def _c8_fijos(self) -> None:
@@ -1017,10 +1002,8 @@ def _actualizar_offset_horas(offset_horas: dict, datos: Datos, plan_ventana: dic
 
 
 def _linea_fija_de(datos: Datos, w: str) -> str | None:
-    """Única línea de capacidad normal de un fijo (versión a nivel módulo de Modelo._linea_fija)."""
-    lineas = [turno for (ww, turno), c in datos.capacidades.items()
-              if ww == w and c.v == 0 and (c.lv or c.sab or c.dom or c.fest)]
-    return lineas[0] if len(lineas) == 1 else None
+    """Línea que cubre un fijo, declarada en trabajadores.csv (versión a nivel módulo)."""
+    return datos.trabajadores[w].linea
 
 
 def _patrones_uvi(datos: Datos) -> set[str]:

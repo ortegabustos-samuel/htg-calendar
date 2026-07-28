@@ -105,10 +105,13 @@ class Turno:
 
 @dataclass
 class Trabajador:
-    id: str                         #Nif único 
+    id: str                         #Nif único
     tipo: str                       # fijo | patron | correturno | mixto
     patron: str | None              # id del patrón (solo tipo=patron)
     vacaciones: list[tuple[date, date]] #Lista con tupla (inicio_vacaciones,fin_vacaciones)
+    linea: str | None = None        # id del turno que cubre un FIJO (solo tipo=fijo). Se declara aquí
+                                    # igual que el patrón: es lo que define su trabajo. Su capacidad
+                                    # se deriva sola (ver _anadir_capacidad_fijo), no va en capacidades.csv.
     factor_jornada: float = 1.0     # reducción de jornada: escala objetivo (1776) y tope (1826). 1.0 = jornada completa
     grupo: str | None = None        # grupo de EQUIDAD: mismos grupo se equiparan entre sí (findes/festivos).
                                     # Lo asigna la empresa; None = sin grupo (no entra en equidad de grupo)
@@ -237,6 +240,7 @@ def _cargar_trabajadores(directorio: Path) -> dict[str, Trabajador]:
                 id=fila["id_trab"],
                 tipo=fila["tipo"],
                 patron=fila.get("patron",None),
+                linea=(fila.get("linea") or "").strip() or None,   # columna OPCIONAL, solo para fijos
                 vacaciones = [(vac1, vac1 + timedelta(days=14)),(vac2, vac2 + timedelta(days=14))],
                 factor_jornada=factor,
                 grupo=(fila.get("grupo") or "").strip() or None,   # columna OPCIONAL de grupo de equidad
@@ -321,6 +325,36 @@ def _anadir_capacidades_patron(
     return anadidas
 
 
+def _anadir_capacidad_fijo(
+    trabajadores: dict[str, Trabajador],
+    turnos: dict[str, Turno],
+    capacidades: dict[tuple[str, str], Capacidad],
+) -> int:
+    """Deriva la capacidad de los FIJOS a partir de su `linea` (declarada en trabajadores.csv), igual
+    que las de patrón se derivan de patrones.csv.
+
+    Un fijo trabaja su plaza de LUNES A VIERNES: eso es lo que significa ser fijo, así que la regla
+    vive AQUÍ y no en los datos. Importa que sea así y no deducirla de los días en que opera la línea:
+    VADN022 opera sábados, domingos y festivos, pero su fijo solo la cubre L-V (el finde lo hace otro).
+    Si un fijo tuviera además días atípicos, basta una fila explícita en capacidades.csv: esta
+    derivación respeta lo que ya venga del CSV. Devuelve el nº de capacidades añadidas."""
+    anadidas = 0
+    for w, t in trabajadores.items():
+        if t.tipo != "fijo":
+            continue
+        if not t.linea:
+            # Falla en voz alta: con un trabajadores.csv anterior a la columna `linea`, el fijo se
+            # quedaría sin plaza congelada y el cuadrante saldría en silencio con su línea vacía.
+            raise ValueError(f"El fijo {w} no declara `linea` en trabajadores.csv "
+                             f"(columna obligatoria para tipo=fijo)")
+        if t.linea not in turnos:
+            raise ValueError(f"El fijo {w} declara la línea '{t.linea}', que no existe en turnos.csv")
+        if (w, t.linea) not in capacidades:                 # respeta lo que ya venga del CSV
+            capacidades[(w, t.linea)] = Capacidad(lv=1, sab=0, dom=0, fest=0, v=0)
+            anadidas += 1
+    return anadidas
+
+
 def _derivar_grupos_equidad(trabajadores: dict[str, Trabajador]) -> int:
     """Grupo de equidad de findes/festivos: cada PATRÓN es un grupo CERRADO propio — sus miembros se
     equiparan solo entre sí (el patrón ya codifica una rotación equilibrada; la equidad se mide DENTRO
@@ -345,6 +379,8 @@ def cargar(directorio: Path | str = DATA) -> Datos:
     # Capacidades de los trabajadores de patrón: derivadas de la estructura del patrón (no están en
     # capacidades.csv porque esa info ya vive en patrones.csv).
     _anadir_capacidades_patron(trabajadores, patrones, turnos, capacidades)
+    # Capacidad de los fijos: derivada de su `linea` (trabajadores.csv), L-V por definición.
+    _anadir_capacidad_fijo(trabajadores, turnos, capacidades)
     # Grupo de equidad: cada patrón, su propio grupo cerrado; mixtos/correturnos en el pool general.
     _derivar_grupos_equidad(trabajadores)
     return Datos(
