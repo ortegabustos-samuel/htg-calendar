@@ -1242,7 +1242,26 @@ def resolver_anual(datos: Datos, inicio: date, fin: date, dias_ventana: int = 14
     # coincidir con las vacaciones del binomio ni de los cubridores). Si sale vacío se cae al
     # comportamiento anterior (lo decide el cap prorrateado, con riesgo de coincidencia).
     cesiones = calendario_cesiones(datos, inicio, fin)
-    disp_año = {w: sum(datos.disponible(w, f) for f in dias_horizonte)
+    # PESO de cada día para el prorrateo de la jornada. NO se cuentan los días a pelo: la carga que
+    # toca a cada persona disponible NO es uniforme a lo largo del año. En agosto la demanda es la
+    # misma pero hay menos gente (vacaciones), así que cada disponible tiene que dar un ~8% MÁS de lo
+    # normal; en enero, un ~6% menos. Prorratear por días transcurridos reparte bien el total del año
+    # pero en el MOMENTO equivocado: da horas de sobra en invierno y las quita en verano, y el cap
+    # corta justo cuando más falta hace (medido en 2026: 126 de los 135 huecos de agosto tenían gente
+    # libre a la que solo le faltaban horas). Se pondera por carga esperada = demanda del día entre
+    # personas disponibles ese día.
+    carga_dia: dict[date, float] = {}
+    for f in dias_horizonte:
+        dem_f = sum(t.dem * t.horas for s, t in datos.turnos.items()
+                    if t.prioridad >= 1 and datos.opera(s, f))
+        disp_f = sum(1 for w in datos.trabajadores if datos.disponible(w, f))
+        carga_dia[f] = dem_f / disp_f if disp_f else 0.0
+
+    def peso(w: str, dias: list[date]) -> float:
+        """Carga esperada que le corresponde a w en esos días (0 en los que no está disponible)."""
+        return sum(carga_dia[f] for f in dias if datos.disponible(w, f))
+
+    disp_año = {w: peso(w, dias_horizonte)
                 for w, t in datos.trabajadores.items() if t.tipo != "fijo" and t.patron not in uvi}
     # Etapa 4: días ELEGIBLES de cada fijo congelado (línea ≤8h) sobre el año; base del prorrateo del
     # objetivo 1776 acumulado (los fijos se cuadran quitando días de su propia línea).
@@ -1263,15 +1282,16 @@ def resolver_anual(datos: Datos, inicio: date, fin: date, dias_ventana: int = 14
         cola = set(fechas_cola)
         congelar = {(w, f): plan[(w, f)] for (w, f) in plan if f in cola}
 
-        # Objetivo de jornada de la ventana: prorrateo de HORAS_OBJETIVO (meta blanda, 1776) por
-        # días disponibles (P4). El tope anual duro lo impone C9 aparte.
+        # Objetivo de jornada de la ventana: prorrateo de HORAS_OBJETIVO (meta blanda, 1776) por la
+        # CARGA que le toca en ella, no por días (ver carga_dia). Así la equidad y el cap hablan el
+        # mismo idioma: en las ventanas cargadas se espera más de cada uno, y en las flojas menos.
         objetivo_horas = {}
-        for w, disp_total in disp_año.items():
-            if disp_total == 0:
+        for w, peso_total in disp_año.items():
+            if peso_total == 0:
                 continue
-            disp_v = sum(datos.disponible(w, f) for f in fechas_ventana)
+            peso_v = peso(w, fechas_ventana)
             factor = datos.trabajadores[w].factor_jornada        # reducción de jornada
-            objetivo_horas[w] = round(HORAS_OBJETIVO * factor * 60 * disp_v / disp_total)
+            objetivo_horas[w] = round(HORAS_OBJETIVO * factor * 60 * peso_v / peso_total)
 
         # Etapa 4: objetivo ACUMULADO (min) de 1776 de cada fijo hasta el FIN de esta ventana
         # (prorrateo por días elegibles transcurridos). _retirada_fijos lo usa como línea de ritmo.
@@ -1283,18 +1303,18 @@ def resolver_anual(datos: Datos, inicio: date, fin: date, dias_ventana: int = 14
             elig_hasta = sum(1 for f in elig if f <= fin_v)
             objetivo_horas_fijo[w] = round(HORAS_OBJETIVO * factor * 60 * elig_hasta / len(elig))
 
-        # Cap PRORRATEADO (no-fijos): jornada acumulada hasta el FIN de esta ventana <= ritmo lineal
-        # hacia el OBJETIVO 1776 por días DISPONIBLES transcurridos + colchón. Tope DURO por ventana:
-        # (a) evita agotar horas antes de diciembre (reparte huecos homogéneo) y (b) hace de 1776 un
-        # techo blando (se cruza como mucho por el colchón). El tope anual lo impone C9 aparte.
+        # Cap PRORRATEADO (no-fijos): jornada acumulada hasta el FIN de esta ventana <= ritmo hacia el
+        # OBJETIVO 1776 según la CARGA ya transcurrida (ver carga_dia) + colchón. Tope DURO por
+        # ventana: (a) evita agotar horas antes de diciembre y (b) hace de 1776 un techo blando (se
+        # cruza como mucho por el colchón). El tope anual lo impone C9 aparte.
         tope_paced = {}
-        for w, disp_total in disp_año.items():
+        for w, peso_total in disp_año.items():
             t = datos.trabajadores[w]
-            if disp_total == 0:
+            if peso_total == 0:
                 continue
             if cesiones and t.patron in noche:
                 continue      # su jornada la gobierna el calendario de cesiones, no el cap
-            disp_hasta = sum(datos.disponible(w, f) for f in rango_fechas(inicio, fin_v))
+            peso_hasta = peso(w, rango_fechas(inicio, fin_v))
             factor = t.factor_jornada
             # Colchón (adelanto permitido sobre el ritmo de 1776), por tipo:
             #  · CESIÓN GRUESA (noches: solo pueden recortar quincenas enteras): COLCHON_NOCHE_H, para
@@ -1307,7 +1327,7 @@ def resolver_anual(datos: Datos, inicio: date, fin: date, dias_ventana: int = 14
                 colchon = 0
             else:
                 colchon = COLCHON_PACE_H
-            tope_paced[w] = round((HORAS_OBJETIVO * disp_hasta / disp_total + colchon) * factor * 60)
+            tope_paced[w] = round((HORAS_OBJETIVO * peso_hasta / peso_total + colchon) * factor * 60)
 
         mod = Modelo(datos, fechas_cola + fechas_ventana,
                      congelar=congelar, offset_equidad=offset, cola=cola,
