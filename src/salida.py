@@ -10,7 +10,7 @@ sin cubrir. También imprime un resumen por consola.
 from __future__ import annotations
 
 import csv
-from collections import defaultdict
+from collections import Counter, defaultdict
 from datetime import date
 from pathlib import Path
 
@@ -26,10 +26,11 @@ SALIDA = RAIZ / "data" / "output"
 
 DIA_INI = ["L", "M", "X", "J", "V", "S", "D"]
 
-# Colores por categoría de día para el Excel (cuerpo / cabecera)
-CAT_FILL = {"lv": "EAF1FB", "finde": "FFF2CC", "festivo": "FCE4D6"}
-CAT_HEAD = {"lv": "BDD7EE", "finde": "FFE699", "festivo": "F4B084"}
-FILL_VAC_XL, FILL_HUECO_XL = "D9D9D9", "F4B084"
+# Colores del Excel. El de FESTIVO se aplica CELDA A CELDA, no a la columna entera: un festivo local
+# solo tiñe a quien trabaja en un municipio que se acoge a ese calendario (hay 6 municipios repartidos
+# entre 2 calendarios locales, así que un mismo día es festivo para unos y laborable para otros).
+CAT_FILL = {"lv": "FFF2CC", "finde": "F8CBAD", "festivo": "FFC000"}
+FILL_VAC_XL, FILL_HUECO_XL = "FFFF00", "F4B084"
 
 
 # --------------------------------------------------------------------------- #
@@ -50,10 +51,34 @@ def sin_cubrir(modelo: Modelo, solver) -> list[tuple[date, str]]:
 # --------------------------------------------------------------------------- #
 #  Excel (formato de la empresa)
 # --------------------------------------------------------------------------- #
-def _categoria(datos: Datos, d: date) -> str:
-    """Categoría de día para colorear la columna: festivo (Común), finde o L-V.
-    (Los festivos regionales no tiñen la columna; solo los comunes, que afectan a todos.)"""
-    if d in datos.festivos.get("Comun", set()):
+def _municipio_trabajador(datos: Datos) -> dict[str, str]:
+    """Municipio de referencia de cada trabajador, para saber qué festivos le afectan. No es un dato
+    de `trabajadores.csv`: el municipio vive en los TURNOS, así que se deduce de las líneas que hace
+    —la de su patrón si lo tiene, la suya si es fijo, o sus capacidades— quedándose con la más
+    frecuente. Solo se usa para PINTAR el calendario; cuando el trabajador tiene turno asignado ese
+    día se usa el municipio de ese turno, que es exacto."""
+    muni: dict[str, str] = {}
+    for w, t in datos.trabajadores.items():
+        lineas: list[str] = []
+        if t.tipo == "patron" and t.patron:
+            lineas = [s for fila in datos.patrones.get(t.patron, []) for s in fila.values()
+                      if s and s in datos.turnos]
+        elif t.tipo == "fijo" and t.linea:
+            lineas = [t.linea]
+        if not lineas:
+            lineas = [s for (ww, s) in datos.capacidades if ww == w and s in datos.turnos]
+        cuenta = Counter(datos.turnos[s].municipio for s in lineas)
+        muni[w] = cuenta.most_common(1)[0][0] if cuenta else "Valladolid"
+    return muni
+
+
+def _categoria(datos: Datos, d: date, municipio: str | None = None) -> str:
+    """Categoría de un día PARA UN MUNICIPIO concreto: festivo, finde o laborable. Si no se pasa
+    municipio se mira solo el calendario común (para la cabecera, que es de toda la plantilla)."""
+    if municipio is None:
+        if d in datos.festivos.get("Comun", set()):
+            return "festivo"
+    elif datos.es_festivo(d, municipio):
         return "festivo"
     return "finde" if d.weekday() >= 5 else "lv"
 
@@ -81,11 +106,14 @@ def escribir_excel(datos: Datos, fechas: list[date], asign, huecos, kpis: dict) 
     for j, d in enumerate(fechas):
         c = ws.cell(HDR, 3 + j, f"{DIA_INI[d.weekday()]}\n{d:%d/%m}")
         c.alignment, c.font, c.border = centro, negrita, borde
-        c.fill = PatternFill("solid", fgColor=CAT_HEAD[_categoria(datos, d)])
+        c.fill = PatternFill("solid", fgColor=CAT_FILL[_categoria(datos, d)])
 
     def orden(kv):
         _, t = kv
         return (t.tipo, t.patron or "", _)
+
+    muni = _municipio_trabajador(datos)
+    negro = Font(color="000000", bold=True)
 
     r = HDR + 1
     for trab, t in sorted(datos.trabajadores.items(), key=orden):
@@ -95,9 +123,14 @@ def escribir_excel(datos: Datos, fechas: list[date], asign, huecos, kpis: dict) 
             c = ws.cell(r, 3 + j)
             c.alignment, c.border = centro, borde
             if not datos.disponible(trab, d):
-                c.value, color = "VAC", FILL_VAC_XL
+                c.value, color = "V", FILL_VAC_XL
+                c.font = negro
             else:
-                c.value, color = asign.get((trab, d), ""), CAT_FILL[_categoria(datos, d)]
+                turno = asign.get((trab, d), "")
+                # el festivo se mira con el municipio de SU turno de ese día (exacto) y, si libra,
+                # con el municipio de referencia del trabajador
+                m = datos.turnos[turno].municipio if turno else muni[trab]
+                c.value, color = turno, CAT_FILL[_categoria(datos, d, m)]
             c.fill = PatternFill("solid", fgColor=color)
         r += 1
 

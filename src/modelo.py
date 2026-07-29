@@ -1319,6 +1319,11 @@ def resolver_anual(datos: Datos, inicio: date, fin: date, dias_ventana: int = 14
             # Colchón (adelanto permitido sobre el ritmo de 1776), por tipo:
             #  · CESIÓN GRUESA (noches: solo pueden recortar quincenas enteras): COLCHON_NOCHE_H, para
             #    que puedan oscilar alrededor del ritmo en vez de incumplirlo desde la primera semana.
+            # (Se probó a dar el colchón del pool a los CUBRIDORES de líneas críticas, por absorber
+            #  ellos los picos: salió peor en todo. No dedican la holgura a las noches —el colchón
+            #  afloja el cap en general y el solver la gasta en cualquier cobertura—, así que llegaban
+            #  igual de justos a noviembre y además descolocaban junio: 2 huecos críticos -> 6, y la
+            #  jornada se iba a 1787 con sigma 4.0.)
             #  · PATRONES largos: 0 → recortan días sueltos, así que siguen el ritmo de cerca.
             #  · POOL flexible: COLCHON_PACE_H, holgura para picos de cobertura.
             if t.patron in noche:
