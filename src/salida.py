@@ -83,6 +83,65 @@ def _categoria(datos: Datos, d: date, municipio: str | None = None) -> str:
     return "finde" if d.weekday() >= 5 else "lv"
 
 
+def _ajustar_anchos(ws, desde_fila: int = 1, saltar: set[int] | None = None,
+                    minimo: int = 4, maximo: int = 24) -> None:
+    """Ajusta cada columna al contenido más largo que tenga, para que no haya que tocar el Excel a
+    mano. openpyxl no trae autoajuste: hay que medir el texto y fijar el ancho.
+
+    Se ignoran las filas de TÍTULO (`saltar`) y todo lo anterior a `desde_fila`: son textos largos
+    que viven en la columna A —el encabezado del cuadrante, la línea de KPIs, el rótulo del bloque
+    de pueblos— y la dejarían absurdamente ancha sin aportar nada. En las cabeceras de día
+    ("L\\n05/01") se mide la línea más larga, no el total. Los turnos más largos son de 9 caracteres
+    (VADU47127, REF CAL M), así que el ancho fijo de 8 que había antes los cortaba."""
+    saltar = saltar or set()
+    anchos: dict[int, int] = {}
+    for fila in ws.iter_rows(min_row=desde_fila):
+        for c in fila:
+            if c.value is None or c.row in saltar:
+                continue
+            largo = max(len(t) for t in str(c.value).split("\n"))
+            if largo > anchos.get(c.column, 0):
+                anchos[c.column] = largo
+    for col, largo in anchos.items():
+        ws.column_dimensions[get_column_letter(col)].width = min(maximo, max(minimo, largo + 2))
+
+
+def _bloques(datos: Datos, muni: dict[str, str]) -> list[tuple[str, list[str]]]:
+    """Orden en que se apilan las filas del cuadrante, agrupando gente que se lee junta:
+    fijos · patrones dedicados (UVI y noches) · mixtos · patrón grande de la ciudad · correturnos,
+    y luego, separados, los patrones de los pueblos.
+
+    Los criterios salen de los datos, no de nombres concretos: un patrón es DEDICADO si su rotación
+    incluye alguna línea crítica (prioridad>=2), que es lo que distingue a UVI y noches; y la ciudad
+    es el municipio con más plantilla, así que "los pueblos" son los demás. Devuelve una lista de
+    (título, trabajadores); el título vacío no imprime separación."""
+    principal = Counter(muni.values()).most_common(1)[0][0]
+    dedicados = {p for p, filas in datos.patrones.items()
+                 if any(datos.turnos[s].prioridad >= 2
+                        for fila in filas for s in fila.values() if s in datos.turnos)}
+
+    def sel(cond) -> list[str]:
+        return sorted((w for w, t in datos.trabajadores.items() if cond(w, t)),
+                      key=lambda w: (datos.trabajadores[w].patron or "", w))
+
+    bloques = [
+        ("", sel(lambda w, t: t.tipo == "fijo")),
+        ("", sel(lambda w, t: t.tipo == "patron" and t.patron in dedicados)),
+        ("", sel(lambda w, t: t.tipo == "mixto")),
+        ("", sel(lambda w, t: t.tipo == "patron" and t.patron not in dedicados
+                 and muni[w] == principal)),
+        ("", sel(lambda w, t: t.tipo == "correturno")),
+        (f"PATRONES DE LOS PUEBLOS (fuera de {principal})",
+         sel(lambda w, t: t.tipo == "patron" and t.patron not in dedicados
+             and muni[w] != principal)),
+    ]
+    colocados = {w for _, g in bloques for w in g}
+    resto = sorted(set(datos.trabajadores) - colocados)
+    if resto:                                    # red de seguridad: que no se pierda nadie
+        bloques.append(("OTROS", resto))
+    return [(tit, g) for tit, g in bloques if g]
+
+
 def escribir_excel(datos: Datos, fechas: list[date], asign, huecos, kpis: dict) -> None:
     SALIDA.mkdir(parents=True, exist_ok=True)
     wb = Workbook()
@@ -108,15 +167,36 @@ def escribir_excel(datos: Datos, fechas: list[date], asign, huecos, kpis: dict) 
         c.alignment, c.font, c.border = centro, negrita, borde
         c.fill = PatternFill("solid", fgColor=CAT_FILL[_categoria(datos, d)])
 
-    def orden(kv):
-        _, t = kv
-        return (t.tipo, t.patron or "", _)
-
     muni = _municipio_trabajador(datos)
     negro = Font(color="000000", bold=True)
 
-    r = HDR + 1
-    for trab, t in sorted(datos.trabajadores.items(), key=orden):
+    # Columnas de recuento a la derecha del calendario
+    COL_EXTRA = 3 + len(fechas)
+    for k, titulo in enumerate(("Sábados", "Domingos", "Festivos", "Horas")):
+        c = ws.cell(HDR, COL_EXTRA + k, titulo)
+        c.alignment, c.font, c.border = centro, negrita, borde
+
+    def recuento(trab: str) -> tuple[int, int, int, float]:
+        """Sábados, domingos, festivos y horas que acumula el trabajador en todo el horizonte. Las
+        tres cuentas de día son INDEPENDIENTES: un turno en festivo que caiga en sábado suma en las
+        dos. El festivo se mira con el municipio del turno que hace ese día."""
+        sab = dom = fes = 0
+        horas = 0.0
+        for d in fechas:
+            s = asign.get((trab, d))
+            if not s:
+                continue
+            if d.weekday() == 5:
+                sab += 1
+            if d.weekday() == 6:
+                dom += 1
+            if datos.es_festivo(d, datos.turnos[s].municipio):
+                fes += 1
+            horas += datos.turnos[s].horas
+        return sab, dom, fes, horas
+
+    def fila(trab: str, t) -> None:
+        nonlocal r
         ws.cell(r, 1, trab).alignment = izq
         ws.cell(r, 2, t.patron if t.tipo == "patron" else t.tipo).alignment = izq
         for j, d in enumerate(fechas):
@@ -132,7 +212,22 @@ def escribir_excel(datos: Datos, fechas: list[date], asign, huecos, kpis: dict) 
                 m = datos.turnos[turno].municipio if turno else muni[trab]
                 c.value, color = turno, CAT_FILL[_categoria(datos, d, m)]
             c.fill = PatternFill("solid", fgColor=color)
+        for k, val in enumerate(recuento(trab)):
+            c = ws.cell(r, COL_EXTRA + k, round(val) if k == 3 else val)
+            c.alignment, c.border, c.font = centro, borde, negrita
         r += 1
+
+    r = HDR + 1
+    titulos: set[int] = set()                    # filas de rótulo: no cuentan para el ancho
+    for titulo, gente in _bloques(datos, muni):
+        if titulo:                                        # separación del bloque de los pueblos
+            r += 1
+            c = ws.cell(r, 1, titulo)
+            c.font = Font(bold=True, size=12)
+            titulos.add(r)
+            r += 1
+        for trab in gente:
+            fila(trab, datos.trabajadores[trab])
 
     # Turnos sin cubrir: apilados bajo la columna de su día
     por_dia = defaultdict(list)
@@ -147,10 +242,7 @@ def escribir_excel(datos: Datos, fechas: list[date], asign, huecos, kpis: dict) 
             c.alignment, c.border = centro, borde
             c.fill = PatternFill("solid", fgColor=FILL_HUECO_XL)
 
-    ws.column_dimensions["A"].width = 12
-    ws.column_dimensions["B"].width = 12
-    for j in range(len(fechas)):
-        ws.column_dimensions[get_column_letter(3 + j)].width = 8
+    _ajustar_anchos(ws, desde_fila=HDR, saltar=titulos)
     ws.freeze_panes = "C5"                               # fija trabajador/tipo y la cabecera
     wb.save(SALIDA / "calendario.xlsx")
 
@@ -205,6 +297,10 @@ def _contribuye(datos: Datos, metrica: str, turno: str, f: date) -> bool:
     t = datos.turnos[turno]
     if metrica == "noche":
         return t.tipo == "noche"
+    if metrica == "sabado":
+        return f.weekday() == 5
+    if metrica == "domingo":
+        return f.weekday() == 6
     if metrica == "finde":
         return f.weekday() >= 5
     if metrica == "festivo":

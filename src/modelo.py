@@ -90,9 +90,19 @@ def peso_cobertura(t: Turno) -> int:
 # Equidad (P2): se equipara al PROMEDIO el nº de findes y de festivos entre los trabajadores capaces
 # de cubrirlos. Los de SOLO L-V quedan fuera solos (nunca son elegibles en finde/festivo). Peso IGUAL
 # para todos los trabajadores (sin favorecer perfiles) y para ambas métricas (sin favorecer tipo de
-# día). LAMBDA queda como dial por si en el futuro se quiere ponderar finde vs festivo.
-METRICAS = ("finde", "festivo")
-LAMBDA = {"finde": 1, "festivo": 1}
+# día). LAMBDA queda como dial por si en el futuro se quiere ponderar una métrica sobre otra.
+# SÁBADO y DOMINGO van POR SEPARADO, no como un único "finde": medidos juntos, el modelo igualaba
+# el TOTAL de días de finde y dejaba repartos opuestos con la misma suma —uno con 20 sábados y 0
+# domingos, otro con 12 y 8—. Medido en el año 2026: el finde quedaba en sigma 1.4 mientras los
+# domingos iban de 0 a 8 dentro del mismo grupo.
+METRICAS = ("sabado", "domingo", "festivo")
+LAMBDA = {"sabado": 1, "domingo": 1, "festivo": 1}
+
+# Peso del RANGO (máximo − mínimo del grupo) dentro de la equidad, además de la desviación media.
+# La desviación L1 minimiza el total y es indiferente entre "uno se pasa 6" y "seis se pasan 1";
+# el rango ataca justo lo que se ve como injusto: que alguien acabe con 12 domingos y otro con 3.
+# Es lineal (max/min de CP-SAT), a diferencia de una L2 que exigiría variables producto.
+PESO_RANGO = 4
 
 # P5 (desempate): "vale" de evitar que un MIXTO cambie de turno/posición dentro de una misma semana
 # laboral (L-V). Correturnos exentos (flexibles por diseño). Tunable.
@@ -668,7 +678,11 @@ class Modelo:
         match metrica:
             case "noche":
                 return t.tipo == "noche"
-            case "finde":
+            case "sabado":
+                return f.weekday() == 5
+            case "domingo":
+                return f.weekday() == 6
+            case "finde":                       # sábado+domingo juntos; ya no se usa en METRICAS
                 return f.weekday() >= 5
             case "festivo":
                 return self.datos.es_festivo(f, t.municipio)
@@ -695,10 +709,17 @@ class Modelo:
         return grupos
 
     def _equidad_ponderada(self) -> tuple[dict[str, list[cp_model.IntVar]], int]:
-        """Para cada métrica (finde, festivo) y cada GRUPO de equidad: carga ACUMULADA por trabajador
-        (offset previo del libro + lo asignado en la ventana; fijos fuera) y su desviación respecto a
-        la media DE SU GRUPO. Equidad PLANA dentro del grupo (todos pesan igual). Los de solo L-V no
-        aparecen (nunca elegibles en finde/festivo). Devuelve (desviaciones por métrica, cota_p2)."""
+        """Para cada métrica (sábado, domingo, festivo) y cada GRUPO de equidad: carga ACUMULADA por
+        trabajador (offset previo del libro + lo asignado en la ventana; fijos fuera) y su desviación
+        respecto a la media DE SU GRUPO. Equidad PLANA dentro del grupo (todos pesan igual). Los de
+        solo L-V no aparecen (nunca son elegibles en finde ni festivo).
+
+        Se miden DOS cosas por grupo y métrica, porque miden injusticias distintas:
+          · la desviación L1 respecto a la media, que aprieta al conjunto;
+          · el RANGO (máximo − mínimo), que es lo que se percibe como injusto. La L1 es indiferente
+            entre "uno se pasa 6" y "seis se pasan 1"; el rango no, y evita que alguien acabe con 12
+            domingos y otro con 3. Es lineal, a diferencia de una L2 que pediría variables producto.
+        Devuelve (desviaciones por métrica, cota_p2)."""
         dias = [f for f in self.fechas if f not in self.cola]     # solo la ventana, no la cola
         desviaciones: dict[str, list[cp_model.IntVar]] = {m: [] for m in METRICAS}
         cota_p2 = 0
@@ -732,6 +753,19 @@ class Modelo:
                     self.m.add_abs_equality(desv, n * carga_w - carga_total)
                     desviaciones[metrica].append(desv)
                 cota_p2 += LAMBDA[metrica] * n * max_desv
+
+                # RANGO del grupo, en la MISMA escala que las desviaciones (×n) para que pese algo
+                # frente a ellas: sin escalar sería un puñado de unidades contra miles.
+                tope = max(c for _, _, c in cargas)
+                mx = self.m.new_int_var(0, tope, f"max_{metrica}_{gid}")
+                mn = self.m.new_int_var(0, tope, f"min_{metrica}_{gid}")
+                self.m.add_max_equality(mx, [c for _, c, _ in cargas])
+                self.m.add_min_equality(mn, [c for _, c, _ in cargas])
+                escala = PESO_RANGO * n
+                rango = self.m.new_int_var(0, tope * escala, f"rango_{metrica}_{gid}")
+                self.m.add(rango == (mx - mn) * escala)
+                desviaciones[metrica].append(rango)
+                cota_p2 += LAMBDA[metrica] * tope * escala
         return desviaciones, cota_p2
 
     # -- C9: jornada anual (tope duro + pacing blando) ----------------------- #
