@@ -1307,6 +1307,85 @@ def calendario_cesiones(datos: Datos, inicio: date, fin: date,
     return elegidas
 
 
+def reserva_cubridores(datos: Datos, inicio: date, fin: date,
+                       cesiones: set[tuple[str, int]], log: bool = True) -> dict[str, dict[date, float]]:
+    """NIVEL 0 — horas que cada CUBRIDOR debe guardarse para la cobertura crítica que aún tiene por
+    delante. Devuelve {trabajador: {fecha: horas pendientes a partir de esa fecha}}.
+
+    El problema que resuelve: la ventana de 14 días no ve el futuro, así que el cap prorrateado le
+    marca a cada uno un ritmo UNIFORME. Pero el año de un cubridor tiene PICOS —las semanas en que el
+    titular está de vacaciones o ha cedido su bloque— y llega a ellos con la jornada ya gastada. En
+    2026 esto dejó 7 noches sin cubrir: el cubridor tenía 1769-1774 h y la noche son 11.
+
+    Y esos picos SE SABEN antes de resolver nada: las vacaciones son dato y las cesiones las acaba de
+    decidir `calendario_cesiones`. Así que se recorre el año, se marca cada día en que una línea
+    crítica se queda sin ninguno de sus titulares, y se reparte esa carga entre sus cubridores por el
+    ORDEN de preferencia declarado (v=1 antes que v=2). De ahí sale, para cada uno, cuántas horas de
+    cobertura le quedan por delante en cada momento — que es lo que el cap debe dejarle libre.
+
+    Es la pieza que da visión global sin agrandar el modelo: el año entra como un parámetro, no como
+    medio millón de variables (el monolítico de 647.000 no encontró ni una solución en 900 s)."""
+    ancla = inicio - timedelta(days=inicio.weekday())
+    fechas = rango_fechas(ancla, fin)
+    criticas = {s for s, t in datos.turnos.items() if t.prioridad >= 2}
+    if not criticas:
+        return {}
+
+    # Quién tiene prescrito cada día de cada línea crítica. NO vale preguntar si "algún titular está
+    # disponible": los dos de un binomio se reparten la semana —uno lun-jue y otro vie-dom— así que
+    # hay que mirar a quién se lo asigna SU rotación ese día concreto.
+    prescrito: dict[tuple[str, date], str] = {}
+    for p, filas in datos.patrones.items():
+        T = len(filas)
+        trabs = sorted(w for w, t in datos.trabajadores.items() if t.patron == p)
+        for off, w in enumerate(trabs):
+            for f in fechas:
+                s = filas[(off + (f - ancla).days // 7) % T][DIAS[f.weekday()]]
+                if s in criticas and datos.opera(s, f):
+                    prescrito[(s, f)] = w
+
+    pendiente: dict[str, dict[date, float]] = defaultdict(lambda: defaultdict(float))
+    total: dict[str, float] = defaultdict(float)
+    for s in sorted(criticas):
+        cubridores = sorted(((c.v, w) for (w, ss), c in datos.capacidades.items()
+                             if ss == s and c.v >= 1))
+        if not cubridores:
+            continue
+        horas = datos.turnos[s].horas
+        for f in fechas:
+            if not datos.opera(s, f):
+                continue
+            titular = prescrito.get((s, f))
+            if titular is None:
+                continue                       # nadie la tiene prescrita ese día
+            cede = (titular, (f - ancla).days // 14) in cesiones
+            if datos.disponible(titular, f) and not cede:
+                continue                       # su titular puede: no hace falta cubridor
+            # De vacaciones o con el bloque cedido: hace falta un cubridor. Se reparte entre los
+            # disponibles dando el día al que MENOS lleve acumulado, con el orden `v` como desempate.
+            # Adjudicárselo siempre al primero por orden daría una reserva irreal —1012 h para
+            # Y0945237C cuando en la práctica hace 550— y le estrangularía el cap sin motivo.
+            libres = [(total[w], v, w) for v, w in cubridores if datos.disponible(w, f)]
+            if libres:
+                _, _, w = min(libres)
+                pendiente[w][f] += horas
+                total[w] += horas
+
+    # acumulado HACIA ATRÁS: en cada fecha, lo que queda por cubrir DESPUÉS de ella
+    restante: dict[str, dict[date, float]] = {}
+    for w, porfecha in pendiente.items():
+        acum, curva = 0.0, {}
+        for f in reversed(fechas):
+            curva[f] = acum                    # lo pendiente ESTRICTAMENTE después de f
+            acum += porfecha.get(f, 0.0)
+        restante[w] = curva
+    if log and restante:
+        print("Reserva de horas para cobertura crítica (Nivel 0):", flush=True)
+        for w in sorted(total, key=lambda x: -total[x]):
+            print(f"  {w}: {total[w]:.0f} h de cobertura previstas en el año", flush=True)
+    return restante
+
+
 def resolver_anual(datos: Datos, inicio: date, fin: date, dias_ventana: int = 14,
                    dias_cola: int = 28, segundos: int = 60, hilos: int = 8,
                    gap: float = 0.0, log: bool = False) -> dict[tuple[str, date], str]:
@@ -1324,6 +1403,8 @@ def resolver_anual(datos: Datos, inicio: date, fin: date, dias_ventana: int = 14
     # coincidir con las vacaciones del binomio ni de los cubridores). Si sale vacío se cae al
     # comportamiento anterior (lo decide el cap prorrateado, con riesgo de coincidencia).
     cesiones = calendario_cesiones(datos, inicio, fin)
+    # Horas que cada cubridor debe guardarse para la cobertura crítica que le queda por delante.
+    reserva = reserva_cubridores(datos, inicio, fin, cesiones)
     # PESO de cada día para el prorrateo de la jornada. NO se cuentan los días a pelo: la carga que
     # toca a cada persona disponible NO es uniforme a lo largo del año. En agosto la demanda es la
     # misma pero hay menos gente (vacaciones), así que cada disponible tiene que dar un ~8% MÁS de lo
@@ -1415,6 +1496,13 @@ def resolver_anual(datos: Datos, inicio: date, fin: date, dias_ventana: int = 14
             else:
                 colchon = COLCHON_PACE_H
             tope_paced[w] = round((HORAS_OBJETIVO * peso_hasta / peso_total + colchon) * factor * 60)
+            # RESERVA (Nivel 0): a un cubridor no se le deja gastar las horas que va a necesitar para
+            # la cobertura crítica que aún tiene por delante. Sin esto llegaba a los picos con la
+            # jornada agotada —1769-1774 h con noches de 11— y la línea se quedaba vacía.
+            pendiente = reserva.get(w, {}).get(fin_v)
+            if pendiente:
+                tope_paced[w] = min(tope_paced[w],
+                                    round((HORAS_OBJETIVO * factor - pendiente) * 60))
 
         mod = Modelo(datos, fechas_cola + fechas_ventana,
                      congelar=congelar, offset_equidad=offset, cola=cola,
