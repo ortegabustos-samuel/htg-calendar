@@ -28,14 +28,14 @@ from __future__ import annotations
 import argparse
 import statistics as st
 import sys
-from collections import defaultdict
+from collections import Counter, defaultdict
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from cargar_datos import Datos, cargar                                    # noqa: E402
-from modelo import (CMAX, CMAX_POOL, HMAX7, HMAX_AÑO, HORAS_OBJETIVO,     # noqa: E402
+from modelo import (CMAX, CMAX_POOL, HMAX7, HORAS_OBJETIVO,                # noqa: E402
                     RMIN, rango_fechas, semana)
 
 METRICAS_PULIDO = ("sabado", "domingo", "festivo")
@@ -312,12 +312,133 @@ def pulir(datos: Datos, plan: dict, inicio: date, fin: date,
     return aplicados
 
 
+PESO_MUNICIPIO = 2      # ir al mismo sitio pesa más que coincidir de franja (prioridad de la empresa)
+
+
+def _coste_semana(datos: Datos, turnos: list[str]) -> float:
+    """Cuánto se desvía una semana de ser homogénea: TURNOS QUE SE SALEN del valor dominante, no
+    cuántos valores distintos hay.
+
+    La diferencia importa mucho. Contando valores distintos, una semana de cuatro turnos con tres
+    mañanas y una tarde puntúa igual que otra con dos y dos —las dos tienen "2 franjas"— así que un
+    intercambio que acerca la semana a la uniformidad da mejora CERO y se descarta. Solo se aceptan
+    los movimientos que logran la homogeneidad perfecta de un golpe, y el pulido se atasca (medido:
+    118 semanas con 1 turno descolocado y 130 con 2, todas puntuando lo mismo).
+
+    Contando los que se salen del dominante, cada turno que se acerca cuenta, que es justo lo que se
+    busca: la misma localización el mayor número de días posible y, si no puede ser, al menos la
+    misma franja."""
+    if len(turnos) < 2:
+        return 0.0
+    tipos = Counter(datos.turnos[s].tipo for s in turnos)
+    munis = Counter(datos.turnos[s].municipio for s in turnos)
+    return ((len(turnos) - max(tipos.values()))
+            + PESO_MUNICIPIO * (len(turnos) - max(munis.values())))
+
+
+def _incoherencia(datos: Datos, plan: dict, gente: list[str]) -> float:
+    """Suma, sobre todas las semanas de esa gente, de los turnos que se salen de su franja y de su
+    municipio dominantes. Cero = cada uno pasa cada semana en la misma franja y el mismo pueblo."""
+    porsem: dict[tuple[str, tuple[int, int]], list[str]] = defaultdict(list)
+    dentro = set(gente)
+    for (w, f), s in plan.items():
+        if w in dentro:
+            porsem[(w, semana(f))].append(s)
+    return sum(_coste_semana(datos, t) for t in porsem.values())
+
+
+def coherencia(datos: Datos, plan: dict, max_mov: int = 400, log: bool = True) -> int:
+    """SEGUNDA fase del pulido: intercambia turnos DEL MISMO DÍA entre correturnos para que cada uno
+    pase la semana en la misma franja y, a poder ser, en el mismo municipio. Hoy solo el 31% de sus
+    semanas tienen una sola franja y el 35% un solo municipio: es normal ver Mayorga, Íscar y
+    Valladolid en la misma semana.
+
+    El movimiento es un trueque EN EL MISMO DÍA, y esa elección lo hace muy seguro:
+      · la cobertura no se mueve (los dos turnos siguen cubiertos, cambia quién);
+      · cada uno trabaja los mismos días, así que los días por semana no varían;
+      · y, sobre todo, NO toca el reparto de sábados y domingos, porque ambos trabajaban ese mismo
+        día — con lo que la equidad de findes que costó tanto cuadrar queda intacta por construcción.
+    Lo único que puede moverse son los festivos (dependen del municipio del turno) y las horas, así
+    que se comprueban las dos cosas.
+
+    Va la ÚLTIMA y solo acepta movimientos que no empeoren nada de lo anterior: es una comodidad,
+    no una prioridad."""
+    corre = [w for w, t in datos.trabajadores.items() if t.tipo == "correturno"]
+    if len(corre) < 2:
+        return 0
+    pares_ok = _pares_pactados(datos)
+    grupos = _grupos(datos)
+    horas: dict[str, float] = defaultdict(float)
+    for (w, f), s in plan.items():
+        horas[w] += datos.turnos[s].horas
+    horas_ini = dict(horas)
+
+    en_corre = set(corre)
+    aplicados = 0
+    for _ in range(max_mov):
+        # En un trueque del mismo día solo cambian DOS entradas: la semana de A y la de B. El delta
+        # se calcula ahí y no recorriendo las 543 semanas por cada uno de los ~20.000 candidatos.
+        porsem: dict[tuple[str, tuple[int, int]], list[str]] = defaultdict(list)
+        pordia: dict[date, list[str]] = defaultdict(list)
+        for (w, f), s in plan.items():
+            if w in en_corre:
+                porsem[(w, semana(f))].append(s)
+                pordia[f].append(w)
+        mejor = None
+        for f, gente in pordia.items():
+            sm = semana(f)
+            for i, A in enumerate(gente):
+                for B in gente[i + 1:]:
+                    sA, sB = plan[(A, f)], plan[(B, f)]
+                    tA, tB = datos.turnos[sA], datos.turnos[sB]
+                    if tA.tipo == tB.tipo and tA.municipio == tB.municipio:
+                        continue                  # el trueque no cambiaría nada
+                    if not (datos.elegible(A, sB, f)[0] and datos.elegible(B, sA, f)[0]):
+                        continue
+                    lA, lB = porsem[(A, sm)], porsem[(B, sm)]
+                    nA, nB = list(lA), list(lB)
+                    nA[nA.index(sA)] = sB
+                    nB[nB.index(sB)] = sA
+                    delta = ((_coste_semana(datos, nA) + _coste_semana(datos, nB))
+                             - (_coste_semana(datos, lA) + _coste_semana(datos, lB)))
+                    if delta >= 0 or (mejor is not None and delta >= mejor[0]):
+                        continue
+                    # sábados y domingos no se mueven (los dos trabajaban ESE día); el festivo sí
+                    # podría, porque depende del municipio del turno, así que se descarta el caso
+                    if datos.es_festivo(f, tA.municipio) != datos.es_festivo(f, tB.municipio):
+                        continue
+                    hA = horas[A] - tA.horas + tB.horas
+                    hB = horas[B] - tB.horas + tA.horas
+                    hs = dict(horas, **{A: hA, B: hB})
+                    plan[(A, f)], plan[(B, f)] = sB, sA
+                    ok = (_valida_tras_cambio(datos, plan, A, sm, hs, pares_ok, horas_ini)
+                          and _valida_tras_cambio(datos, plan, B, sm, hs, pares_ok, horas_ini))
+                    plan[(A, f)], plan[(B, f)] = sA, sB      # deshacer
+                    if ok:
+                        mejor = (delta, A, B, f, sA, sB, hA, hB)
+        if mejor is None:
+            break
+        delta, A, B, f, sA, sB, hA, hB = mejor
+        plan[(A, f)], plan[(B, f)] = sB, sA
+        horas[A], horas[B] = hA, hB
+        aplicados += 1
+        if log and aplicados % 25 == 0:
+            print(f"  {aplicados:>3} trueques · incoherencia "
+                  f"{_incoherencia(datos, plan, corre):.0f}", flush=True)
+    if log:
+        print(f"Coherencia: {aplicados} turnos intercambiados entre correturnos "
+              f"(incoherencia final {_incoherencia(datos, plan, corre):.0f})", flush=True)
+    return aplicados
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description="Pule la equidad de findes/festivos de un plan")
     p.add_argument("plan", help="CSV con id_trab,fecha,id_turno")
     p.add_argument("--anio", type=int, default=2026)
     p.add_argument("--datos", default=str(Path(__file__).resolve().parents[1] / "data" / "input"))
     p.add_argument("--max-mov", type=int, default=200)
+    p.add_argument("--sin-coherencia", action="store_true",
+                   help="omite la 2ª fase (semanas coherentes de los correturnos)")
     p.add_argument("--salida", help="CSV donde escribir el plan pulido")
     a = p.parse_args()
 
@@ -331,6 +452,8 @@ def main() -> int:
 
     resumen(datos, plan, "ANTES del pulido")
     pulir(datos, plan, inicio, fin, max_mov=a.max_mov)
+    if not a.sin_coherencia:
+        coherencia(datos, plan)
     resumen(datos, plan, "DESPUÉS del pulido")
 
     if a.salida:

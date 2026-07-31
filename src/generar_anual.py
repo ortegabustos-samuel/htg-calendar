@@ -62,6 +62,7 @@ def main() -> int:
         # tocar la cobertura ni la jornada (invariantes duros), así que es seguro por defecto.
         pulido.resumen(datos, plan, "EQUIDAD antes del pulido")
         pulido.pulir(datos, plan, inicio, fin)
+        pulido.coherencia(datos, plan)
         pulido.resumen(datos, plan, "EQUIDAD después del pulido")
 
     fechas = rango_fechas(inicio - timedelta(days=inicio.weekday()), fin)

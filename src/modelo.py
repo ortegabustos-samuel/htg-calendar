@@ -24,14 +24,6 @@ HMAX7 = 48         # máx. trabajo efectivo por semana ISO (h)              — 
 # cesiones de bloque aterrizan por debajo y el relleno de refuerzos (rellenar_refuerzos) para en seco
 # al llegar. (Antes el tope era 1826 y por eso media plantilla derivaba a 1808-1834.)
 HORAS_OBJETIVO = 1776
-# Tolerancia POR ENCIMA del objetivo, y solo para C9 (el tope duro anual). Es un margen para CUBRIR,
-# no un cupo que rellenar: al vivir únicamente en C9, lo puede gastar un turno real que si no quedaría
-# vacío, pero NUNCA un refuerzo de calendario, porque el relleno topa en HORAS_OBJETIVO.
-# Sin ella el año 2026 dejaba una noche crítica sin cubrir (VADN052 el 13/06): su cubridor estaba en
-# 1771 h y el turno son 11, así que le faltaban 5 horas de margen. 12 h cubren un turno de cualquier
-# tipo (el más largo son las 11 h de una noche) sin dar pie a acumular.
-TOLERANCIA_H = 12
-HMAX_AÑO = HORAS_OBJETIVO + TOLERANCIA_H   # tope anual DURO (h): solo alcanzable cubriendo
 CMAX = 6           # máx. días trabajados por semana ISO (tope general) — C5
 
 # Tope de días por semana para la plantilla FLEXIBLE (correturnos y mixtos)
@@ -115,6 +107,15 @@ PESO_ESTAB = 5
 # En la escala de P_horas (minutos), 120 ≈ 2 h de desviación de jornada por día cubierto: suficiente
 # para decidir cuando ambos pueden, insuficiente para mover cobertura o equidad.
 PESO_ORDEN = 120
+
+# Prioridad al repartir TRABAJO REAL cuando no llega para todos. Hace falta porque la demanda del
+# servicio da 1.698 h por cabeza y el objetivo son 1776: alguien tiene que quedarse corto, y la
+# empresa decide quién. Fijos, patrones y mixtos van por delante; el CORRETURNO es el único que
+# queda detrás, porque es quien absorbe el relleno de calendario (y, si sobrara plantilla, donde se
+# vería). Multiplica la desviación de jornada, así que cuando un turno lo pueden hacer un mixto y un
+# correturno, se lo lleva el mixto. Importa sobre todo para los mixtos, que tienen capacidades muy
+# estrechas —uno solo puede hacer 4 líneas— y sin esto pierden casi siempre.
+PESO_JORNADA = {"patron": 2, "mixto": 2, "correturno": 1}
 
 # Fijación del patrón (NIVEL DE COBERTURA): "vale" de sacar a un trabajador de patrón de su rotación.
 # Los patrones están PACTADOS con los sindicatos: se priorizan por ENCIMA de la cobertura de turnos
@@ -213,10 +214,16 @@ class Modelo:
                 self.patrones_noche.add(p)
             elif "24h" in tipos and len(filas) <= 2:
                 self.patrones_uvi.add(p)
-        # Nota: no hace falta ninguna regla de "adopción de la semana entera" al cubrir una línea
-        # crítica. El propio C4 la impone: tras una noche (21:30-08:30) solo 6 de los 73 turnos son
-        # legales al día siguiente —ninguno de día— y tras un localizado 24 h (22:00→22:00), ninguno.
-        # El descanso del cubridor sale de la aritmética del convenio, no de una restricción aparte.
+        # Líneas de los patrones DEDICADOS (noche y UVI): quien cubre una de ellas adopta la plaza
+        # ENTERA esa semana, descansos incluidos (ver _handover_critico).
+        # OJO, el criterio NO es la prioridad. H también es prioridad 3, pero eso está puesto para que
+        # no se quede desatendido, no porque arrastre descansos: H sí admite cubrirse sin heredar los
+        # libres de nadie. Si se le aplicara el handover, quien lo tapa un día no podría hacer su
+        # propia línea el resto de la semana.
+        self.lineas_criticas: set[str] = {
+            s for p in (self.patrones_noche | self.patrones_uvi)
+            for fila in datos.patrones.get(p, []) for s in fila.values()
+            if s and s != LIBRE and s in datos.turnos}
 
         #Conjunto de las variables del modelo x_trab_fecha_turno
         self.x: dict[tuple[str, date, str], cp_model.BoolVar] = {} 
@@ -242,6 +249,7 @@ class Modelo:
         self.prescripcion = self._prescripcion_patron()   # turno de rotación por (patrón, fecha)
         self._activo_patron()                     # noches: acopla su rotación por QUINCENA (ciclo 14d)
         self._solo_rotacion_uvi()                 # UVI: solo su rotación → vacantes al cubridor, no al par
+        self._handover_critico()                  # cubrir una crítica = adoptar la plaza y sus descansos
         self._warm_start_patron()                 # arranque pegado al patrón
 
     # -- Variables ----------------------------------------------------------- #
@@ -770,10 +778,8 @@ class Modelo:
 
     # -- C9: jornada anual (tope duro + pacing blando) ----------------------- #
     def _c9_jornada_anual(self) -> None:
-        """C9 (DURA): la jornada anual no supera HMAX_AÑO (objetivo + TOLERANCIA_H). Este es el ÚNICO
-        sitio donde la tolerancia existe: es margen para cubrir un turno que si no quedaría vacío. El
-        resto del sistema (equidad, cesiones, relleno de refuerzos) topa en HORAS_OBJETIVO, así que
-        nadie llega al límite a base de refuerzos de calendario. Libro de
+        """C9 (DURA): la jornada anual no supera HORAS_OBJETIVO. 1776 es el límite legal y no se pasa
+        ni una hora, tampoco para cubrir un turno que fuera a quedar vacío. Libro de
         horas acumuladas: minutos previos (offset_horas) + los de esta ventana <= tope. Guarda los
         términos de minutos por NO-fijo para la equidad de horas (P_horas). Los fijos también topan
         (antes estaban fuera → un fijo podía superar el tope en silencio), pero NO entran en
@@ -787,7 +793,7 @@ class Modelo:
             terminos = self._minutos(w, dias)
             if not terminos:
                 continue                                          # no puede trabajar en la ventana
-            tope_min = round(HMAX_AÑO * t.factor_jornada * 60)     # objetivo + tolerancia, escalado
+            tope_min = round(HORAS_OBJETIVO * t.factor_jornada * 60)   # escalado por reducción de jornada
             off = self.offset_horas.get(w, 0)                     # <= tope por invariante del libro
             cap = tope_min
             paced = self.tope_paced.get(w)                        # cap prorrateado (anti front-loading, no-fijos)
@@ -829,8 +835,9 @@ class Modelo:
                         for t in [round(self.datos.turnos[s].horas_consumo * 60) * self.x[(w, f, s)]]]
             desv = self.m.new_int_var(0, cota_w, f"desvh_{w}")
             self.m.add_abs_equality(desv, sum(terminos) - objetivo)
-            desvs.append(desv)
-            cota += cota_w
+            peso = PESO_JORNADA.get(self.datos.trabajadores[w].tipo, 1)
+            desvs.append(desv * peso if peso != 1 else desv)
+            cota += cota_w * peso
         return sum(desvs), cota
 
     def _retirada_fijos(self) -> tuple[object, int]:
@@ -885,6 +892,47 @@ class Modelo:
                 excesos.append(exceso)
                 cota += len(dias) - 5
         return sum(excesos), cota
+
+    def _handover_critico(self) -> None:
+        """DURA: quien cubre una línea CRÍTICA una semana no hace NINGÚN otro turno esa semana.
+
+        Cubrir una noche o un localizado no es coger unos turnos sueltos: es asumir la plaza, y la
+        plaza viene con sus DESCANSOS. La rotación del UVI libra miércoles y jueves; si el cubridor
+        los rellena con otra línea se ha quedado con el trabajo y no con el descanso, que es lo que
+        la empresa no acepta. Sin esta regla, en 2026 el 70% de las semanas con cobertura crítica
+        (44 de 63) llevaban además otros turnos.
+
+        C4 NO basta para conseguirlo: solo mira el día siguiente a cada turno, no los libres que la
+        rotación reparte más adelante en la semana. Por eso hace falta la restricción explícita.
+
+        La semana ISO es la granularidad correcta aquí: el bloque del localizado cabe dentro de una
+        (libra miércoles y jueves) y el de noche, que son 4+3 noches a caballo de dos semanas, se
+        parte justo por donde toca — en cada una de las dos el cubridor hace sus noches y descansa
+        el resto.
+
+        Es DURA por decisión de la empresa: no es algo que se pueda penalizar y ceder según convenga.
+        El precio a vigilar es que un turno normal que solo pudiera hacer ese cubridor se convierte
+        en hueco, porque ya no puede compaginarlo."""
+        if not self.lineas_criticas:
+            return
+        semanas: dict[tuple[int, int], list[date]] = defaultdict(list)
+        for f in self.fechas:
+            if f not in self.cola:
+                semanas[semana(f)].append(f)
+        for w in self.datos.trabajadores:
+            for sem, dias in semanas.items():
+                crit = [self.x[(w, f, s)] for f in dias for s in self.lineas_criticas
+                        if (w, f, s) in self.x]
+                if not crit:
+                    continue
+                otras = [self.x[(w, f, s)] for f in dias
+                         for s in self.turnos_wd.get((w, f), [])
+                         if s not in self.lineas_criticas and (w, f, s) in self.x]
+                if not otras:
+                    continue
+                cubre = self.m.new_bool_var(f"cubre_crit_{w}_{sem[0]}w{sem[1]}")
+                self.m.add(sum(crit) <= len(crit) * cubre)          # toca una crítica -> cubre=1
+                self.m.add(sum(otras) <= len(otras) * (1 - cubre))  # entonces, nada más
 
     def _preferencia_cubridor(self) -> tuple[object, int]:
         """P7 (BLANDA): respeta el ORDEN entre los cubridores de una misma línea. El gestor designa
@@ -1424,6 +1472,13 @@ def rellenar_refuerzos(datos: Datos, plan: dict[tuple[str, date], str],
     comodines = [s for s, t in datos.turnos.items() if t.prioridad == 0]
     if not comodines:
         return 0
+    # Semanas en que alguien cubre una línea de noche o UVI: ahí adoptó la plaza entera y sus
+    # descansos (ver Modelo._handover_critico), así que el relleno tampoco puede meterle un
+    # refuerzo. Esta pasada corre fuera del modelo y no lo sabría por su cuenta.
+    lineas_criticas = {s for p_ in (_patrones_noche(datos) | _patrones_uvi(datos))
+                       for fila in datos.patrones.get(p_, []) for s in fila.values()
+                       if s and s != LIBRE and s in datos.turnos}
+    sem_bloqueada = {(w, semana(f)) for (w, f), s in plan.items() if s in lineas_criticas}
     fechas = rango_fechas(inicio - timedelta(days=inicio.weekday()), fin)
 
     horas: dict[str, float] = defaultdict(float)
@@ -1477,6 +1532,8 @@ def rellenar_refuerzos(datos: Datos, plan: dict[tuple[str, date], str],
                 if (w, f) in plan or not datos.disponible(w, f):
                     continue
                 sem = semana(f)
+                if (w, sem) in sem_bloqueada:
+                    continue                  # esa semana cubre una crítica: descansa, no se rellena
                 if dias_sem[(w, sem)] >= tope_dias(w):
                     continue
                 for s in comodines:

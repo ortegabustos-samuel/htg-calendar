@@ -255,6 +255,12 @@ def _cargar_trabajadores(directorio: Path) -> dict[str, Trabajador]:
 
 
 def _cargar_calendarios(directorio: Path) -> dict[str, str]:
+    """
+    Cargar calendarios permite un mapping de municipio al calendario de festivos que sigue
+    Iscar -> Valladolid
+    Medina -> Medina
+    Peñafiel -> Valladolid
+    """
     calendario = {}
     with open(directorio / "calendarios_municipio.csv", mode="r", encoding="utf-8",newline="") as archivo:
         lector = csv.DictReader(archivo)
@@ -264,6 +270,11 @@ def _cargar_calendarios(directorio: Path) -> dict[str, str]:
 
 
 def _cargar_festivos(directorio: Path) -> dict[str, set[date]]:
+    """
+    Festivos es de la forma diccionario con key y valor un set:
+    Comun = (01/01/2026, 24/12/2026..)
+    Valladolid = (13/05/2026,08/09/2026)
+    """
     festivos = {}
     with open(directorio / "festivos.csv", mode="r", encoding="utf-8",newline="") as archivo:
         lector = csv.DictReader(archivo)

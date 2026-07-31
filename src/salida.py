@@ -495,11 +495,11 @@ def metricas_trabajadores(datos: Datos, plan: dict) -> list[dict]:
 
     # Aviso de tope: si alguien supera el tope anual duro, el plan NO es válido — casi siempre
     # significa que una ventana del rodante se resolvió sin solución y se cosieron valores basura.
-    from modelo import HMAX_AÑO
+    from modelo import HORAS_OBJETIVO
     excedidos = [(r["id_trab"], r["horas_totales"],
-                  round(HMAX_AÑO * datos.trabajadores[r["id_trab"]].factor_jornada))
+                  round(HORAS_OBJETIVO * datos.trabajadores[r["id_trab"]].factor_jornada))
                  for r in filas
-                 if r["horas_totales"] > HMAX_AÑO * datos.trabajadores[r["id_trab"]].factor_jornada]
+                 if r["horas_totales"] > HORAS_OBJETIVO * datos.trabajadores[r["id_trab"]].factor_jornada]
     if excedidos:
         print(f"\n*** AVISO: {len(excedidos)} trabajador(es) SUPERAN el tope anual ***")
         for w, h, tope in sorted(excedidos, key=lambda x: -x[1]):
