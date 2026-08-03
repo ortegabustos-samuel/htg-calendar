@@ -507,10 +507,25 @@ def metricas_trabajadores(datos: Datos, plan: dict) -> list[dict]:
     return filas
 
 
+def escribir_informe_cobertura(datos: Datos, huecos: list[tuple[date, str]]) -> Path:
+    """Un turno sin cubrir por línea, CON SU PRIORIDAD. La prioridad es la columna que decide si un
+    hueco importa —una tarde ordinaria y una noche no son lo mismo— y sin ella el informe obliga a
+    cruzarlo a mano con turnos.csv para saber cuántos son críticos."""
+    ruta = SALIDA / "informe_cobertura.csv"
+    with open(ruta, "w", encoding="utf-8", newline="") as fh:
+        w = csv.writer(fh)
+        w.writerow(["fecha", "id_turno", "prioridad", "tipo", "municipio"])
+        for f, s in huecos:
+            t = datos.turnos[s]
+            w.writerow([f"{f:%d/%m/%Y}", s, t.prioridad, t.tipo, t.municipio])
+    return ruta
+
+
 def generar_anual(datos: Datos, fechas: list[date], plan: dict,
                   estado: str = "HORIZONTE RODANTE") -> None:
     """Vuelca a Excel el plan anual del horizonte rodante e imprime el report de equidad."""
     huecos = huecos_del_plan(datos, fechas, plan)
+    escribir_informe_cobertura(datos, huecos)
     kpis = _kpis_plan(datos, fechas, plan, huecos, estado)
     escribir_excel(datos, fechas, plan, huecos, kpis)
     print(f"Estado: {kpis['estado']}")
@@ -531,7 +546,8 @@ def generar_anual(datos: Datos, fechas: list[date], plan: dict,
         print("Días con más huecos prioritarios: " + ", ".join(f"{d:%d/%m}:{n}" for d, n in peor))
     reporte_equidad(datos, fechas, plan)
     metricas_trabajadores(datos, plan)
-    print(f"\nFichero en {SALIDA.relative_to(RAIZ)}/: calendario.xlsx")
+    print(f"\nFicheros en {SALIDA.relative_to(RAIZ)}/: calendario.xlsx · "
+          f"metricas_trabajadores.csv · informe_cobertura.csv")
 
 
 if __name__ == "__main__":

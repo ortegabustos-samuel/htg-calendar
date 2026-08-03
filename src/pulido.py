@@ -431,6 +431,117 @@ def coherencia(datos: Datos, plan: dict, max_mov: int = 400, log: bool = True) -
     return aplicados
 
 
+# --------------------------------------------------------------------------- #
+#  Aprovechar los refuerzos de calendario
+# --------------------------------------------------------------------------- #
+def _huecos_dia(datos: Datos, ocupado: Counter, f: date) -> list[str]:
+    """Turnos con DEMANDA real sin cubrir ese día, uno por plaza que falte, del más crítico al menos
+    (misma definición que salida.huecos_del_plan: los comodín no son demanda, luego no son hueco)."""
+    huecos = []
+    for s, t in datos.turnos.items():
+        if t.prioridad >= 1 and datos.opera(s, f):
+            huecos += [s] * max(0, t.dem - ocupado[(s, f)])
+    return sorted(huecos, key=lambda s: -datos.turnos[s].prioridad)
+
+
+def aprovechar(datos: Datos, plan: dict, fechas: list[date], log: bool = True) -> int:
+    """TERCERA fase: cambia un REFUERZO DE CALENDARIO por un turno con demanda real sin cubrir del
+    mismo día, cuando quien lo hace puede atenderlo.
+
+    Un refuerzo (prioridad 0) es relleno: existe para dar horas a quien va corto, no responde a
+    ninguna demanda. Dejar a alguien en un refuerzo mientras un turno real de ese mismo día se queda
+    sin cubrir no beneficia a nadie, y el cambio es NEUTRO EN HORAS cuando los dos turnos computan lo
+    mismo — que es el caso normal, ambos de jornada ordinaria.
+
+    Por qué no lo hace el modelo. La mayoría de esos refuerzos vienen prescritos por una rotación, y
+    sacar a alguien de su patrón cuesta `PESO_DEV` (100), mientras que cubrir un turno normal vale
+    `PESO_COBERTURA` (10). El modelo prefiere, correctamente según sus pesos, mantener el patrón. Pero
+    esos pesos se calibraron pensando en turnos prescritos DE VERDAD: un refuerzo no es una posición
+    que defender, y la asimetría no era intencionada. Medido sobre 2026: 70 de los 122 huecos del año
+    tenían ese día a alguien capacitado haciendo un refuerzo, 56 de ellos en agosto.
+
+    Cambiarlo dentro del modelo obligaría a que el coste de desviarse dependiese del turno prescrito,
+    y ese peso está entretejido con la equidad y la estabilidad. Aquí, sobre el plan ya resuelto, es
+    una sustitución local que solo puede mejorar la cobertura.
+
+    Invariantes: los días trabajados por cada uno NO cambian (mismo día, un turno por otro), luego el
+    tope semanal de días, el fin de semana libre y el reparto de sábados y domingos quedan intactos
+    por construcción. Se comprueban las tres cosas que sí pueden moverse: el descanso entre jornadas,
+    las horas de la semana y el tope anual."""
+    pares = _pares_pactados(datos)
+    ocupado: Counter = Counter()
+    horas: dict[str, float] = defaultdict(float)
+    hsem: dict[tuple[str, tuple[int, int]], float] = defaultdict(float)
+    dia: dict[date, list[str]] = defaultdict(list)
+    for (w, f), s in plan.items():
+        if s not in datos.turnos:
+            continue
+        ocupado[(s, f)] += 1
+        horas[w] += datos.turnos[s].horas
+        hsem[(w, semana(f))] += datos.turnos[s].horas
+        dia[f].append(w)
+
+    # Semana de cada uno, para elegir el turno que MEJOR SE ADAPTA: el que deja su semana más
+    # parecida a sí misma (misma franja, mismo municipio), que es el criterio de `coherencia`.
+    sem_turnos: dict[tuple[str, tuple[int, int]], list[str]] = defaultdict(list)
+    for (w, f), s in plan.items():
+        if s in datos.turnos:
+            sem_turnos[(w, semana(f))].append(s)
+
+    cambios, por_prio = 0, Counter()
+    for f in fechas:
+        huecos = _huecos_dia(datos, ocupado, f)
+        if not huecos:
+            continue
+        libres = [w for w in dia.get(f, [])
+                  if datos.turnos[plan[(w, f)]].prioridad <= 0]          # haciendo relleno
+        for s in huecos:
+            if not libres:
+                break
+            t = datos.turnos[s]
+            mejor = None
+            for w in libres:
+                ref = plan[(w, f)]
+                dh = t.horas - datos.turnos[ref].horas
+                sm = semana(f)
+                elegible, refuerzo = datos.elegible(w, s, f)
+                if not elegible:
+                    continue
+                if hsem[(w, sm)] + dh > HMAX7:
+                    continue
+                if horas[w] + dh > HORAS_OBJETIVO * datos.trabajadores[w].factor_jornada:
+                    continue
+                if not _descanso_ok(datos, plan, w, f, s, pares):
+                    continue
+                # coste: cuánto desencaja su semana, más el desajuste de horas y, en último
+                # término, preferir a quien puede hacerlo de forma ordinaria antes que de refuerzo
+                resto = list(sem_turnos[(w, sm)])
+                resto.remove(ref)
+                coste = (_coste_semana(datos, resto + [s]) - _coste_semana(datos, sem_turnos[(w, sm)])
+                         + abs(dh) / 8 + (1 if refuerzo else 0))
+                if mejor is None or coste < mejor[0]:
+                    mejor = (coste, w, ref, dh)
+            if mejor is None:
+                continue
+            _, w, ref, dh = mejor
+            sm = semana(f)
+            plan[(w, f)] = s
+            ocupado[(ref, f)] -= 1
+            ocupado[(s, f)] += 1
+            horas[w] += dh
+            hsem[(w, sm)] += dh
+            sem_turnos[(w, sm)].remove(ref)
+            sem_turnos[(w, sm)].append(s)
+            libres.remove(w)
+            cambios += 1
+            por_prio[t.prioridad] += 1
+    if log:
+        detalle = ", ".join(f"prioridad {p}: {n}" for p, n in sorted(por_prio.items(), reverse=True))
+        print(f"Refuerzos aprovechados: {cambios} cambiados por un turno real sin cubrir"
+              + (f" ({detalle})" if detalle else ""), flush=True)
+    return cambios
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description="Pule la equidad de findes/festivos de un plan")
     p.add_argument("plan", help="CSV con id_trab,fecha,id_turno")
@@ -452,6 +563,7 @@ def main() -> int:
 
     resumen(datos, plan, "ANTES del pulido")
     pulir(datos, plan, inicio, fin, max_mov=a.max_mov)
+    aprovechar(datos, plan, rango_fechas(inicio - timedelta(days=inicio.weekday()), fin))
     if not a.sin_coherencia:
         coherencia(datos, plan)
     resumen(datos, plan, "DESPUÉS del pulido")

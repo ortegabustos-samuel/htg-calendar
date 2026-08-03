@@ -44,6 +44,11 @@ COLCHON_PACE_H = 24
 # ~Media unidad de cesión permite oscilar alrededor del ritmo y ceder cuando toca. El tope anual duro
 # (HORAS_OBJETIVO) sigue mandando al final del año.
 COLCHON_NOCHE_H = 40
+# Coste, dentro del CALENDARIO DE CESIONES (Nivel 0), de librar un bloque en un ciclo tenso: se paga
+# por cada punto porcentual que la carga por persona de ese ciclo supera la media del horizonte. Un
+# bloque libre no desaparece, lo cubre otro; si se concede cuando media plantilla está de vacaciones,
+# ese otro sale de un turno que se queda sin cubrir. Ver `calendario_cesiones`.
+PESO_CESION_TENSA = 60
 
 # Penalización de cobertura (P1): PONDERADA por prioridad, en TRES escalones respecto a PESO_DEV (el
 # coste de sacar a un trabajador de su patrón). Así la criticidad del turno decide si se toca o no un
@@ -158,6 +163,23 @@ def semana(f: date) -> tuple[int, int]:
     """Clave (año, nº) de la semana ISO (lunes-domingo) a la que pertenece la fecha."""
     a, n, _ = f.isocalendar()
     return (a, n)
+
+
+def carga_diaria(datos: Datos, fechas: list[date]) -> dict[date, float]:
+    """Horas de demanda que le tocan a CADA persona disponible ese día.
+
+    Es la medida de tensión de la plantilla: la demanda no cambia en agosto, pero hay mucha menos
+    gente para atenderla, así que a cada disponible le corresponde bastante más. La usan dos sitios
+    que deben hablar del mismo idioma — el prorrateo del objetivo anual (dar más margen de horas
+    cuando la plantilla está tensa) y el calendario de cesiones (no regalar bloques libres justo
+    entonces)—, y por eso vive aquí y no duplicada en cada uno."""
+    carga: dict[date, float] = {}
+    for f in fechas:
+        dem = sum(t.dem * t.horas for s, t in datos.turnos.items()
+                  if t.prioridad >= 1 and datos.opera(s, f))
+        disp = sum(1 for w in datos.trabajadores if datos.disponible(w, f))
+        carga[f] = dem / disp if disp else 0.0
+    return carga
 
 
 class Modelo:
@@ -1198,7 +1220,16 @@ def calendario_cesiones(datos: Datos, inicio: date, fin: date,
       · repartidos A LO LARGO DEL AÑO (uno por cada tramo igual del horizonte);
       · NUNCA en un ciclo en el que su BINOMIO esté de vacaciones (dejaría la línea entera huérfana);
       · NUNCA en un ciclo en el que TODOS sus cubridores estén de vacaciones (no habría quien cubra);
-      · los dos del binomio no ceden el mismo ciclo.
+      · los dos del binomio no ceden el mismo ciclo;
+      · y, entre los que quedan, NUNCA cuando la plantilla está tensa si se puede evitar.
+    Lo último es lo que se añadió después de ver el año 2026: mirar solo las vacaciones del binomio
+    y de los cubridores no basta, porque un ciclo puede tener cubridor libre y aun así ser el peor
+    momento del año. Una cesión en agosto se cubre sacando a alguien de otro sitio, y ese otro sitio
+    se queda sin cubrir: en 2026 uno de los cuatro bloques cayó el 24/08, dentro del mes que acumuló
+    80 de los 122 huecos. La tensión se mide con `carga_diaria` —las horas de demanda que le tocan a
+    cada persona disponible— así que no hay nada específico de agosto ni de Valladolid en la regla:
+    la penalización aparece sola donde la plantilla se estrecha, sea cuando sea.
+
     Entre los ciclos que cumplen todo eso se eligen los que dejan la jornada anual más cerca del
     objetivo, garantizando no superarlo. Devuelve {(trabajador, ciclo)}."""
     noche = _patrones_noche(datos)
@@ -1207,6 +1238,17 @@ def calendario_cesiones(datos: Datos, inicio: date, fin: date,
     ancla = inicio - timedelta(days=inicio.weekday())
     fechas = rango_fechas(ancla, fin)
     nciclos = (fechas[-1] - ancla).days // 14 + 1
+
+    # TENSIÓN de cada ciclo: cuánto se aparta su carga por persona de la media del horizonte, en
+    # puntos porcentuales y solo por arriba (ceder en un ciclo flojo no penaliza, es lo deseable).
+    carga = carga_diaria(datos, fechas)
+    media = sum(carga.values()) / len(carga) if carga else 0.0
+    tension: dict[int, int] = {}
+    for k in range(nciclos):
+        dias = [ancla + timedelta(days=14 * k + i) for i in range(14)]
+        dias = [f for f in dias if f in carga]
+        c = sum(carga[f] for f in dias) / len(dias) if dias else 0.0
+        tension[k] = max(0, round(100 * (c / media - 1))) if media else 0
 
     def libre_todo(x: str, k: int) -> bool:
         """¿x está disponible los 14 días del ciclo k?"""
@@ -1284,7 +1326,14 @@ def calendario_cesiones(datos: Datos, inicio: date, fin: date,
 
     if not cede:
         return set()
-    m.minimize(sum(desvs))
+    # Los desvíos van en MINUTOS y apenas discriminan: todos los ciclos de una misma rotación
+    # prescriben casi las mismas horas, así que ceder uno u otro deja la jornada anual casi igual.
+    # Quien debe decidir es la tensión. Con este peso, un ciclo un 10% por encima de la carga media
+    # cuesta 600 —más que cualquier diferencia de desvío que se haya observado (unos 300)—, así que
+    # manda el CUÁNDO; el desvío sigue desempatando entre ciclos igual de flojos. El tope de jornada
+    # no está en juego: `total - cedido <= objetivo` es duro y se cumple elija lo que elija.
+    m.minimize(sum(desvs) + PESO_CESION_TENSA * sum(tension[k] * var
+                                                    for (w, k), var in cede.items()))
     solver = cp_model.CpSolver()
     solver.parameters.max_time_in_seconds = 30
     st = solver.solve(m)
@@ -1413,12 +1462,7 @@ def resolver_anual(datos: Datos, inicio: date, fin: date, dias_ventana: int = 14
     # corta justo cuando más falta hace (medido en 2026: 126 de los 135 huecos de agosto tenían gente
     # libre a la que solo le faltaban horas). Se pondera por carga esperada = demanda del día entre
     # personas disponibles ese día.
-    carga_dia: dict[date, float] = {}
-    for f in dias_horizonte:
-        dem_f = sum(t.dem * t.horas for s, t in datos.turnos.items()
-                    if t.prioridad >= 1 and datos.opera(s, f))
-        disp_f = sum(1 for w in datos.trabajadores if datos.disponible(w, f))
-        carga_dia[f] = dem_f / disp_f if disp_f else 0.0
+    carga_dia = carga_diaria(datos, dias_horizonte)
 
     def peso(w: str, dias: list[date]) -> float:
         """Carga esperada que le corresponde a w en esos días (0 en los que no está disponible)."""

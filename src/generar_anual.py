@@ -75,15 +75,18 @@ def main() -> int:
     plan = resolver_anual(datos, inicio, fin, dias_ventana=a.ventana, dias_cola=a.cola,
                           segundos=a.segundos, hilos=a.hilos, gap=0.0, log=a.log)
 
+    fechas = rango_fechas(inicio - timedelta(days=inicio.weekday()), fin)
     if not a.sin_pulir:
-        # Pasada final de equidad: intercambia semanas para igualar findes y festivos. No puede
-        # tocar la cobertura ni la jornada (invariantes duros), así que es seguro por defecto.
+        # Pasada final: equidad por intercambio de semanas, aprovechamiento de los refuerzos y
+        # coherencia. Ninguna puede empeorar la cobertura ni la jornada (invariantes duros).
+        # `aprovechar` va entre medias a propósito: sustituye refuerzos por demanda real y deja
+        # semanas nuevas que `coherencia` todavía puede ordenar.
         pulido.resumen(datos, plan, "EQUIDAD antes del pulido")
         pulido.pulir(datos, plan, inicio, fin)
+        pulido.aprovechar(datos, plan, fechas)
         pulido.coherencia(datos, plan)
         pulido.resumen(datos, plan, "EQUIDAD después del pulido")
 
-    fechas = rango_fechas(inicio - timedelta(days=inicio.weekday()), fin)
     if plan and max(f for _, f in plan) < fin:
         print(f"\n*** AVISO: el rodante se detuvo, el plan acaba en {max(f for _, f in plan)} ***")
     salida.generar_anual(datos, fechas, plan)
