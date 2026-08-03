@@ -428,7 +428,7 @@ def reporte_equidad(datos: Datos, fechas: list[date], plan: dict) -> None:
     fijos = [w for w, t in datos.trabajadores.items() if t.tipo == "fijo"]
     if fijos:
         print("-" * 78)
-        print("Fijos (horas COMPUTADAS, deben rondar 1776):")
+        print(f"Fijos (horas COMPUTADAS, deben rondar {HORAS_OBJETIVO}):")
         for w in sorted(fijos):
             c = carga[w]
             print(f"  {w:<12} {c['comp']:>6.0f} h   findes={c['finde']:<3} festivos={c['festivo']}")
@@ -438,7 +438,7 @@ def reporte_equidad(datos: Datos, fechas: list[date], plan: dict) -> None:
                    for g in grupos.values() for w in g), reverse=True)[:8]
     if desv:
         print("-" * 78)
-        print("No-fijos más alejados de 1776 (consumo):")
+        print(f"No-fijos más alejados de {HORAS_OBJETIVO} (consumo):")
         for _, w in desv:
             c = carga[w]
             print(f"  {w:<12} {datos.trabajadores[w].tipo:<10} consumo={c['cons']:>6.0f}  "

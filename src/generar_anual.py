@@ -29,6 +29,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import salida                                                   # noqa: E402
+import validar_datos                                            # noqa: E402
 from cargar_datos import cargar                                 # noqa: E402
 import pulido                                                    # noqa: E402
 from modelo import HORAS_OBJETIVO, rango_fechas, resolver_anual  # noqa: E402
@@ -47,7 +48,24 @@ def main() -> int:
     p.add_argument("--log", action="store_true", help="log detallado del solver")
     p.add_argument("--sin-pulir", action="store_true",
                    help="omite la pasada de equidad (intercambios de semana)")
+    p.add_argument("--sin-validar", action="store_true",
+                   help="arranca aunque los CSV tengan errores (bajo tu responsabilidad)")
     a = p.parse_args()
+
+    # Validar primero: son 45 minutos de cómputo, y un CSV con un espacio de más no da un fallo
+    # ruidoso sino un cuadrante que parece bueno y no lo es. Mejor no arrancar.
+    inf = validar_datos.validar(a.datos)
+    for m in inf.errores:
+        print(f"  ERROR  {m}")
+    for m in inf.avisos:
+        print(f"  aviso  {m}")
+    if inf.errores:
+        print(f"\n{len(inf.errores)} errores en los datos de entrada. Arréglalos en los CSV, o "
+              f"pasa --sin-validar si sabes lo que haces.")
+        if not a.sin_validar:
+            return 1
+    if inf.errores or inf.avisos:
+        print()
 
     inicio, fin = date(a.anio, 1, 1), date(a.anio, 12, 31)
     datos = cargar(a.datos)

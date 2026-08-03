@@ -7,6 +7,19 @@ reconstruir los datos. **Si cambias el contrato, actualiza este fichero en el mi
 
 Todos los ficheros son CSV con cabecera y separador coma, codificación UTF-8.
 
+**Comprueba los datos antes de resolver:**
+
+```
+python3 src/validar_datos.py            # o: python3 src/validar_datos.py otro/directorio
+```
+
+Recorre los seis ficheros en cuatro niveles —formato, referencias, este contrato y viabilidad—
+y distingue **ERROR** (se pierde información: no resolver con esto), **aviso** (probablemente
+intencionado, míralo) y **nota** (contexto: balance anual, horas que prescribe cada patrón).
+`generar_anual.py` lo ejecuta al arrancar y se niega a empezar si hay errores, porque el fallo
+típico aquí no es ruidoso: un espacio de más en una celda hace que el cargador la descarte en
+silencio y el cuadrante salga sutilmente mal después de 45 minutos de cómputo.
+
 ---
 
 ## `turnos.csv` — las líneas de servicio
