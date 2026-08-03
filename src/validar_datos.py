@@ -87,20 +87,27 @@ def _fecha(txt: str) -> date | None:
 # --------------------------------------------------------------------------- #
 #  1. FORMATO — lo que impide leer bien el fichero
 # --------------------------------------------------------------------------- #
-def revisar_formato(directorio: Path, inf: Informe) -> dict[str, list[dict]]:
+def revisar_formato(directorio: Path, inf: Informe) -> tuple[dict[str, list[dict]], list[str]]:
     """Lee los CSV en crudo, sin pasar por el cargador, para ver el texto tal cual está.
-    Devuelve las filas de cada fichero (lista vacía si no se pudo leer)."""
+
+    Devuelve (filas de cada fichero, ficheros ILEGIBLES). La distinción importa: un espacio
+    sobrante en una celda es un error, pero el fichero se sigue entendiendo y los niveles
+    siguientes pueden decir cosas útiles sobre él. Uno que no existe, o al que le falta una
+    columna, no deja nada que analizar — y solo eso corta la revisión."""
     crudo: dict[str, list[dict]] = {}
+    ilegibles: list[str] = []
     for nombre, obligatorias in OBLIGATORIAS.items():
         crudo[nombre] = []
         ruta = directorio / nombre
         if not ruta.exists():
             inf.error(f"{nombre}: no existe en {directorio}")
+            ilegibles.append(nombre)
             continue
         with open(ruta, encoding="utf-8-sig", newline="") as fh:
             filas = list(csv.reader(fh))
         if not filas:
             inf.error(f"{nombre}: fichero vacío")
+            ilegibles.append(nombre)
             continue
 
         cab = filas[0]
@@ -110,6 +117,7 @@ def revisar_formato(directorio: Path, inf: Informe) -> dict[str, list[dict]]:
         faltan = [c for c in obligatorias if c not in cab]
         if faltan:
             inf.error(f"{nombre}: faltan columnas obligatorias {faltan} (cabecera: {cab})")
+            ilegibles.append(nombre)
             continue
 
         datos: list[dict] = []
@@ -142,7 +150,7 @@ def revisar_formato(directorio: Path, inf: Informe) -> dict[str, list[dict]]:
                 if veces > 1:
                     inf.error(f"{nombre}: la clave {k} aparece {veces} veces; solo valdrá la última")
         crudo[nombre] = datos
-    return crudo
+    return crudo, ilegibles
 
 
 # --------------------------------------------------------------------------- #
@@ -408,17 +416,26 @@ def revisar_viabilidad(directorio: Path, inf: Informe) -> None:
 #  Orquestación
 # --------------------------------------------------------------------------- #
 def validar(directorio: Path | str = DATA) -> Informe:
-    """Ejecuta los cuatro niveles en cascada: si un nivel encuentra errores, los siguientes
-    trabajarían sobre datos que ya sabemos rotos, así que no se ejecutan."""
+    """Ejecuta los cuatro niveles, informando de todo lo que se pueda en una sola pasada: arreglar
+    los CSV de uno en uno, relanzando entre cada arreglo, sería insufrible.
+
+    Solo hay dos cortes, y los dos son porque seguir daría ruido en vez de información:
+      * un fichero ILEGIBLE (ausente, vacío, sin una columna obligatoria) no deja nada que mirar,
+        y los niveles 2 y 3 lo verían como si estuviera vacío: todo lo que lo cita saldría roto.
+      * el nivel 4 mide el año entero (balance, profundidad, horas por patrón); con referencias
+        rotas esos números serían inventados, así que solo corre si no hay ningún error."""
     directorio = Path(directorio)
     inf = Informe()
 
-    crudo = revisar_formato(directorio, inf)
-    if inf.errores:
+    crudo, ilegibles = revisar_formato(directorio, inf)
+    if ilegibles:
+        inf.nota(f"no se ha revisado nada más: {', '.join(ilegibles)} no se puede(n) leer")
         return inf
     revisar_referencias(crudo, inf)
     revisar_contrato(crudo, inf)
     if inf.errores:
+        inf.nota("el balance anual y la profundidad de cobertura no se han medido: con estos "
+                 "errores los números no significarían nada")
         return inf
     try:
         revisar_viabilidad(directorio, inf)
