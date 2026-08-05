@@ -25,11 +25,7 @@ from collections import defaultdict
 from datetime import date, datetime, timedelta
 
 from cargar_datos import DATA, DIAS, LIBRE, Datos, cargar
-
-RMIN = 12          # descanso mínimo entre jornadas (h)   — mismo criterio que modelo.C4
-HMAX7 = 48         # máx. horas por semana ISO            — C6
-CMAX = 6           # máx. días trabajados por semana      — C5
-OBJETIVO = 1776    # jornada anual objetivo (h)
+from modelo import jornada_minutos
 
 
 def _rango(inicio: date, fin: date) -> list[date]:
@@ -45,12 +41,13 @@ def _intervalo(f: date, t) -> tuple[datetime, datetime]:
 
 
 # --------------------------------------------------------------------------- #
-def balance(datos: Datos, fechas: list[date], objetivo: int = OBJETIVO) -> None:
+def balance(datos: Datos, fechas: list[date], objetivo: int | None = None) -> None:
     """¿Cuadra la aritmética gruesa? Horas que EXIGE la demanda del año frente a las que
     APORTA la plantilla a `objetivo` h/año. Si el balance es negativo, el cuadrante es
     imposible sin huecos o sin superar el objetivo: es un problema de plantilla, no de
     solver. Se da en las dos métricas: computada (legal) y de consumo (capacidad real,
     que es mayor cuando hay localizados)."""
+    objetivo = objetivo if objetivo is not None else datos.config.horas_objetivo
     dem_h = dem_c = 0.0
     for s, t in datos.turnos.items():
         if t.prioridad < 1:                     # comodines: no son demanda
@@ -99,12 +96,13 @@ def _prescripcion(datos: Datos, patron: str, trabs: list[str],
 
 
 def patrones(datos: Datos, fechas: list[date], ancla: date,
-             objetivo: int = OBJETIVO) -> None:
+             objetivo: int | None = None) -> None:
     """Horas/año que PRESCRIBE cada patrón (contando solo días en que la línea opera y el
     trabajador está disponible) frente al objetivo. El EXCEDENTE es la cantidad que ese
     patrón debe ceder al año — el mecanismo de 'libranzas' NO es propio de las noches: lo
     necesita todo patrón con excedente. Se expresa en unidades de cesión para que se vea
     cuántas hay que liberar: una SEMANA de la rotación y un PERIODO completo (len(filas))."""
+    objetivo = objetivo if objetivo is not None else datos.config.horas_objetivo
     grupos: dict[str, list[str]] = defaultdict(list)
     for w, t in datos.trabajadores.items():
         if t.tipo == "patron" and t.patron:
@@ -113,7 +111,7 @@ def patrones(datos: Datos, fechas: list[date], ancla: date,
     print("\n" + "=" * 78)
     print(f"2. PATRONES: horas prescritas vs objetivo ({objetivo} h)")
     print("=" * 78)
-    print(f"{'patron':<18} {'per':>4} {'h/año':>7} {'consumo':>8} {'Δ obj':>7} "
+    print(f"{'patron':<18} {'per':>4} {'h/año':>7} {'jornada':>8} {'Δ obj':>7} "
           f"{'h/sem':>6} {'ceder':>13}")
     print("-" * 78)
     for p, trabs in sorted(grupos.items()):
@@ -123,15 +121,18 @@ def patrones(datos: Datos, fechas: list[date], ancla: date,
         pres = _prescripcion(datos, p, trabs, fechas, ancla)
         hs, cs = [], []
         for w, items in pres.items():
-            hs.append(sum(datos.turnos[s].horas for f, s in items
-                          if datos.opera(s, f) and datos.disponible(w, f)))
-            cs.append(sum(datos.turnos[s].horas_consumo for f, s in items
-                          if datos.opera(s, f) and datos.disponible(w, f)))
+            reales = {(w, f): s for f, s in items
+                      if datos.opera(s, f) and datos.disponible(w, f)}
+            hs.append(sum(datos.turnos[s].horas for s in reales.values()))
+            cs.append(jornada_minutos(datos, reales, fechas).get(w, 0) / 60)
         med, medc = sum(hs) / len(hs), sum(cs) / len(cs)
-        delta = med - objetivo
-        # unidades de cesión: horas de una semana media y de un periodo completo
-        h_periodo = sum(datos.turnos[s].horas for fila in filas for s in fila.values()
-                        if s and s != LIBRE and s in datos.turnos)
+        delta = medc - objetivo          # lo que cuenta contra el objetivo es la JORNADA, no la legal
+        # unidades de cesión: jornada de una semana media y de un periodo completo
+        h_periodo = sum(jornada_minutos(datos, {("·", ancla + timedelta(days=7 * i + j)):
+                                                filas[i][DIAS[j]]
+                                                for i in range(len(filas)) for j in range(7)
+                                                if filas[i][DIAS[j]] not in (None, "", LIBRE)
+                                                and filas[i][DIAS[j]] in datos.turnos}).values()) / 60
         h_sem = h_periodo / len(filas)
         ceder = (f"{delta/h_sem:.1f} sem = {delta/h_periodo:.2f} per" if delta > 0 else "—")
         print(f"{p:<18} {len(filas):>4} {med:>7.0f} {medc:>8.0f} {delta:>+7.0f} "
@@ -139,8 +140,10 @@ def patrones(datos: Datos, fechas: list[date], ancla: date,
     print("-" * 78)
     print("  Δ obj > 0: hay que CEDER esas horas (libranzas) para aterrizar en el objetivo.")
     print("  Δ obj < 0: el patrón deja capacidad libre (puede absorber coberturas).")
-    print("  'consumo' >> 'h/año' delata líneas de localizado: decidir con la empresa CUÁL")
-    print("  de las dos cuenta contra el objetivo anual.")
+    print("  'h/año' = horas LEGALES computadas (las del convenio, C5/C6/C7).")
+    print("  'jornada' = lo que la plaza OCUPA, que es lo que cuenta contra el objetivo anual:")
+    print("  una semana de localizado computa entera (ver modelo.JORNADA_LOCALIZADO_SEMANA), y por")
+    print("  eso en esas líneas 'jornada' >> 'h/año'.")
 
 
 # --------------------------------------------------------------------------- #
@@ -149,11 +152,12 @@ def exenciones(datos: Datos) -> None:
     eximirla (la conciliación pactada con los sindicatos). Un patrón que cumple los límites
     no necesita exención alguna; y ningún trabajador debería estar exento en las semanas en
     que NO sigue su rotación (p.ej. cuando cubre otra línea): ahí manda el convenio."""
+    cfg = datos.config
     print("\n" + "=" * 78)
     print("3. EXENCIONES LEGALES QUE LA ROTACIÓN PACTADA REALMENTE NECESITA")
     print("=" * 78)
     print(f"{'patron':<18} {'max h/sem':>9} {'max d/sem':>9} {'min desc.':>9}   "
-          f"{'C6>48h':>6} {'C5>6d':>6} {'C4<12h':>7}")
+          f"{f'C6>{cfg.hmax7}h':>6} {f'C5>{cfg.cmax}d':>6} {f'C4<{cfg.rmin}h':>7}")
     print("-" * 78)
     base = date(2026, 1, 5)                    # un lunes cualquiera: solo importa la forma
     for p, filas in sorted(datos.patrones.items()):
@@ -184,7 +188,7 @@ def exenciones(datos: Datos) -> None:
                 peor = min(peor, (ini2 - fin1).total_seconds() / 3600)
         marca = lambda b: "SÍ" if b else "no"          # noqa: E731
         print(f"{p:<18} {maxh:>9.0f} {maxd:>9} {peor:>9.1f}   "
-              f"{marca(maxh > HMAX7):>6} {marca(maxd > CMAX):>6} {marca(peor < RMIN):>7}")
+              f"{marca(maxh > cfg.hmax7):>6} {marca(maxd > cfg.cmax):>6} {marca(peor < cfg.rmin):>7}")
     print("-" * 78)
     print("  'no' en las tres = ese patrón NO necesita ninguna exención: debe cumplir el")
     print("  convenio como el resto de la plantilla.")
@@ -222,8 +226,9 @@ def lineas(datos: Datos, fechas: list[date]) -> None:
 def main() -> None:
     import sys
     directorio = sys.argv[1] if len(sys.argv) > 1 else DATA
-    anio = int(sys.argv[2]) if len(sys.argv) > 2 else 2026
-    datos = cargar(directorio)
+    anio = int(sys.argv[2]) if len(sys.argv) > 2 else None
+    datos = cargar(directorio, anio)
+    anio = datos.config.anio
     inicio, fin = date(anio, 1, 1), date(anio, 12, 31)
     inicio -= timedelta(days=inicio.weekday())       # alinear a lunes, como el modelo
     fechas = _rango(inicio, fin)

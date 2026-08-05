@@ -19,7 +19,9 @@ from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
 from cargar_datos import Datos, cargar
-from modelo import LAMBDA, METRICAS, Modelo, peso_cobertura, rango_fechas
+from modelo import (JORNADA_LOCALIZADO_SEMANA, LAMBDA, METRICAS,
+                    Modelo, _patrones_uvi, jornada_minutos, lineas_localizadas,
+                    peso_cobertura, rango_fechas, semana)
 
 RAIZ = Path(__file__).resolve().parents[1]
 SALIDA = RAIZ / "data" / "output"
@@ -99,6 +101,8 @@ def _ajustar_anchos(ws, desde_fila: int = 1, saltar: set[int] | None = None,
         for c in fila:
             if c.value is None or c.row in saltar:
                 continue
+            if isinstance(c.value, str) and c.value.startswith("="):
+                continue        # una fórmula mide 200 caracteres y no es lo que se ve en la celda
             largo = max(len(t) for t in str(c.value).split("\n"))
             if largo > anchos.get(c.column, 0):
                 anchos[c.column] = largo
@@ -142,7 +146,51 @@ def _bloques(datos: Datos, muni: dict[str, str]) -> list[tuple[str, list[str]]]:
     return [(tit, g) for tit, g in bloques if g]
 
 
+def _min(horas: float) -> float:
+    """Horas redondeadas al MINUTO. `modelo.jornada_minutos` trabaja en minutos enteros por turno,
+    así que el Excel tiene que partir del mismo número: con el decimal exacto (80/7 h de un
+    localizado) la hoja se desviaba unos segundos por turno del CSV de métricas, y dos cifras que
+    deberían ser la misma no pueden bailar."""
+    return round(horas * 60) / 60
+
+
+def _calendarios_festivos(datos: Datos) -> dict[str, set[date]]:
+    """calendario -> fechas festivas EFECTIVAS (las comunes más las suyas). Es lo que mira
+    `Datos.es_festivo`, resuelto de una vez para poder volcarlo como banderas por día."""
+    comun = datos.festivos.get("Comun", set())
+    cals = {datos.calendario_municipio.get(t.municipio, t.municipio) for t in datos.turnos.values()}
+    return {c: comun | datos.festivos.get(c, set()) for c in sorted(cals)}
+
+
+def _calendario_de(datos: Datos, turno: str) -> str:
+    t = datos.turnos[turno]
+    return datos.calendario_municipio.get(t.municipio, t.municipio)
+
+
+def _semanas_de(fechas: list[date]) -> list[list[int]]:
+    """Índices de columna (0-based sobre `fechas`) agrupados por semana ISO, en orden. Como el
+    horizonte arranca en lunes, cada grupo es un bloque de columnas CONTIGUAS: eso es lo que
+    permite que una fórmula de Excel pregunte por 'la semana' sin celdas auxiliares por día."""
+    grupos: dict[tuple[int, int], list[int]] = defaultdict(list)
+    for j, f in enumerate(fechas):
+        grupos[semana(f)].append(j)
+    return [grupos[k] for k in sorted(grupos)]
+
+
 def escribir_excel(datos: Datos, fechas: list[date], asign, huecos, kpis: dict) -> None:
+    """Vuelca el cuadrante a XLSX. La hoja es VIVA: los cuatro recuentos de la derecha —sábados,
+    domingos, festivos y horas— son FÓRMULAS, no números pegados. Si el planificador escribe una
+    línea en una celda del calendario, los cuatro se recalculan solos y con los datos DE ESA LÍNEA
+    (sus horas, y si el día es festivo según el calendario de su municipio).
+
+    Para que las fórmulas tengan de dónde leer, debajo del calendario va el PLAN FUNCIONAL: una
+    fila por línea con sus días de operación (LV/sábado/domingo/festivo), horario, horas computadas,
+    horas de jornada, demanda y prioridad. Las fórmulas de horas y de festivos leen de ahí.
+
+    Una hoja `Aux` (oculta) lleva lo que no cabe en el calendario sin ensuciarlo: qué día es sábado,
+    domingo o festivo de cada calendario, y en qué semanas asume cada trabajador una plaza de
+    localizado — que es lo que permite computarla como semana entera (JORNADA_LOCALIZADO_SEMANA)
+    también dentro de Excel."""
     SALIDA.mkdir(parents=True, exist_ok=True)
     wb = Workbook()
     ws = wb.active
@@ -170,37 +218,22 @@ def escribir_excel(datos: Datos, fechas: list[date], asign, huecos, kpis: dict) 
     muni = _municipio_trabajador(datos)
     negro = Font(color="000000", bold=True)
 
-    # Columnas de recuento a la derecha del calendario
-    COL_EXTRA = 3 + len(fechas)
-    for k, titulo in enumerate(("Sábados", "Domingos", "Festivos", "Horas")):
+    ndias = len(fechas)
+    COL_D0, COL_DN = 3, 2 + ndias                        # primera y última columna de día
+    L_D0, L_DN = get_column_letter(COL_D0), get_column_letter(COL_DN)
+    COL_EXTRA = 3 + ndias                                # recuentos, a la derecha del calendario
+
+    RECUENTOS = ("Sábados", "Domingos", "Festivos", "Horas")
+    for k, titulo in enumerate(RECUENTOS):
         c = ws.cell(HDR, COL_EXTRA + k, titulo)
         c.alignment, c.font, c.border = centro, negrita, borde
-
-    def recuento(trab: str) -> tuple[int, int, int, float]:
-        """Sábados, domingos, festivos y horas que acumula el trabajador en todo el horizonte. Las
-        tres cuentas de día son INDEPENDIENTES: un turno en festivo que caiga en sábado suma en las
-        dos. El festivo se mira con el municipio del turno que hace ese día."""
-        sab = dom = fes = 0
-        horas = 0.0
-        for d in fechas:
-            s = asign.get((trab, d))
-            if not s:
-                continue
-            if d.weekday() == 5:
-                sab += 1
-            if d.weekday() == 6:
-                dom += 1
-            if datos.es_festivo(d, datos.turnos[s].municipio):
-                fes += 1
-            horas += datos.turnos[s].horas
-        return sab, dom, fes, horas
 
     def fila(trab: str, t) -> None:
         nonlocal r
         ws.cell(r, 1, trab).alignment = izq
         ws.cell(r, 2, t.patron if t.tipo == "patron" else t.tipo).alignment = izq
         for j, d in enumerate(fechas):
-            c = ws.cell(r, 3 + j)
+            c = ws.cell(r, COL_D0 + j)
             c.alignment, c.border = centro, borde
             if not datos.disponible(trab, d):
                 c.value, color = "V", FILL_VAC_XL
@@ -212,12 +245,11 @@ def escribir_excel(datos: Datos, fechas: list[date], asign, huecos, kpis: dict) 
                 m = datos.turnos[turno].municipio if turno else muni[trab]
                 c.value, color = turno, CAT_FILL[_categoria(datos, d, m)]
             c.fill = PatternFill("solid", fgColor=color)
-        for k, val in enumerate(recuento(trab)):
-            c = ws.cell(r, COL_EXTRA + k, round(val) if k == 3 else val)
-            c.alignment, c.border, c.font = centro, borde, negrita
+        fila_de[trab] = r
         r += 1
 
     r = HDR + 1
+    fila_de: dict[str, int] = {}                 # trabajador -> fila, para las fórmulas de después
     titulos: set[int] = set()                    # filas de rótulo: no cuentan para el ancho
     for titulo, gente in _bloques(datos, muni):
         if titulo:                                        # separación del bloque de los pueblos
@@ -228,6 +260,7 @@ def escribir_excel(datos: Datos, fechas: list[date], asign, huecos, kpis: dict) 
             r += 1
         for trab in gente:
             fila(trab, datos.trabajadores[trab])
+    W0, W1 = HDR + 1, r - 1                      # franja de filas de trabajador (con rótulos dentro)
 
     # Turnos sin cubrir: apilados bajo la columna de su día
     por_dia = defaultdict(list)
@@ -238,11 +271,150 @@ def escribir_excel(datos: Datos, fechas: list[date], asign, huecos, kpis: dict) 
     base = r + 1
     for j, d in enumerate(fechas):
         for k, s in enumerate(por_dia.get(d, [])):
-            c = ws.cell(base + k, 3 + j, s)
+            c = ws.cell(base + k, COL_D0 + j, s)
             c.alignment, c.border = centro, borde
             c.fill = PatternFill("solid", fgColor=FILL_HUECO_XL)
+    r = base + max((len(v) for v in por_dia.values()), default=0) + 1
 
-    _ajustar_anchos(ws, desde_fila=HDR, saltar=titulos)
+    # ---------------------------------------------------------------- #
+    #  PLAN FUNCIONAL: la tabla de líneas de la que leen las fórmulas
+    # ---------------------------------------------------------------- #
+    fes_cal = _calendarios_festivos(datos)
+    cals = list(fes_cal)
+    # Ordenado por CALENDARIO: las fórmulas de festivos necesitan que las líneas de un mismo
+    # calendario ocupen filas contiguas (se referencian como un rango, no una a una).
+    lineas = sorted(datos.turnos, key=lambda s: (_calendario_de(datos, s), s))
+    tramo_cal = {c: [i for i, s in enumerate(lineas) if _calendario_de(datos, s) == c] for c in cals}
+
+    r += 1
+    ws.cell(r, 1, "PLAN FUNCIONAL").font = Font(bold=True, size=12)
+    titulos.add(r)
+    ws.cell(r, 3, "una fila por línea: es de aquí de donde leen las fórmulas de la derecha del "
+                  "calendario (horas, sábados, domingos y festivos)").alignment = izq
+    r += 1
+    PF_HDR = r
+    CAMPOS = ("Línea", "Municipio", "LV", "Sábado", "Domingo", "Festivo", "Entrada", "Salida",
+              "h. computadas", "h. jornada", "Demanda/día", "Prioridad", "Demanda anual",
+              "Asignados")
+    for k, titulo in enumerate(CAMPOS):
+        c = ws.cell(PF_HDR, 1 + k, titulo)
+        c.alignment, c.font, c.border = centro, negrita, borde
+
+    PF0 = PF_HDR + 1
+    for i, s in enumerate(lineas):
+        t, fr = datos.turnos[s], PF0 + i
+        vals = (s, t.municipio, t.lv, t.sab, t.dom, t.fes,
+                f"{t.hora_entrada:%H:%M}", f"{t.hora_salida:%H:%M}",
+                t.horas, _min(t.horas_consumo), t.dem, t.prioridad,
+                t.dem * sum(1 for d in fechas if datos.opera(s, d)),
+                f"=COUNTIF({L_D0}${W0}:{L_DN}${W1},$A{fr})")
+        for k, v in enumerate(vals):
+            c = ws.cell(fr, 1 + k, v)
+            c.alignment, c.border = (izq if k < 2 else centro), borde
+            if k in (8, 9):
+                c.number_format = "0.00"
+    PF1 = PF0 + len(lineas) - 1
+    # Las filas del plan funcional caen bajo las columnas de DÍA del calendario, así que se dejan
+    # fuera del autoajuste: si no, "h. computadas" ensancharía la columna del 3 de enero.
+    titulos.update(range(PF_HDR, PF1 + 1))
+    T_ID = f"$A${PF0}:$A${PF1}"
+    T_JOR = f"$J${PF0}:$J${PF1}"                          # columna 10 = h. jornada
+
+    # ---------------------------------------------------------------- #
+    #  Hoja Aux (oculta): banderas por día y semanas de plaza de localizado
+    # ---------------------------------------------------------------- #
+    aux = wb.create_sheet("Aux")
+    aux.cell(1, 1, "banderas por día y semanas de localizado; las usan las fórmulas del Cuadrante")
+    for j, d in enumerate(fechas):
+        aux.cell(2, COL_D0 + j, f"{d:%d/%m/%Y}")
+        aux.cell(3, COL_D0 + j, 1 if d.weekday() == 5 else 0)
+        aux.cell(4, COL_D0 + j, 1 if d.weekday() == 6 else 0)
+    aux.cell(3, 1, "sábado")
+    aux.cell(4, 1, "domingo")
+    F_CAL = {}
+    for i, c in enumerate(cals):
+        fr = 5 + i
+        F_CAL[c] = fr
+        aux.cell(fr, 1, f"festivo {c}")
+        for j, d in enumerate(fechas):
+            aux.cell(fr, COL_D0 + j, 1 if d in fes_cal[c] else 0)
+
+    # Semanas: peso de cada una (una semana de plaza de localizado computa JORNADA_LOCALIZADO_SEMANA
+    # entera; la que el horizonte parte por la mitad, su parte proporcional) y, por trabajador, en
+    # cuáles asume esa plaza. Es lo que hace que Excel cuente igual que `modelo.jornada_minutos`.
+    semanas = _semanas_de(fechas)
+    FILA_PESO = 5 + len(cals)
+    aux.cell(FILA_PESO, 1, "peso semana (h)")
+    for k, cols in enumerate(semanas):
+        aux.cell(FILA_PESO, 2 + k, _min(JORNADA_LOCALIZADO_SEMANA * min(7, len(cols)) / 7))
+    L_SN = get_column_letter(1 + len(semanas))
+    R_PESO = f"Aux!$B${FILA_PESO}:${L_SN}${FILA_PESO}"
+
+    loc = sorted(lineas_localizadas(datos))
+    lista_loc = "{" + ";".join(f'"{s}"' for s in loc) + "}"
+    aux_de: dict[str, int] = {}
+    for n, (trab, fr_cal) in enumerate(sorted(fila_de.items())):
+        fr = FILA_PESO + 1 + n
+        aux_de[trab] = fr
+        aux.cell(fr, 1, trab)
+        for k, cols in enumerate(semanas):
+            a, b = get_column_letter(COL_D0 + cols[0]), get_column_letter(COL_D0 + cols[-1])
+            aux.cell(fr, 2 + k, f"=IF(SUMPRODUCT(COUNTIF(Cuadrante!{a}{fr_cal}:{b}{fr_cal},"
+                                f"{lista_loc}))>0,1,0)" if loc else 0)
+    aux.sheet_state = "hidden"
+
+    # ---------------------------------------------------------------- #
+    #  Recuentos del trabajador, ya como FÓRMULAS
+    # ---------------------------------------------------------------- #
+    # La jornada de una plaza de localizado NO es la suma de sus turnos (ver
+    # modelo.JORNADA_LOCALIZADO_SEMANA): se descuenta lo que aportaron turno a turno y se suma la
+    # semana entera. Sin esa corrección, Excel y metricas_trabajadores.csv darían cifras distintas.
+    descuento = "".join(f'-{_min(datos.turnos[s].horas_consumo):.6f}*COUNTIF({{D}},"{s}")'
+                        for s in loc)
+    uvi_xl = _patrones_uvi(datos)
+    jornada_xl = {w: m / 60 for w, m in jornada_minutos(datos, asign, fechas).items()}
+
+    for trab, fr in fila_de.items():
+        D = f"{L_D0}{fr}:{L_DN}{fr}"
+        # AJUSTE pactado, sumado dentro de la fórmula de horas. Solo lo llevan los titulares de una
+        # rotación de localizado: cubrir su plaza el año entero salvo vacaciones ES su jornada
+        # completa por acuerdo con la empresa, aunque la cuenta del calendario dé otra cosa. Se suma
+        # como constante y no se recalcula, así que la celda sigue viva: si se les cambia un turno,
+        # la parte calculada se mueve y el pacto se mantiene.
+        t = datos.trabajadores[trab]
+        ajuste = (datos.config.horas_objetivo * t.factor_jornada - jornada_xl.get(trab, 0.0)
+                  if t.patron in uvi_xl else 0.0)
+        # `COUNTIF(lista_de_líneas, fila_de_días)` da un 1 por cada día en que la celda contiene una
+        # línea real y 0 en libres, vacaciones o texto suelto. Se usa esto y no MATCH porque MATCH
+        # sobre un rango solo devuelve vector si se introduce como fórmula matricial, y aquí tiene
+        # que funcionar tal cual la escribe el fichero.
+        pertenece = f"COUNTIF({T_ID},{D})"
+        formulas = [
+            f"=SUMPRODUCT(Aux!${L_D0}$3:${L_DN}$3,{pertenece})",
+            f"=SUMPRODUCT(Aux!${L_D0}$4:${L_DN}$4,{pertenece})",
+            # El festivo depende del CALENDARIO de la línea que se hace ese día (hay municipios con
+            # festivos propios), así que se suma un término por calendario contra sus líneas.
+            "=" + "+".join(
+                f"SUMPRODUCT(Aux!${L_D0}${F_CAL[c]}:${L_DN}${F_CAL[c]},"
+                f"COUNTIF($A${PF0 + tramo[0]}:$A${PF0 + tramo[-1]},{D}))"
+                for c, tramo in tramo_cal.items() if tramo),
+            f"=SUMPRODUCT(COUNTIF({D},{T_ID}),{T_JOR})"
+            f"+SUMPRODUCT(Aux!$B${aux_de[trab]}:${L_SN}${aux_de[trab]},{R_PESO})"
+            f"{descuento.format(D=D)}"
+            + (f"{ajuste:+.2f}" if abs(ajuste) > 0.005 else ""),
+        ]
+        for k, v in enumerate(formulas):
+            c = ws.cell(fr, COL_EXTRA + k, v)
+            c.alignment, c.border, c.font = centro, borde, negrita
+            if k == 3:
+                c.number_format = "0.0"
+
+    ws.cell(3, 1, f"Hoja VIVA: los recuentos de la derecha del calendario (sábados, domingos, "
+                  f"festivos y horas) son fórmulas que leen del PLAN FUNCIONAL de abajo. Escribe "
+                  f"una línea en una celda del calendario y se recalculan solos. Objetivo "
+                  f"{datos.config.horas_objetivo} h/año.").alignment = izq
+
+    _ajustar_anchos(ws, desde_fila=HDR, saltar=titulos | {PF_HDR - 1})
     ws.freeze_panes = "C5"                               # fija trabajador/tipo y la cabecera
     wb.save(SALIDA / "calendario.xlsx")
 
@@ -370,15 +542,24 @@ def _kpis_plan(datos: Datos, fechas: list[date], plan: dict, huecos: list, estad
     }
 
 
-def _carga_por_trabajador(datos: Datos, plan: dict) -> dict[str, dict]:
-    """Por trabajador: horas COMPUTADAS (legales), horas de CONSUMO (capacidad, localizados ×80/7),
-    y nº de findes y festivos trabajados. Base del report de equidad."""
+def _carga_por_trabajador(datos: Datos, plan: dict,
+                          fechas: list[date] | None = None) -> dict[str, dict]:
+    """Por trabajador: horas COMPUTADAS (legales), horas de JORNADA (la moneda del objetivo anual:
+    turno normal = horas_consumo, semana de plaza de localizado = semana entera; ver
+    modelo.jornada_minutos) y nº de findes y festivos trabajados. Base del report de equidad.
+
+    `fechas` = horizonte que se cuenta. El plan puede traer días de ANTES del 1 de enero (arranca el
+    lunes de esa semana, para que las semanas ISO estén completas) y esos son del año anterior."""
+    dentro = set(fechas) if fechas is not None else None
     carga = {w: {"comp": 0.0, "cons": 0.0, "finde": 0, "festivo": 0}
              for w in datos.trabajadores}
+    for w, minutos in jornada_minutos(datos, plan, fechas).items():
+        carga[w]["cons"] = minutos / 60
     for (w, f), s in plan.items():
+        if dentro is not None and f not in dentro:
+            continue
         t = datos.turnos[s]
         carga[w]["comp"] += t.horas
-        carga[w]["cons"] += t.horas_consumo
         if f.weekday() >= 5:
             carga[w]["finde"] += 1
         if datos.es_festivo(f, t.municipio):
@@ -400,21 +581,24 @@ def reporte_equidad(datos: Datos, fechas: list[date], plan: dict) -> None:
     sin grupo caen en '—' = pool global) muestra la dispersión de horas de CONSUMO y del nº de
     findes/festivos entre sus miembros — lo que el modelo intenta igualar. Los fijos van aparte
     (jornada cuadrada por retirada de días; deben rondar 1776 h computadas). Objetivo = 1776 h."""
-    from modelo import HORAS_OBJETIVO
-
-    carga = _carga_por_trabajador(datos, plan)
+    carga = _carga_por_trabajador(datos, plan, fechas)
+    uvi = _patrones_uvi(datos)
 
     # -- No-fijos: agrupados por grupo de equidad --------------------------- #
+    # Los TITULARES de una rotación de localizado quedan fuera: cubren su plaza el año entero salvo
+    # vacaciones y por acuerdo eso ES su jornada, computen sus turnos lo que computen. Compararlos
+    # con el resto solo ensuciaría la dispersión del grupo (ver _c9_jornada_anual).
     grupos: dict[str, list[str]] = defaultdict(list)
     for w, t in datos.trabajadores.items():
-        if t.tipo == "fijo":
+        if t.tipo == "fijo" or t.patron in uvi:
             continue
         grupos[t.grupo or "—"].append(w)
 
     print("\n" + "=" * 78)
-    print(f"EQUIDAD  (objetivo {HORAS_OBJETIVO} h/año · consumo = capacidad, localizado 24h ×80/7)")
+    print(f"EQUIDAD  (objetivo {datos.config.horas_objetivo} h/año · jornada = ocupación: localizado 24h ×80/7, "
+          f"semana de plaza localizada = semana entera)")
     print("=" * 78)
-    print(f"{'grupo':<10} {'n':>3}  {'horas consumo':<24} {'findes':<20} {'festivos'}")
+    print(f"{'grupo':<10} {'n':>3}  {'horas jornada':<24} {'findes':<20} {'festivos'}")
     print("-" * 78)
     for gid in sorted(grupos):
         miembros = grupos[gid]
@@ -424,35 +608,62 @@ def reporte_equidad(datos: Datos, fechas: list[date], plan: dict) -> None:
         print(f"{gid:<10} {len(miembros):>3}  {_resumen(cons):<24} "
               f"{_resumen(fin):<20} {_resumen(fes)}")
 
+    # -- Titulares de localizado: fuera de la equidad, jornada dada por acuerdo -- #
+    titulares = sorted(w for w, t in datos.trabajadores.items() if t.patron in uvi)
+    if titulares:
+        print("-" * 78)
+        print(f"Localizado 24h (rotación completa = {datos.config.horas_objetivo} h por acuerdo; "
+              f"no entran en la equidad):")
+        for w in titulares:
+            c = carga[w]
+            print(f"  {w:<12} {datos.trabajadores[w].patron:<12} computadas={c['comp']:>6.0f} h   "
+                  f"findes={c['finde']:<3} festivos={c['festivo']}")
+
     # -- Fijos: horas computadas (deben rondar 1776) ------------------------ #
     fijos = [w for w, t in datos.trabajadores.items() if t.tipo == "fijo"]
     if fijos:
         print("-" * 78)
-        print(f"Fijos (horas COMPUTADAS, deben rondar {HORAS_OBJETIVO}):")
+        print(f"Fijos (horas COMPUTADAS, deben rondar {datos.config.horas_objetivo}):")
         for w in sorted(fijos):
             c = carga[w]
             print(f"  {w:<12} {c['comp']:>6.0f} h   findes={c['finde']:<3} festivos={c['festivo']}")
 
-    # -- No-fijos más alejados de 1776 en consumo --------------------------- #
-    desv = sorted(((abs(carga[w]["cons"] - HORAS_OBJETIVO), w)
+    # -- No-fijos más alejados de 1776 en jornada --------------------------- #
+    desv = sorted(((abs(carga[w]["cons"] - datos.config.horas_objetivo), w)
                    for g in grupos.values() for w in g), reverse=True)[:8]
     if desv:
         print("-" * 78)
-        print(f"No-fijos más alejados de {HORAS_OBJETIVO} (consumo):")
+        print(f"No-fijos más alejados de {datos.config.horas_objetivo} (jornada):")
         for _, w in desv:
             c = carga[w]
-            print(f"  {w:<12} {datos.trabajadores[w].tipo:<10} consumo={c['cons']:>6.0f}  "
-                  f"computadas={c['comp']:>6.0f}  (Δ{c['cons']-HORAS_OBJETIVO:+.0f})")
+            print(f"  {w:<12} {datos.trabajadores[w].tipo:<10} jornada={c['cons']:>6.0f}  "
+                  f"computadas={c['comp']:>6.0f}  (Δ{c['cons']-datos.config.horas_objetivo:+.0f})")
     print("=" * 78)
 
 
-def metricas_trabajadores(datos: Datos, plan: dict) -> list[dict]:
-    """Por trabajador: nº de turnos en SÁBADO, DOMINGO y FESTIVO, y horas COMPUTADAS totales.
+def metricas_trabajadores(datos: Datos, plan: dict,
+                          fechas: list[date] | None = None) -> list[dict]:
+    """Por trabajador: nº de turnos en SÁBADO, DOMINGO y FESTIVO, y horas de JORNADA totales.
     Las tres cuentas de día son INDEPENDIENTES (un turno en festivo que caiga en sábado/domingo
-    suma en las dos columnas que le apliquen). Escribe data/output/metricas_trabajadores.csv
-    (una fila por trabajador) y devuelve las filas para el resumen por consola."""
+    suma en las dos columnas que le apliquen). `fechas` acota lo que se cuenta al año que se
+    entrega: el plan trae también los días del año anterior con que arranca la primera semana ISO.
+
+    `horas_totales` es la jornada frente al objetivo anual, no la suma de horas legales de los
+    turnos: una semana de plaza de LOCALIZADO computa entera (ver modelo.jornada_minutos), porque
+    quien la asume se lleva también sus descansos y no hace nada más. Y el TITULAR de una rotación
+    de localizado sale directamente al objetivo: cubrir su plaza el año entero salvo vacaciones es,
+    por acuerdo, su jornada completa.
+
+    Escribe data/output/metricas_trabajadores.csv (una fila por trabajador) y devuelve las filas
+    para el resumen por consola."""
+    uvi = _patrones_uvi(datos)
+    dentro = set(fechas) if fechas is not None else None
     m = {w: {"sab": 0, "dom": 0, "fes": 0, "horas": 0.0} for w in datos.trabajadores}
+    for w, minutos in jornada_minutos(datos, plan, fechas).items():
+        m[w]["horas"] = minutos / 60
     for (w, f), s in plan.items():
+        if dentro is not None and f not in dentro:
+            continue
         t = datos.turnos[s]
         if f.weekday() == 5:
             m[w]["sab"] += 1
@@ -460,14 +671,14 @@ def metricas_trabajadores(datos: Datos, plan: dict) -> list[dict]:
             m[w]["dom"] += 1
         if datos.es_festivo(f, t.municipio):
             m[w]["fes"] += 1
-        m[w]["horas"] += t.horas
 
     filas = []
     for w, t in datos.trabajadores.items():
+        horas = (datos.config.horas_objetivo * t.factor_jornada) if t.patron in uvi else m[w]["horas"]
         filas.append({
             "id_trab": w, "tipo": t.tipo, "grupo": t.grupo or (t.patron or ""),
             "sabados": m[w]["sab"], "domingos": m[w]["dom"], "festivos": m[w]["fes"],
-            "horas_totales": round(m[w]["horas"]),
+            "horas_totales": round(horas),
         })
     filas.sort(key=lambda r: (r["tipo"], r["grupo"], r["id_trab"]))
 
@@ -495,11 +706,10 @@ def metricas_trabajadores(datos: Datos, plan: dict) -> list[dict]:
 
     # Aviso de tope: si alguien supera el tope anual duro, el plan NO es válido — casi siempre
     # significa que una ventana del rodante se resolvió sin solución y se cosieron valores basura.
-    from modelo import HORAS_OBJETIVO
     excedidos = [(r["id_trab"], r["horas_totales"],
-                  round(HORAS_OBJETIVO * datos.trabajadores[r["id_trab"]].factor_jornada))
+                  round(datos.config.horas_objetivo * datos.trabajadores[r["id_trab"]].factor_jornada))
                  for r in filas
-                 if r["horas_totales"] > HORAS_OBJETIVO * datos.trabajadores[r["id_trab"]].factor_jornada]
+                 if r["horas_totales"] > datos.config.horas_objetivo * datos.trabajadores[r["id_trab"]].factor_jornada]
     if excedidos:
         print(f"\n*** AVISO: {len(excedidos)} trabajador(es) SUPERAN el tope anual ***")
         for w, h, tope in sorted(excedidos, key=lambda x: -x[1]):
@@ -545,7 +755,7 @@ def generar_anual(datos: Datos, fechas: list[date], plan: dict,
         peor = sorted(por_dia.items(), key=lambda kv: -kv[1])[:5]
         print("Días con más huecos prioritarios: " + ", ".join(f"{d:%d/%m}:{n}" for d, n in peor))
     reporte_equidad(datos, fechas, plan)
-    metricas_trabajadores(datos, plan)
+    metricas_trabajadores(datos, plan, fechas)
     print(f"\nFicheros en {SALIDA.relative_to(RAIZ)}/: calendario.xlsx · "
           f"metricas_trabajadores.csv · informe_cobertura.csv")
 
@@ -555,7 +765,8 @@ if __name__ == "__main__":
     # mes se decide en un único modelo, para ver hasta dónde llega el solver en
     # un tiempo razonable. Para producción (año completo) usar resolver_anual.
     datos = cargar("data/input")
-    inicio, fin = date(2026, 1, 1), date(2026, 1, 31)
+    anio = datos.config.anio
+    inicio, fin = date(anio, 1, 1), date(anio, 1, 31)
     fechas = rango_fechas(inicio, fin)
     modelo = Modelo(datos, fechas)
     solver, estado = modelo.resolver(trabajadores_cpu=16, log=True)

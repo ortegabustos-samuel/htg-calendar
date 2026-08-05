@@ -7,29 +7,39 @@ restricciones duras
 from __future__ import annotations
 
 import sys
-from collections import defaultdict
+from collections import Counter, defaultdict
 from datetime import date, timedelta, time, datetime
 
 from cargar_datos import DIAS, DATA, LIBRE, Datos, Turno, cargar
 
 from ortools.sat.python import cp_model
 
-FECHA_INI = date(2026, 1, 1)
-FECHA_FIN = date(2026, 1, 31)
+# Los parámetros LEGALES y el AÑO no viven aquí: son de la instancia, no del problema. Están en
+# `<datos>/config.toml` y llegan por `datos.config` (ver cargar_datos.Config):
+#   config.horas_objetivo — jornada anual objetivo (h). Techo de TODO lo que no sea cubrir: la
+#       equidad apunta ahí, las cesiones de bloque aterrizan por debajo y el relleno de refuerzos
+#       (rellenar_refuerzos) para en seco al llegar. (Antes el tope era 1826 y por eso media
+#       plantilla derivaba a 1808-1834.)
+#   config.rmin   — descanso mínimo entre jornadas (h)                     — C4
+#   config.hmax7  — máx. trabajo efectivo por semana ISO (h)               — C6
+#   config.cmax   — máx. días trabajados por semana ISO (tope general)     — C5
+#   config.cmax_pool — el mismo tope para la plantilla FLEXIBLE (correturnos y mixtos)
+# Estaban duplicados aquí y en diagnostico.py, así que el diagnóstico podía juzgar viable un
+# dataset con un objetivo distinto del que luego aplicaba el modelo.
 
-# Parámetros legales (V Convenio CyL)
-RMIN = 12          # descanso mínimo entre jornadas (h)                    — C4
-HMAX7 = 48         # máx. trabajo efectivo por semana ISO (h)              — C6
-# Jornada anual objetivo. Es el techo de TODO lo que no sea cubrir: la equidad apunta aquí, las
-# cesiones de bloque aterrizan por debajo y el relleno de refuerzos (rellenar_refuerzos) para en seco
-# al llegar. (Antes el tope era 1826 y por eso media plantilla derivaba a 1808-1834.)
-HORAS_OBJETIVO = 1776
-CMAX = 6           # máx. días trabajados por semana ISO (tope general) — C5
+# Jornada que COMPUTA una SEMANA de plaza de LOCALIZADO 24h asumida entera (h). Es la unidad en que
+# se contabiliza esa plaza para el objetivo anual, y no la suma de sus turnos, por dos motivos:
+#  · quien la cubre se lleva la plaza CON sus descansos (_handover_critico): esa semana no hace
+#    NINGÚN otro turno, así que es una semana de trabajo completa aunque la rotación solo le ponga
+#    2 turnos (la fila corta libra miércoles y jueves; la larga son 5);
+#  · sus turnos computan 8 h LEGALES cada uno, que es lo que exige el convenio, pero no describe lo
+#    que la plaza ocupa: sumándolos, el cubridor de una semana corta aparecía con 16 h "trabajadas"
+#    y el libro anual le reclamaba el resto en otras semanas -> acababa trabajando de más.
+# El titular de la rotación queda igualmente FUERA del libro anual (ver _c9_jornada_anual): cubre su
+# año entero salvo vacaciones y por acuerdo eso ES su jornada.
+JORNADA_LOCALIZADO_SEMANA = 40
 
-# Tope de días por semana para la plantilla FLEXIBLE (correturnos y mixtos)
-CMAX_POOL = 5
-
-# Cap PRORRATEADO (dos funciones a la vez): además del tope anual duro (HORAS_OBJETIVO), la jornada acumulada
+# Cap PRORRATEADO (dos funciones a la vez): además del tope anual duro (config.horas_objetivo), la jornada acumulada
 # de cada NO-fijo hasta el fin de cada ventana se limita al ritmo lineal hacia el OBJETIVO 1776
 # (prorrateado por días disponibles transcurridos) + COLCHON_PACE_H. Efecto doble: (a) anti
 # front-loading → nadie agota horas antes de diciembre (mata el acantilado, reparte huecos homogéneo);
@@ -42,7 +52,7 @@ COLCHON_PACE_H = 24
 # p.ej. una quincena de noche = 77 h): sin colchón el cap se incumpliría desde la primera semana (su
 # rotación va por encima del ritmo de 1776 SIEMPRE, y no pueden recortar horas sueltas para seguirlo).
 # ~Media unidad de cesión permite oscilar alrededor del ritmo y ceder cuando toca. El tope anual duro
-# (HORAS_OBJETIVO) sigue mandando al final del año.
+# (config.horas_objetivo) sigue mandando al final del año.
 COLCHON_NOCHE_H = 40
 # Coste, dentro del CALENDARIO DE CESIONES (Nivel 0), de librar un bloque en un ciclo tenso: se paga
 # por cada punto porcentual que la carga por persona de ese ciclo supera la media del horizonte. Un
@@ -135,6 +145,14 @@ PESO_JORNADA = {"patron": 2, "mixto": 2, "correturno": 1}
 # y libres, porque desviar a cualquiera de su patrón costaba casi nada frente al valor de cobertura.
 PESO_DEV = 100
 
+# ...salvo cuando lo que la rotación prescribe ese día es un COMODÍN (REF CAL): entonces desviarse
+# cuesta esto y no PESO_DEV. Un refuerzo no es una posición que defender —es relleno de prioridad 0,
+# no responde a ninguna demanda—, así que protegerlo por encima de cubrir un turno real (10 por
+# unidad de prioridad) era una asimetría no buscada: el modelo dejaba huecos teniendo ese día a
+# alguien capacitado haciendo un refuerzo prescrito. Sigue siendo >0 para que el refuerzo se haga
+# siempre que no estorbe: soltarlo tiene que COMPRARSE con cobertura, nunca salir gratis.
+PESO_DEV_COMODIN = 1
+
 # Etapa 4 (nivel bajo): "vale" de quitarle un día a un fijo. Pequeño, solo para que no retire días
 # gratis: retira únicamente cuando baja el exceso de horas sobre el objetivo (1776). << horas/día.
 PESO_RETIRA = 1
@@ -165,6 +183,50 @@ def semana(f: date) -> tuple[int, int]:
     return (a, n)
 
 
+def lineas_localizadas(datos: Datos) -> set[str]:
+    """Líneas de los patrones UVI (localizado 24h): las únicas que se ceden como PLAZA ENTERA con
+    sus descansos (_handover_critico) y, por tanto, las únicas que computan por SEMANA y no por
+    turno (ver JORNADA_LOCALIZADO_SEMANA)."""
+    return {s for p in _patrones_uvi(datos)
+            for fila in datos.patrones.get(p, []) for s in fila.values()
+            if s and s != LIBRE and s in datos.turnos}
+
+
+def jornada_minutos(datos: Datos, plan: dict[tuple[str, date], str],
+                    fechas: list[date] | None = None) -> dict[str, int]:
+    """Minutos de JORNADA de cada trabajador en `plan`, en la moneda del LIBRO ANUAL (la del
+    objetivo 1776) — que NO es la de la jornada legal:
+
+      · turno normal            -> horas_consumo (= horas computadas salvo localizados);
+      · SEMANA con localizado   -> JORNADA_LOCALIZADO_SEMANA fija, sean 2 turnos o 5.
+
+    `fechas` = horizonte que se CONTABILIZA. Manda en dos cosas: solo cuentan los días que estén en
+    él —lo de fuera es de otro libro: el plan arranca el lunes de la semana del 1 de enero, y esos
+    días de diciembre son jornada del año ANTERIOR, ya cerrada— y la semana que quede CORTADA por su
+    borde se prorratea (la última del año, o el corte de una ventana). Si es None, cuenta todo el
+    plan y toda semana tocada entera.
+
+    La jornada LEGAL (`Turno.horas`, 8 h por localizado) sigue siendo la de C4/C5/C6 y no se toca
+    aquí: son dos contabilidades distintas a propósito. Y ojo, esas dos SÍ miran los días de fuera
+    del libro: la semana del 29 de diciembre es una semana ISO real y sus topes se cuentan enteros.
+    """
+    loc = lineas_localizadas(datos)
+    dentro = set(fechas) if fechas is not None else None
+    dias_sem = Counter(semana(f) for f in fechas) if fechas is not None else None
+    porsem: dict[tuple[str, tuple[int, int]], list[str]] = defaultdict(list)
+    for (w, f), s in plan.items():
+        if s in datos.turnos and (dentro is None or f in dentro):
+            porsem[(w, semana(f))].append(s)
+    mins: dict[str, int] = defaultdict(int)
+    for (w, sm), turnos in porsem.items():
+        if any(s in loc for s in turnos):
+            n = min(7, dias_sem.get(sm, 7)) if dias_sem is not None else 7
+            mins[w] += round(JORNADA_LOCALIZADO_SEMANA * 60 * n / 7)
+            turnos = [s for s in turnos if s not in loc]   # por si el handover no aplicara
+        mins[w] += sum(round(datos.turnos[s].horas_consumo * 60) for s in turnos)
+    return dict(mins)
+
+
 def carga_diaria(datos: Datos, fechas: list[date]) -> dict[date, float]:
     """Horas de demanda que le tocan a CADA persona disponible ese día.
 
@@ -192,9 +254,16 @@ class Modelo:
                  objetivo_horas_fijo: dict[str, int] | None = None,
                  tope_paced: dict[str, int] | None = None,
                  cesiones: set[tuple[str, int]] | None = None,
-                 ancla_patron: date | None = None):
+                 ancla_patron: date | None = None,
+                 desde: date | None = None):
         self.datos = datos
         self.fechas = fechas
+        # Primer día que cuenta para el LIBRO ANUAL de jornada (C9, cap prorrateado y equidad de
+        # horas). El horizonte arranca el LUNES de la semana del 1 de enero para que las semanas ISO
+        # estén completas, pero esos días de diciembre son jornada del año anterior y su libro está
+        # cerrado: se trabajan y cuentan para lo LEGAL (C5/C6/C7, que miran la semana real), no para
+        # las 1776 de este año. Si es None, cuenta todo el horizonte.
+        self.desde = desde
         self.m = cp_model.CpModel()
         # Ancla GLOBAL de la rotación de patrones: fecha fija (misma para todas las ventanas del
         # horizonte) desde la que se cuenta la semana de rotación. IMPRESCINDIBLE que sea global: si se
@@ -246,6 +315,14 @@ class Modelo:
             s for p in (self.patrones_noche | self.patrones_uvi)
             for fila in datos.patrones.get(p, []) for s in fila.values()
             if s and s != LIBRE and s in datos.turnos}
+        # Subconjunto LOCALIZADO (solo UVI): además de arrastrar los descansos, computa por SEMANA
+        # entera en el libro anual (ver JORNADA_LOCALIZADO_SEMANA y _minutos_jornada). Las noches no:
+        # sus turnos computan 11 h reales cada uno y sumarlos ya describe bien la carga.
+        self.lineas_uvi: set[str] = {
+            s for p in self.patrones_uvi
+            for fila in datos.patrones.get(p, []) for s in fila.values()
+            if s and s != LIBRE and s in datos.turnos}
+        self._cubre_loc: dict[tuple[str, tuple[int, int]], object] = {}   # cache de _minutos_jornada
 
         #Conjunto de las variables del modelo x_trab_fecha_turno
         self.x: dict[tuple[str, date, str], cp_model.BoolVar] = {} 
@@ -340,7 +417,7 @@ class Modelo:
 
     
     def _c4_descanso(self) -> None:
-        """Descanso >= RMIN horas entre el turno de un día y el del siguiente. DURA para todos, con una
+        """Descanso >= config.rmin horas entre el turno de un día y el del siguiente. DURA para todos, con una
         salvedad: los encadenamientos que la propia rotación PACTADA del trabajador contiene
         (_pares_pactados), porque los localizados 24h (22:00→22:00) los exige su diseño. Cualquier otro
         encadenamiento —en particular al salir de la rotación para cubrir otra línea— sí exige las
@@ -377,11 +454,11 @@ class Modelo:
     def _pares_incompatibles(self) -> set[tuple[str, str]]:
         """
         Devuelve pares (s1, s2) no encadenables en días consecutivos
-        porque dejan menos de RMIN horas de descanso.
+        porque dejan menos de config.rmin horas de descanso.
         """
         base = date(2000, 1, 1)
         dia_siguiente = base + timedelta(days=1)
-        descanso_minimo = timedelta(hours=RMIN)
+        descanso_minimo = timedelta(hours=self.datos.config.rmin)
 
         incompatibles = set()
 
@@ -436,7 +513,7 @@ class Modelo:
         """Días trabajados por SEMANA ISO (lunes-domingo), NO ventana deslizante: un tramo puede cruzar
         el domingo→lunes y se cuenta por separado en cada semana. Solo semanas completas (7 días); las
         ventanas del rodante son 2 semanas ISO completas, así que el conteo es limpio.
-        El tope es POR TRABAJADOR (ver _tope_dias_semana): CMAX_POOL=5 para la plantilla flexible, y
+        El tope es POR TRABAJADOR (ver _tope_dias_semana): config.cmax_pool para la plantilla flexible, y
         para los de patrón el máximo que su propia rotación pactada exige. Aplica a todos, también a
         los de patrón: su rotación lo cumple por construcción y así queda acotado el que sale de ella
         a cubrir, que es quien acumulaba rachas largas."""
@@ -450,17 +527,28 @@ class Modelo:
                 self.m.add(sum(self.trabaja[(trab, f)] for f in dias) <= tope)
 
     def _tope_dias_semana(self, trab: str) -> int:
-        """Días máximos por semana ISO de este trabajador. Correturnos, mixtos y fijos: CMAX_POOL (5).
-        Los de patrón: lo que exija su rotación pactada (nunca menos de CMAX_POOL, nunca más de CMAX),
+        """Días máximos por semana ISO de este trabajador. Correturnos, mixtos y fijos: config.cmax_pool.
+        Los de patrón: lo que exija su rotación pactada (nunca menos de cmax_pool, nunca más de cmax),
         para no romper un cuadrante que la empresa ya tiene acordado."""
         t = self.datos.trabajadores[trab]
         filas = self.datos.patrones.get(t.patron or "") if t.tipo == "patron" else None
+        cfg = self.datos.config
         if not filas:
-            return CMAX_POOL
+            return cfg.cmax_pool
         propio = max(sum(1 for dia in DIAS
                          if fila.get(dia) and fila.get(dia) != LIBRE and fila.get(dia) in self.datos.turnos)
                      for fila in filas)
-        return min(CMAX, max(CMAX_POOL, propio))
+        return min(cfg.cmax, max(cfg.cmax_pool, propio))
+
+    def _dias_decision(self, libro: bool = False) -> list[date]:
+        """Días que DECIDE esta ventana (fuera la cola, que ya está resuelta y congelada).
+
+        Con `libro=True`, además solo los que cuentan para el LIBRO DEL AÑO (>= self.desde): la
+        primera ventana arranca el lunes anterior al 1 de enero para tener semanas ISO completas, y
+        esos días son jornada del año anterior. Lo LEGAL (C5/C6/C7) sí los cuenta —son días reales de
+        una semana real—, así que esos límites usan la lista sin filtrar."""
+        return [f for f in self.fechas
+                if f not in self.cola and not (libro and self.desde and f < self.desde)]
 
     def _minutos(self, trab: str, dias: list[date]) -> list:
         """Términos horas(s)*x (en minutos efectivos COMPUTABLES = jornada legal) del trabajador en
@@ -476,6 +564,47 @@ class Modelo:
         return [round(self.datos.turnos[s].horas_consumo * 60) * self.x[(trab, f, s)]
                 for f in dias for s in self.turnos_wd.get((trab, f), [])]
 
+    def _cubre_localizado(self, trab: str, sem_: tuple[int, int], loc: list):
+        """Bool: ¿asume `trab` una plaza de localizado en la semana ISO `sem_`? OR exacto sobre sus
+        variables de línea UVI. Cacheado: C9 y la equidad de jornada piden el mismo bool."""
+        v = self._cubre_loc.get((trab, sem_))
+        if v is None:
+            v = self.m.new_bool_var(f"cubre_loc_{trab}_{sem_[0]}w{sem_[1]}")
+            self.m.add_max_equality(v, loc)
+            self._cubre_loc[(trab, sem_)] = v
+        return v
+
+    def _minutos_jornada(self, trab: str, dias: list[date], solo_reales: bool = False) -> list:
+        """Términos de JORNADA del trabajador en esos días, en la moneda del LIBRO ANUAL (objetivo
+        1776) — la misma que `jornada_minutos` aplica sobre un plan ya resuelto:
+
+          · turno normal          -> horas_consumo(s)·x;
+          · SEMANA con localizado -> JORNADA_LOCALIZADO_SEMANA·cubre_localizado, un único término
+            por semana ISO, independiente de cuántos turnos ponga la rotación (2 o 5). Prorrateado
+            si la semana está cortada por el borde de la ventana.
+
+        NO es la jornada legal: esa la da `_minutos` (8 h por localizado) y es la que gobierna C5,
+        C6 y C7. Aquí se mide lo que la plaza OCUPA, que es lo que el objetivo anual reparte.
+
+        `solo_reales` deja fuera los turnos COMODÍN (prioridad 0): lo necesita la equidad de jornada
+        (ver _desviacion_jornada), no el tope duro."""
+        porsem: dict[tuple[int, int], list[date]] = defaultdict(list)
+        for f in dias:
+            porsem[semana(f)].append(f)
+        terminos = []
+        for sem_, fs in porsem.items():
+            loc = [self.x[(trab, f, s)] for f in fs
+                   for s in self.turnos_wd.get((trab, f), []) if s in self.lineas_uvi]
+            if loc:
+                minutos = round(JORNADA_LOCALIZADO_SEMANA * 60 * len(fs) / 7)
+                terminos.append(minutos * self._cubre_localizado(trab, sem_, loc))
+            terminos.extend(
+                round(self.datos.turnos[s].horas_consumo * 60) * self.x[(trab, f, s)]
+                for f in fs for s in self.turnos_wd.get((trab, f), [])
+                if s not in self.lineas_uvi
+                and not (solo_reales and self.datos.turnos[s].prioridad == 0))
+        return terminos
+
     def _c6_horas_semana(self) -> None:
         """<= 48 h de trabajo efectivo por SEMANA ISO (lunes-domingo), NO ventana deslizante (igual
         criterio que C5). Solo semanas completas. Aplica a TODOS: ninguna rotación pactada pasa de
@@ -489,7 +618,7 @@ class Modelo:
             for dias in semanas:
                 minutos = self._minutos(trab, dias)
                 if minutos:
-                    self.m.add(sum(minutos) <= HMAX7 * 60)
+                    self.m.add(sum(minutos) <= self.datos.config.hmax7 * 60)
 
     def _c7_descanso_semanal(self) -> None:
         """Descanso semanal (art. 24), parte (b): al menos un sábado+domingo libres en cada
@@ -680,7 +809,11 @@ class Modelo:
         —única razón admitida—. Al ser BLANDA (no dura) nunca vuelve infactible una costura de
         rotación o un festivo donde la línea no opera: simplemente lo absorbe como desvío. Quedan
         FUERA (sin variable, no penalizan): vacaciones, festivos sin operatividad de la línea, o
-        sin capacidad ese día. Devuelve (suma_desvío, cota)."""
+        sin capacidad ese día.
+
+        El desvío va YA PONDERADO (PESO_DEV, o PESO_DEV_COMODIN si lo prescrito es un REF CAL): un
+        refuerzo prescrito se suelta en cuanto con ello se cubre un turno real de ese día, mientras
+        que una línea de verdad sigue costando 100. Devuelve (suma_desvío_ponderado, cota)."""
         devs, cota = [], 0
         for (w, f), turno in self.prescripcion.items():
             if self.datos.trabajadores[w].patron in self.patrones_noche:
@@ -690,8 +823,9 @@ class Modelo:
             var = self.x.get((w, f, turno))
             if var is None:
                 continue                # vacaciones / no opera / sin capacidad -> sin fijación
-            devs.append(1 - var)        # 1 si el trabajador NO hace su turno de rotación
-            cota += 1
+            peso = (PESO_DEV_COMODIN if self.datos.turnos[turno].prioridad == 0 else PESO_DEV)
+            devs.append(peso * (1 - var))    # cuesta `peso` si el trabajador NO hace su turno
+            cota += peso
         return sum(devs), cota
 
 
@@ -752,7 +886,7 @@ class Modelo:
             entre "uno se pasa 6" y "seis se pasan 1"; el rango no, y evita que alguien acabe con 12
             domingos y otro con 3. Es lineal, a diferencia de una L2 que pediría variables producto.
         Devuelve (desviaciones por métrica, cota_p2)."""
-        dias = [f for f in self.fechas if f not in self.cola]     # solo la ventana, no la cola
+        dias = self._dias_decision(libro=True)   # ventana, sin la cola y sin los días del año anterior
         desviaciones: dict[str, list[cp_model.IntVar]] = {m: [] for m in METRICAS}
         cota_p2 = 0
 
@@ -802,22 +936,30 @@ class Modelo:
 
     # -- C9: jornada anual (tope duro + pacing blando) ----------------------- #
     def _c9_jornada_anual(self) -> None:
-        """C9 (DURA): la jornada anual no supera HORAS_OBJETIVO. 1776 es el límite legal y no se pasa
+        """C9 (DURA): la jornada anual no supera config.horas_objetivo, que es el límite legal y no se pasa
         ni una hora, tampoco para cubrir un turno que fuera a quedar vacío. Libro de
         horas acumuladas: minutos previos (offset_horas) + los de esta ventana <= tope. Guarda los
         términos de minutos por NO-fijo para la equidad de horas (P_horas). Los fijos también topan
         (antes estaban fuera → un fijo podía superar el tope en silencio), pero NO entran en
         _min_ventana: su jornada la cuadra _retirada_fijos quitando días (Etapa 4). Los UVI quedan
-        FUERA por completo: trabajan su rotación todo el año y sus contadores no son relevantes."""
-        dias = [f for f in self.fechas if f not in self.cola]     # solo la ventana
+        FUERA por completo: trabajan su rotación todo el año y por acuerdo eso ES su jornada de 1776,
+        computen sus turnos lo que computen.
+
+        Se mide en minutos de JORNADA (_minutos_jornada), no de jornada legal: el tope y la equidad
+        de horas tienen que hablar el MISMO idioma. Cuando C9 contaba las 8 h legales del localizado
+        y la equidad contaba su ocupación real, el cubridor de una plaza de localizado quedaba corto
+        para el tope duro y el modelo le seguía cargando turnos hasta llegar a 1776 de papel: en la
+        práctica trabajaba semanas de más. Como la jornada de ocupación es siempre >= la legal,
+        toparla en 1776 sigue garantizando el límite del convenio."""
+        dias = self._dias_decision(libro=True)                     # solo la ventana, y solo este año
         self._min_ventana: dict[str, list] = {}
         for w, t in self.datos.trabajadores.items():
             if t.patron in self.patrones_uvi:
                 continue        # UVI: fuera de la contabilidad de horas (ver docstring de la clase)
-            terminos = self._minutos(w, dias)
+            terminos = self._minutos_jornada(w, dias)
             if not terminos:
                 continue                                          # no puede trabajar en la ventana
-            tope_min = round(HORAS_OBJETIVO * t.factor_jornada * 60)   # escalado por reducción de jornada
+            tope_min = round(self.datos.config.horas_objetivo * t.factor_jornada * 60)   # escalado por reducción de jornada
             off = self.offset_horas.get(w, 0)                     # <= tope por invariante del libro
             cap = tope_min
             paced = self.tope_paced.get(w)                        # cap prorrateado (anti front-loading, no-fijos)
@@ -830,17 +972,18 @@ class Modelo:
                 self._min_ventana[w] = terminos
 
     def _desviacion_jornada(self) -> tuple[object, int]:
-        """P_horas (BLANDA, EQUIDAD): penaliza que los minutos de CONSUMO de la ventana se desvíen del
-        objetivo prorrateado (objetivo_horas[w], derivado de HORAS_OBJETIVO=1776) por DEBAJO o
-        por ENCIMA (desviación absoluta, simétrica). Se mide sobre CONSUMO (no computado): un
-        localizado 24h consume ≈11.43 h por su naturaleza aunque compute 8 → así no arrastra un
-        falso déficit de horas. Reparte la jornada de forma pareja a lo largo del año y evita que
+        """P_horas (BLANDA, EQUIDAD): penaliza que los minutos de JORNADA de la ventana se desvíen del
+        objetivo prorrateado (objetivo_horas[w], derivado de config.horas_objetivo) por DEBAJO o
+        por ENCIMA (desviación absoluta, simétrica). Se mide en JORNADA (_minutos_jornada), no en
+        horas computadas: un localizado 24h ocupa más que sus 8 h legales y una SEMANA de plaza de
+        localizado ocupa la semana entera → así no arrastra un falso déficit de horas que el modelo
+        intentaría compensar cargándole turnos. Reparte la jornada de forma pareja a lo largo del año y evita que
         nadie derive hacia el tope duro. Va al nivel bajo (desempate): solo actúa cuando no
         cuesta cobertura ni equidad de findes. Fijos fuera (su jornada se cuadra por retirada de
         días, Etapa 4). Devuelve (Σ|desv|, cota).
         Nota: exceso y déficit pesan IGUAL (|·|). Si se quisiera penalizar más suave el exceso,
         separar en dos variables (déficit / exceso) con pesos distintos."""
-        dias = [f for f in self.fechas if f not in self.cola]
+        dias = self._dias_decision(libro=True)
         max_turno_min = max((round(t.horas_consumo * 60) for t in self.datos.turnos.values()), default=0)
         max_min = len(dias) * max_turno_min                       # cota superior de minutos de consumo
         desvs, cota = [], 0
@@ -854,9 +997,7 @@ class Modelo:
             # que hace falta para cubrir el pico de vacaciones (medido: absorbían 7.136 h, más que
             # todo el sobrante del año, y dejaban a la plantilla pegada al tope en agosto). El relleno
             # se hace al final, con lo que realmente sobre (ver rellenar_refuerzos).
-            terminos = [t for f in dias for s in self.turnos_wd.get((w, f), [])
-                        if self.datos.turnos[s].prioridad > 0
-                        for t in [round(self.datos.turnos[s].horas_consumo * 60) * self.x[(w, f, s)]]]
+            terminos = self._minutos_jornada(w, dias, solo_reales=True)
             desv = self.m.new_int_var(0, cota_w, f"desvh_{w}")
             self.m.add_abs_equality(desv, sum(terminos) - objetivo)
             peso = PESO_JORNADA.get(self.datos.trabajadores[w].tipo, 1)
@@ -875,13 +1016,16 @@ class Modelo:
         vez alcanzado/superado el ritmo se vuelve barato cederla (exceso barato → sí puede entonces).
         El tope anual lo garantiza C9 aparte, independiente de este peso. Devuelve (Σ costes,
         cota)."""
-        dias = [f for f in self.fechas if f not in self.cola]
+        dias = self._dias_decision(libro=True)
         costes, cota = [], 0
         for w in self.fijos_activos:
             objetivo_cum = self.objetivo_horas_fijo.get(w)
             if objetivo_cum is None:
                 continue
-            terminos = self._minutos(w, dias)                     # = Σ min(phi)·(1 − retira)
+            # Jornada, para hablar el mismo idioma que offset_horas/objetivo_horas_fijo. Para un fijo
+            # coincide con la legal (su línea es un turno normal de <=8 h, nunca un localizado), pero
+            # dejarlo explícito evita mezclar monedas en la misma ecuación.
+            terminos = self._minutos_jornada(w, dias)             # = Σ min(phi)·(1 − retira)
             if not terminos:
                 continue
             max_win = len(dias) * max((round(s.horas * 60) for s in self.datos.turnos.values()), default=0)
@@ -1033,7 +1177,7 @@ class Modelo:
         mixto (los dos desempates comparten el nivel más bajo para no inflar la torre de pesos)."""
         p1 = self._coste_cobertura()
         p_exceso, _ = self._exceso_semanal()               # 6 días seguidos dentro de una semana
-        p_dev, _ = self._fijacion_patron()                 # desvío del patrón (fijación blanda)
+        p_dev, _ = self._fijacion_patron()                 # desvío del patrón (ya ponderado por PESO_DEV)
         desviaciones, max_p2 = self._equidad_ponderada()   # cota_p2 exacta (incluye offset)
         self.desviaciones = desviaciones                  # expuesto para el resumen tras resolver
         p2 = sum(LAMBDA[metrica] * sum(vars_desv) for metrica, vars_desv in desviaciones.items())
@@ -1055,7 +1199,7 @@ class Modelo:
         solver.parameters.log_search_progress = log
         solver.parameters.relative_gap_limit = gap
         solver.parameters.max_time_in_seconds = tiempo
-        self.m.minimize(W1 * (p1 + p_exceso + PESO_DEV * p_dev) + W2 * p2
+        self.m.minimize(W1 * (p1 + p_exceso + p_dev) + W2 * p2
                         + W3 * (p_horas + p_ret + PESO_RETIRA * p_retira + PESO_ESTAB * p5
                                 + PESO_ORDEN * p7))
         return solver, solver.solve(self.m)
@@ -1084,7 +1228,7 @@ class Modelo:
         p7, _ = self._preferencia_cubridor()
 
         niveles = [
-            ("cobertura", p1 + p_exceso + PESO_DEV * p_dev),
+            ("cobertura", p1 + p_exceso + p_dev),
             ("equidad", p2),
             ("horas", p_horas + p_ret + PESO_RETIRA * p_retira + PESO_ESTAB * p5
                       + PESO_ORDEN * p7),
@@ -1132,9 +1276,11 @@ def _plan_ventana(mod: Modelo, solver, fechas_ventana: list[date]) -> dict[tuple
 
 
 def _actualizar_offset(offset: dict, mod: Modelo, plan_ventana: dict) -> None:
-    """Suma al libro de equidad las cargas indeseables asignadas en la ventana (fijos fuera)."""
+    """Suma al libro de equidad las cargas indeseables asignadas en la ventana (fijos fuera).
+    Los días anteriores al arranque del año quedan fuera, igual que en el modelo (_dias_decision):
+    son findes y festivos del año pasado y su reparto ya se cerró entonces."""
     for (w, f), turno in plan_ventana.items():
-        if mod.datos.trabajadores[w].tipo == "fijo":
+        if mod.datos.trabajadores[w].tipo == "fijo" or (mod.desde and f < mod.desde):
             continue
         for metrica in METRICAS:
             if mod._contribuye(metrica, turno, f):
@@ -1142,12 +1288,14 @@ def _actualizar_offset(offset: dict, mod: Modelo, plan_ventana: dict) -> None:
                 offset[w][metrica] = offset[w].get(metrica, 0) + 1
 
 
-def _actualizar_offset_horas(offset_horas: dict, datos: Datos, plan_ventana: dict) -> None:
+def _actualizar_offset_horas(offset_horas: dict, datos: Datos, plan_ventana: dict,
+                             fechas_ventana: list[date]) -> None:
     """Suma al libro de jornada anual (C9 + pace) los minutos trabajados en la ventana. Incluye a
     los fijos (Etapa 4): un día retirado no aparece en el plan, así que no suma → el libro refleja
-    sus horas reales tras las retiradas."""
-    for (w, f), turno in plan_ventana.items():
-        offset_horas[w] = offset_horas.get(w, 0) + round(datos.turnos[turno].horas * 60)
+    sus horas reales tras las retiradas. Usa la MISMA moneda que _minutos_jornada (semana entera
+    para las plazas de localizado); si no, el libro y el modelo se contradirían ventana a ventana."""
+    for w, minutos in jornada_minutos(datos, plan_ventana, fechas_ventana).items():
+        offset_horas[w] = offset_horas.get(w, 0) + minutos
 
 
 def _linea_fija_de(datos: Datos, w: str) -> str | None:
@@ -1266,7 +1414,7 @@ def calendario_cesiones(datos: Datos, inicio: date, fin: date,
         binomio = sorted(pres)
         for w in binomio:
             t = datos.trabajadores[w]
-            objetivo = round(HORAS_OBJETIVO * t.factor_jornada * 60)
+            objetivo = round(datos.config.horas_objetivo * t.factor_jornada * 60)
             hciclo = {k: v for k, v in pres[w].items() if v > 0}
             total = sum(hciclo.values())
             if total <= objetivo:
@@ -1404,7 +1552,11 @@ def reserva_cubridores(datos: Datos, inicio: date, fin: date,
                              if ss == s and c.v >= 1))
         if not cubridores:
             continue
-        horas = datos.turnos[s].horas
+        # Lo que le CUESTA al cubridor un día de esta línea, en la moneda del libro anual: para un
+        # localizado, su ocupación (horas_consumo ≈ 11.43 h), no las 8 h legales. Es una media del
+        # ciclo —la semana corta ocupa más de lo que suma y la larga menos—, suficiente para
+        # dimensionar la reserva; el reparto exacto por semana lo hace el modelo (_minutos_jornada).
+        horas = datos.turnos[s].horas_consumo
         for f in fechas:
             if not datos.opera(s, f):
                 continue
@@ -1444,12 +1596,17 @@ def resolver_anual(datos: Datos, inicio: date, fin: date, dias_ventana: int = 14
                    gap: float = 0.0, log: bool = False) -> dict[tuple[str, date], str]:
     """Horizonte rodante: resuelve [inicio, fin] por ventanas alineadas a lunes, con cola
     congelada (costura legal) y libro de equidad acumulada. Devuelve el plan completo."""
+    # El AÑO que se contabiliza es [inicio, fin]; el horizonte que se RESUELVE arranca el lunes
+    # anterior, para que las semanas ISO estén completas y los topes semanales (C5/C6/C7) cuadren
+    # desde el primer día. Esos días de diciembre se planifican y se muestran, pero su jornada es del
+    # año anterior: no entran ni en el libro de las 1776 ni en el prorrateo (ver Modelo.desde).
+    anio = inicio
     inicio -= timedelta(days=inicio.weekday())          # alinear a lunes
     plan: dict[tuple[str, date], str] = {}
     offset: dict[str, dict[str, int]] = {}
     offset_horas: dict[str, int] = {}                   # libro de jornada anual (minutos), C9
-    # días disponibles (no vacaciones) de cada trabajador en todo el horizonte: base del prorrateo
-    dias_horizonte = rango_fechas(inicio, fin)
+    # días disponibles (no vacaciones) de cada trabajador en el AÑO: base del prorrateo
+    dias_horizonte = rango_fechas(anio, fin)
     uvi = _patrones_uvi(datos)                          # UVI: horas de patrón aceptadas, no se recortan
     noche = _patrones_noche(datos)                      # rotación acoplada: cede bloques enteros
     # NIVEL 0: qué bloques libra cada nochero, decidido sobre el AÑO ENTERO (repartidos, sin
@@ -1469,8 +1626,9 @@ def resolver_anual(datos: Datos, inicio: date, fin: date, dias_ventana: int = 14
     carga_dia = carga_diaria(datos, dias_horizonte)
 
     def peso(w: str, dias: list[date]) -> float:
-        """Carga esperada que le corresponde a w en esos días (0 en los que no está disponible)."""
-        return sum(carga_dia[f] for f in dias if datos.disponible(w, f))
+        """Carga esperada que le corresponde a w en esos días (0 en los que no está disponible, y 0
+        en los del año anterior: no están en `carga_dia` porque no entran en el reparto de 1776)."""
+        return sum(carga_dia[f] for f in dias if f in carga_dia and datos.disponible(w, f))
 
     disp_año = {w: peso(w, dias_horizonte)
                 for w, t in datos.trabajadores.items() if t.tipo != "fijo" and t.patron not in uvi}
@@ -1493,7 +1651,7 @@ def resolver_anual(datos: Datos, inicio: date, fin: date, dias_ventana: int = 14
         cola = set(fechas_cola)
         congelar = {(w, f): plan[(w, f)] for (w, f) in plan if f in cola}
 
-        # Objetivo de jornada de la ventana: prorrateo de HORAS_OBJETIVO (meta blanda, 1776) por la
+        # Objetivo de jornada de la ventana: prorrateo de config.horas_objetivo (meta blanda) por la
         # CARGA que le toca en ella, no por días (ver carga_dia). Así la equidad y el cap hablan el
         # mismo idioma: en las ventanas cargadas se espera más de cada uno, y en las flojas menos.
         objetivo_horas = {}
@@ -1502,7 +1660,7 @@ def resolver_anual(datos: Datos, inicio: date, fin: date, dias_ventana: int = 14
                 continue
             peso_v = peso(w, fechas_ventana)
             factor = datos.trabajadores[w].factor_jornada        # reducción de jornada
-            objetivo_horas[w] = round(HORAS_OBJETIVO * factor * 60 * peso_v / peso_total)
+            objetivo_horas[w] = round(datos.config.horas_objetivo * factor * 60 * peso_v / peso_total)
 
         # Etapa 4: objetivo ACUMULADO (min) de 1776 de cada fijo hasta el FIN de esta ventana
         # (prorrateo por días elegibles transcurridos). _retirada_fijos lo usa como línea de ritmo.
@@ -1512,7 +1670,7 @@ def resolver_anual(datos: Datos, inicio: date, fin: date, dias_ventana: int = 14
                 continue
             factor = datos.trabajadores[w].factor_jornada
             elig_hasta = sum(1 for f in elig if f <= fin_v)
-            objetivo_horas_fijo[w] = round(HORAS_OBJETIVO * factor * 60 * elig_hasta / len(elig))
+            objetivo_horas_fijo[w] = round(datos.config.horas_objetivo * factor * 60 * elig_hasta / len(elig))
 
         # Cap PRORRATEADO (no-fijos): jornada acumulada hasta el FIN de esta ventana <= ritmo hacia el
         # OBJETIVO 1776 según la CARGA ya transcurrida (ver carga_dia) + colchón. Tope DURO por
@@ -1525,7 +1683,7 @@ def resolver_anual(datos: Datos, inicio: date, fin: date, dias_ventana: int = 14
                 continue
             if cesiones and t.patron in noche:
                 continue      # su jornada la gobierna el calendario de cesiones, no el cap
-            peso_hasta = peso(w, rango_fechas(inicio, fin_v))
+            peso_hasta = peso(w, rango_fechas(anio, fin_v))
             factor = t.factor_jornada
             # Colchón (adelanto permitido sobre el ritmo de 1776), por tipo:
             #  · CESIÓN GRUESA (noches: solo pueden recortar quincenas enteras): COLCHON_NOCHE_H, para
@@ -1543,20 +1701,21 @@ def resolver_anual(datos: Datos, inicio: date, fin: date, dias_ventana: int = 14
                 colchon = 0
             else:
                 colchon = COLCHON_PACE_H
-            tope_paced[w] = round((HORAS_OBJETIVO * peso_hasta / peso_total + colchon) * factor * 60)
+            tope_paced[w] = round((datos.config.horas_objetivo * peso_hasta / peso_total + colchon) * factor * 60)
             # RESERVA (Nivel 0): a un cubridor no se le deja gastar las horas que va a necesitar para
             # la cobertura crítica que aún tiene por delante. Sin esto llegaba a los picos con la
             # jornada agotada —1769-1774 h con noches de 11— y la línea se quedaba vacía.
             pendiente = reserva.get(w, {}).get(fin_v)
             if pendiente:
                 tope_paced[w] = min(tope_paced[w],
-                                    round((HORAS_OBJETIVO * factor - pendiente) * 60))
+                                    round((datos.config.horas_objetivo * factor - pendiente) * 60))
 
         mod = Modelo(datos, fechas_cola + fechas_ventana,
                      congelar=congelar, offset_equidad=offset, cola=cola,
                      offset_horas=offset_horas, objetivo_horas=objetivo_horas,
                      objetivo_horas_fijo=objetivo_horas_fijo, tope_paced=tope_paced,
-                     cesiones=cesiones, ancla_patron=inicio)   # ancla GLOBAL fija: la rotación es consistente entre ventanas
+                     cesiones=cesiones, ancla_patron=inicio,   # ancla GLOBAL fija: la rotación es consistente entre ventanas
+                     desde=anio)                          # ...y el libro de horas empieza el 1 de enero
         solver, st = mod.resolver(tiempo=segundos, trabajadores_cpu=hilos, gap=gap, log=log)
 
         # GUARDIA: sin solución, solver.value() devuelve BASURA en silencio (se llegó a coser un
@@ -1571,7 +1730,8 @@ def resolver_anual(datos: Datos, inicio: date, fin: date, dias_ventana: int = 14
         pv = _plan_ventana(mod, solver, fechas_ventana)
         plan.update(pv)
         _actualizar_offset(offset, mod, pv)
-        _actualizar_offset_horas(offset_horas, datos, pv)
+        _actualizar_offset_horas(offset_horas, datos, pv,
+                                 [f for f in fechas_ventana if f >= anio])
 
         v += 1
         # u ya solo contiene turnos con DEMANDA real: los comodín REF CAL no generan holgura
@@ -1585,7 +1745,7 @@ def resolver_anual(datos: Datos, inicio: date, fin: date, dias_ventana: int = 14
     # PASADA FINAL: repartir los comodines (REF CAL) entre quienes quedaron por debajo del objetivo.
     # Va aquí y no dentro del modelo para que el relleno use lo que SOBRA y no compita con la
     # cobertura por el presupuesto anual de horas (ver rellenar_refuerzos).
-    rellenar_refuerzos(datos, plan, inicio, fin, log=True)
+    rellenar_refuerzos(datos, plan, anio, fin, log=True)
     return plan
 
 
@@ -1615,13 +1775,18 @@ def rellenar_refuerzos(datos: Datos, plan: dict[tuple[str, date], str],
                        for fila in datos.patrones.get(p_, []) for s in fila.values()
                        if s and s != LIBRE and s in datos.turnos}
     sem_bloqueada = {(w, semana(f)) for (w, f), s in plan.items() if s in lineas_criticas}
-    fechas = rango_fechas(inicio - timedelta(days=inicio.weekday()), fin)
+    # Solo el AÑO: los días del lunes anterior al 1 de enero son jornada del año pasado. Ni cuentan
+    # en el libro ni se rellenan (un refuerzo ahí no acercaría a nadie a sus 1776 de este año).
+    # Los contadores SEMANALES sí se construyen con el plan entero: la semana ISO es la real.
+    fechas = rango_fechas(inicio, fin)
 
+    # `horas` = jornada acumulada contra el objetivo anual -> moneda del libro (semana entera para
+    # las plazas de localizado). `horas_sem` = jornada LEGAL de la semana, que es lo que topa config.hmax7.
     horas: dict[str, float] = defaultdict(float)
+    horas.update({w: m / 60 for w, m in jornada_minutos(datos, plan, fechas).items()})
     dias_sem: dict[tuple[str, tuple[int, int]], int] = defaultdict(int)
     horas_sem: dict[tuple[str, tuple[int, int]], float] = defaultdict(float)
     for (w, f), s in plan.items():
-        horas[w] += datos.turnos[s].horas
         dias_sem[(w, semana(f))] += 1
         horas_sem[(w, semana(f))] += datos.turnos[s].horas
 
@@ -1629,13 +1794,13 @@ def rellenar_refuerzos(datos: Datos, plan: dict[tuple[str, date], str],
         t = datos.trabajadores[w]
         filas = datos.patrones.get(t.patron or "") if t.tipo == "patron" else None
         if not filas:
-            return CMAX_POOL
+            return datos.config.cmax_pool
         propio = max(sum(1 for dia in DIAS if fila.get(dia) and fila.get(dia) != LIBRE
                          and fila.get(dia) in datos.turnos) for fila in filas)
-        return min(CMAX, max(CMAX_POOL, propio))
+        return min(datos.config.cmax, max(datos.config.cmax_pool, propio))
 
     def descanso_ok(w: str, f: date, s: str) -> bool:
-        """¿Deja el turno s en el día f al menos RMIN horas con el turno del día anterior y el del
+        """¿Deja el turno s en el día f al menos config.rmin horas con el turno del día anterior y el del
         siguiente? (los comodines no aparecen en ninguna rotación pactada, así que no hay exención)"""
         t = datos.turnos[s]
         for delta in (-1, 1):
@@ -1648,21 +1813,21 @@ def rellenar_refuerzos(datos: Datos, plan: dict[tuple[str, date], str],
             if fin1 <= ini1:
                 fin1 += timedelta(days=1)
             ini2 = datetime.combine(date(2000, 1, 2), t2.hora_entrada)
-            if (ini2 - fin1).total_seconds() / 3600 < RMIN:
+            if (ini2 - fin1).total_seconds() / 3600 < datos.config.rmin:
                 return False
         return True
 
     asignados = 0
     while True:
         # a quién le falta más jornada (solo quien esté por debajo del objetivo)
-        faltan = sorted(((HORAS_OBJETIVO * datos.trabajadores[w].factor_jornada - horas[w], w)
+        faltan = sorted(((datos.config.horas_objetivo * datos.trabajadores[w].factor_jornada - horas[w], w)
                          for w in datos.trabajadores),
                         reverse=True)
         for falta, w in faltan:
             if falta <= 0:
                 return _fin_relleno(asignados, log)
             t = datos.trabajadores[w]
-            tope = HORAS_OBJETIVO * t.factor_jornada
+            tope = datos.config.horas_objetivo * t.factor_jornada
             hueco = None
             for f in fechas:
                 if (w, f) in plan or not datos.disponible(w, f):
@@ -1676,7 +1841,7 @@ def rellenar_refuerzos(datos: Datos, plan: dict[tuple[str, date], str],
                     if not datos.elegible(w, s, f)[0]:
                         continue
                     h = datos.turnos[s].horas
-                    if horas[w] + h > tope or horas_sem[(w, sem)] + h > HMAX7:
+                    if horas[w] + h > tope or horas_sem[(w, sem)] + h > datos.config.hmax7:
                         continue
                     if not descanso_ok(w, f, s):
                         continue
@@ -1718,7 +1883,7 @@ def resolver_monolitico(datos: Datos, inicio: date, fin: date,
     fechas = rango_fechas(inicio, fin)
     objetivo_horas, objetivo_horas_fijo = {}, {}
     for w, t in datos.trabajadores.items():
-        obj = round(HORAS_OBJETIVO * t.factor_jornada * 60)     # objetivo anual completo
+        obj = round(datos.config.horas_objetivo * t.factor_jornada * 60)     # objetivo anual completo
         if t.tipo == "fijo":
             objetivo_horas_fijo[w] = obj                # cumulativo hasta fin de año = objetivo pleno
         else:
@@ -1784,7 +1949,8 @@ def imprimir_resumen(modelo: Modelo, solver: cp_model.CpSolver, status: int) -> 
 # --------------------------------------------------------------------------- #
 def main() -> None:
     datos = cargar(DATA)
-    fechas = rango_fechas(FECHA_INI,FECHA_FIN)
+    anio = datos.config.anio
+    fechas = rango_fechas(date(anio, 1, 1), date(anio, 1, 31))
 
     print("=" * 80)
     print("CONSTRUCCIÓN DEL MODELO")

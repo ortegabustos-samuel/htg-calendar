@@ -5,7 +5,8 @@ DNI/NIE reales y fechas de vacaciones de empleados, y el repositorio tiene remot
 Este documento es, por tanto, la única referencia del formato: sin él, un clon limpio no puede
 reconstruir los datos. **Si cambias el contrato, actualiza este fichero en el mismo commit.**
 
-Todos los ficheros son CSV con cabecera y separador coma, codificación UTF-8.
+Los seis ficheros de datos son CSV con cabecera y separador coma, codificación UTF-8; el
+séptimo, `config.toml`, es TOML.
 
 **Comprueba los datos antes de resolver:**
 
@@ -13,12 +14,42 @@ Todos los ficheros son CSV con cabecera y separador coma, codificación UTF-8.
 python3 src/validar_datos.py            # o: python3 src/validar_datos.py otro/directorio
 ```
 
-Recorre los seis ficheros en cuatro niveles —formato, referencias, este contrato y viabilidad—
-y distingue **ERROR** (se pierde información: no resolver con esto), **aviso** (probablemente
+Recorre `config.toml` y los seis CSV en cinco niveles —config, formato, referencias, este
+contrato y viabilidad— y distingue **ERROR** (se pierde información: no resolver con esto), **aviso** (probablemente
 intencionado, míralo) y **nota** (contexto: balance anual, horas que prescribe cada patrón).
 `generar_anual.py` lo ejecuta al arrancar y se niega a empezar si hay errores, porque el fallo
 típico aquí no es ruidoso: un espacio de más en una celda hace que el cargador la descarte en
 silencio y el cuadrante salga sutilmente mal después de 45 minutos de cómputo.
+
+---
+
+## `config.toml` — el año y el convenio
+
+```toml
+[horizonte]
+anio = 2026
+
+[jornada]
+horas_objetivo = 1776
+
+[convenio]
+rmin = 12       # descanso mínimo entre jornadas (h)              — C4
+hmax7 = 48      # máx. horas de trabajo efectivo por semana ISO   — C6
+cmax = 6        # máx. días trabajados por semana ISO             — C5
+cmax_pool = 5   # el mismo tope para correturnos y mixtos
+```
+
+Lo que cambia al pasar de año o de provincia. Antes estaba escrito en `modelo.py` y **duplicado**
+en `diagnostico.py`, con lo que el diagnóstico podía juzgar viable un dataset usando un objetivo
+distinto del que luego aplicaba el modelo.
+
+`anio` es **obligatorio**: el horizonte lo declaran los datos y no se deduce de ningún sitio.
+`--anio` en la línea de órdenes lo pisa para una ejecución concreta. El validador comprueba además
+que todas las fechas de `festivos.csv` sean de ese año.
+
+Los cuatro de `[convenio]` y el de `[jornada]` son opcionales: sin ellos se usan los valores de
+arriba, que son los que el código tenía escritos. Un campo desconocido es error, no se ignora en
+silencio.
 
 ---
 

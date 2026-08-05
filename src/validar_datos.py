@@ -1,19 +1,12 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
 validar_datos.py — Revisa los CSV de entrada ANTES de resolver y avisa de lo que está mal.
 
-El fallo más probable de este proyecto no es el modelo: es un CSV reeditado a mano. Los datos no se
-versionan (llevan DNI reales), cambian cada año con el plan funcional y con las horas de convenio, y
-los toca gente distinta. Un espacio de más basta para que un turno se pierda en silencio y el
-cuadrante salga sutilmente mal — de hecho así estaba: dos celdas de patrones.csv tenían ' LIBRE' y
-' REF CAL T' con un espacio delante, y el cargador las descartaba sin decir nada.
-
 Revisa en cuatro niveles, de lo que impide leer a lo que solo es sospechoso:
-  1. FORMATO      — ficheros, cabeceras, nº de campos, espacios sobrantes, claves duplicadas.
-  2. REFERENCIAS  — que lo que se cita (turnos, trabajadores, patrones, municipios) exista.
-  3. CONTRATO     — las reglas de doc/contrato_datos.md: qué declara cada fichero y qué se deriva.
-  4. VIABILIDAD   — no rompe la carga, pero anticipa un cuadrante malo (balance, profundidad, ciclos).
+  0. CONFIG (config.toml)
+  1. FORMATO
+  2. REFERENCIAS
+  3. CONTRATO
+  4. VIABILIDAD
 
 No corrige nada, solo informa: el arreglo va en el CSV, que es la fuente de verdad.
 Sale con código 1 si hay algún ERROR.
@@ -30,7 +23,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from cargar_datos import DATA, DIAS, LIBRE, cargar                              # noqa: E402
+from cargar_datos import DATA, DIAS, LIBRE, _cargar_config, cargar              # noqa: E402
 
 # Columnas que cada fichero DEBE traer. Las opcionales (factor_jornada, grupo, linea, municipio,
 # prioridad, fila_inicial) no se exigen: el cargador les da valor por defecto.
@@ -43,6 +36,7 @@ OBLIGATORIAS = {
     "festivos.csv": ["fecha", "ambito"],
     "calendarios_municipio.csv": ["municipio", "calendario_festivos"],
 }
+
 # Columnas que identifican una fila. Los cargadores usan dict[clave] = ..., así que una clave
 # repetida NO da error: la segunda pisa a la primera y se pierde información sin avisar.
 CLAVES = {
@@ -78,6 +72,7 @@ class Informe:
 
 
 def _fecha(txt: str) -> date | None:
+    #Comprueba si una fecha es real y correcta
     try:
         return datetime.strptime(txt.strip(), "%d/%m/%Y").date()
     except ValueError:
@@ -87,6 +82,29 @@ def _fecha(txt: str) -> date | None:
 # --------------------------------------------------------------------------- #
 #  1. FORMATO — lo que impide leer bien el fichero
 # --------------------------------------------------------------------------- #
+def revisar_config(directorio: Path, inf: Informe) -> bool:
+    """`config.toml`: año y parámetros del convenio. Devuelve si se puede seguir (sin año no hay
+    horizonte y el nivel 4 no puede hacer nada)."""
+    try:
+        cfg = _cargar_config(directorio)
+    except Exception as e:                                  # noqa: BLE001 — el mensaje ya es claro
+        inf.error(f"config.toml: {e}")
+        return False
+    if not 1900 < cfg.anio < 2200:
+        inf.error(f"config.toml: anio={cfg.anio} no parece un año")
+    if cfg.horas_objetivo <= 0:
+        inf.error(f"config.toml: horas_objetivo={cfg.horas_objetivo}; debe ser > 0")
+    if not 0 <= cfg.rmin <= 24:
+        inf.error(f"config.toml: rmin={cfg.rmin} horas de descanso no caben en un día")
+    if not 0 < cfg.hmax7 <= 7 * 24:
+        inf.error(f"config.toml: hmax7={cfg.hmax7} horas no caben en una semana")
+    if not 1 <= cfg.cmax <= 7:
+        inf.error(f"config.toml: cmax={cfg.cmax} días está fuera de 1..7")
+    if not 1 <= cfg.cmax_pool <= cfg.cmax:
+        inf.error(f"config.toml: cmax_pool={cfg.cmax_pool} debe estar entre 1 y cmax={cfg.cmax}")
+    return not inf.errores
+
+
 def revisar_formato(directorio: Path, inf: Informe) -> tuple[dict[str, list[dict]], list[str]]:
     """Lee los CSV en crudo, sin pasar por el cargador, para ver el texto tal cual está.
 
@@ -381,19 +399,22 @@ def revisar_contrato(crudo: dict[str, list[dict]], inf: Informe) -> None:
 # --------------------------------------------------------------------------- #
 def revisar_viabilidad(directorio: Path, inf: Informe) -> None:
     """Solo corre si el resto pasó: necesita los datos ya cargados por cargar_datos."""
-    from modelo import HORAS_OBJETIVO, _patrones_noche, _patrones_uvi, rango_fechas   # noqa: PLC0415
+    from modelo import (_patrones_noche, _patrones_uvi,                   # noqa: PLC0415
+                        jornada_minutos, rango_fechas)
 
     d = cargar(directorio)
-
-    # El año se deduce de los festivos, que es el fichero que sí lo lleva escrito.
-    anios = Counter(f.year for fechas in d.festivos.values() for f in fechas)
-    if not anios:
-        inf.error("festivos.csv no tiene ninguna fecha; no se puede situar el horizonte")
-        return
-    anio = anios.most_common(1)[0][0]
+    objetivo = d.config.horas_objetivo
+    anio = d.config.anio
     ini = date(anio, 1, 1) - timedelta(days=date(anio, 1, 1).weekday())
     fechas = rango_fechas(ini, date(anio, 12, 31))
-    inf.nota(f"horizonte deducido de los festivos: año {anio}")
+    inf.nota(f"horizonte: año {anio} (config.toml), objetivo {objetivo} h")
+
+    # Los festivos tienen que ser del año que se resuelve; si no, el cuadrante sale con los
+    # festivos de otro año y nada lo delata.
+    fuera = sorted({f for fs in d.festivos.values() for f in fs if f.year != anio})
+    if fuera:
+        inf.error(f"festivos.csv: {len(fuera)} fecha(s) no son del año {anio} "
+                  f"(p.ej. {fuera[0]:%d/%m/%Y}); o sobran, o el anio de config.toml está mal")
 
     # Filas de arranque EFECTIVAS (lo declarado en fila_inicial, o el orden alfabético si no viene).
     # Se mira aquí y no sobre el CSV porque una colisión puede darse entre un trabajador que declara
@@ -411,15 +432,15 @@ def revisar_viabilidad(directorio: Path, inf: Informe) -> None:
     # Balance anual: horas que hay que cubrir contra horas que la plantilla puede dar.
     dem = sum(t.dem * t.horas for f in fechas for s, t in d.turnos.items()
               if t.prioridad >= 1 and d.opera(s, f))
-    cap = sum(HORAS_OBJETIVO * t.factor_jornada for t in d.trabajadores.values())
+    cap = sum(objetivo * t.factor_jornada for t in d.trabajadores.values())
     # Las vacaciones ya están descontadas del objetivo anual: 1776 es lo que trabaja cada uno.
     if dem > cap:
         inf.error(f"la demanda ({dem:,.0f} h) supera la capacidad de la plantilla ({cap:,.0f} h a "
-                  f"{HORAS_OBJETIVO} h/persona): habrá huecos sí o sí, faltan "
-                  f"{(dem - cap) / HORAS_OBJETIVO:.1f} personas")
+                  f"{objetivo} h/persona): habrá huecos sí o sí, faltan "
+                  f"{(dem - cap) / objetivo:.1f} personas")
     else:
         inf.nota(f"balance anual: demanda {dem:,.0f} h, capacidad {cap:,.0f} h; sobran "
-                 f"{(cap - dem) / HORAS_OBJETIVO:.1f} personas de holgura, que habrá que absorber "
+                 f"{(cap - dem) / objetivo:.1f} personas de holgura, que habrá que absorber "
                  f"con refuerzos o dejar sin asignar")
 
     # Profundidad de cobertura: una línea crítica con un solo cubridor cae en cuanto ese se va.
@@ -447,11 +468,15 @@ def revisar_viabilidad(directorio: Path, inf: Informe) -> None:
         if not any(t.patron == p for t in d.trabajadores.values()):
             continue
         T = len(filas)
-        h = sum(d.turnos[s].horas
-                for f in fechas
-                for s in [filas[((f - ini).days // 7) % T][DIAS[f.weekday()]]]
-                if s and s != LIBRE and s in d.turnos and d.opera(s, f))
-        desv = h / HORAS_OBJETIVO - 1
+        # En JORNADA, no en horas legales: si no, un patrón de localizado (8 h computadas por turno
+        # pero la plaza ocupa la semana) parecería quedarse un 25% corto y avisaría de un problema
+        # que no existe. Ver modelo.jornada_minutos.
+        prescrito = {(f"·{p}", f): s
+                     for f in fechas
+                     for s in [filas[((f - ini).days // 7) % T][DIAS[f.weekday()]]]
+                     if s and s != LIBRE and s in d.turnos and d.opera(s, f)}
+        h = jornada_minutos(d, prescrito, fechas).get(f"·{p}", 0) / 60
+        desv = h / objetivo - 1
         gap = "por encima: habrá que ceder bloques" if desv > 0 else "por debajo: harán falta refuerzos"
         inf.nota(f"el patrón '{p}' prescribe ~{h:,.0f} h/año, un {abs(100 * desv):.0f}% {gap}")
         if abs(desv) > 0.25:
@@ -474,6 +499,9 @@ def validar(directorio: Path | str = DATA) -> Informe:
     directorio = Path(directorio)
     inf = Informe()
 
+    if not revisar_config(directorio, inf):
+        inf.nota("no se ha revisado nada más: sin config.toml válido no hay horizonte que medir")
+        return inf
     crudo, ilegibles = revisar_formato(directorio, inf)
     if ilegibles:
         inf.nota(f"no se ha revisado nada más: {', '.join(ilegibles)} no se puede(n) leer")

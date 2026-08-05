@@ -8,7 +8,7 @@ cola de 28) y escribe calendario.xlsx + metricas_trabajadores.csv. El `__main__`
 NO sirve para esto: resuelve solo enero, en un único modelo, como prueba del solver.
 
 Uso:
-    python3 src/generar_anual.py                 # año 2026 con los valores por defecto
+    python3 src/generar_anual.py                 # el año que diga data/input/config.toml
     python3 src/generar_anual.py --anio 2027
     python3 src/generar_anual.py --segundos 120 --hilos 8
 
@@ -32,14 +32,15 @@ import salida                                                   # noqa: E402
 import validar_datos                                            # noqa: E402
 from cargar_datos import cargar                                 # noqa: E402
 import pulido                                                    # noqa: E402
-from modelo import HORAS_OBJETIVO, rango_fechas, resolver_anual  # noqa: E402
+from modelo import rango_fechas, resolver_anual                  # noqa: E402
 
 RAIZ = Path(__file__).resolve().parents[1]
 
 
 def main() -> int:
     p = argparse.ArgumentParser(description="Genera el cuadrante anual en data/output/")
-    p.add_argument("--anio", type=int, default=2026, help="año a resolver (por defecto 2026)")
+    p.add_argument("--anio", type=int, default=None,
+                   help="año a resolver; por defecto el de config.toml")
     p.add_argument("--segundos", type=int, default=60, help="tiempo de solver por ventana")
     p.add_argument("--hilos", type=int, default=16, help="hilos del solver")
     p.add_argument("--ventana", type=int, default=14, help="días por ventana")
@@ -67,24 +68,36 @@ def main() -> int:
     if inf.errores or inf.avisos:
         print()
 
-    inicio, fin = date(a.anio, 1, 1), date(a.anio, 12, 31)
-    datos = cargar(a.datos)
+    datos = cargar(a.datos, a.anio)
+    anio = datos.config.anio
+    inicio, fin = date(anio, 1, 1), date(anio, 12, 31)
     print(f"Cuadrante {inicio:%d/%m/%Y} – {fin:%d/%m/%Y} · {len(datos.trabajadores)} trabajadores · "
-          f"objetivo {HORAS_OBJETIVO} h/año · {a.segundos}s por ventana, {a.hilos} hilos\n", flush=True)
+          f"objetivo {datos.config.horas_objetivo} h/año · {a.segundos}s por ventana, {a.hilos} hilos\n", flush=True)
 
     plan = resolver_anual(datos, inicio, fin, dias_ventana=a.ventana, dias_cola=a.cola,
                           segundos=a.segundos, hilos=a.hilos, gap=0.0, log=a.log)
 
-    fechas = rango_fechas(inicio - timedelta(days=inicio.weekday()), fin)
+    # Horizonte que se CONTABILIZA y se entrega: el año natural. El plan trae además los días del
+    # lunes anterior al 1 de enero —el rodante arranca ahí para que las semanas ISO estén completas y
+    # los topes semanales cuadren desde el primer día—, pero esos son jornada del año ANTERIOR: no
+    # cuentan para las 1776, no se pulen, no se rellenan y no salen en el Excel. Siguen en `plan`
+    # porque el descanso entre jornadas del 1 de enero se mide contra el 31 de diciembre.
+    fechas = rango_fechas(inicio, fin)
     if not a.sin_pulir:
-        # Pasada final: equidad por intercambio de semanas, aprovechamiento de los refuerzos y
+        # Pasada final: rescate de cobertura con los refuerzos, equidad por intercambio de semanas y
         # coherencia. Ninguna puede empeorar la cobertura ni la jornada (invariantes duros).
-        # `aprovechar` va entre medias a propósito: sustituye refuerzos por demanda real y deja
-        # semanas nuevas que `coherencia` todavía puede ordenar.
+        #
+        # El orden importa. Primero se rescata cobertura: `aprovechar` canjea el refuerzo por un
+        # turno real DEL MISMO DÍA (neutro en horas) y `canjear` lo hace ya contra el año entero,
+        # soltando refuerzos de otros meses para que quepa el turno del hueco. Los dos mueven a gente
+        # a días —y a findes— que no eran suyos, así que `pulir` va DESPUÉS y absorbe ese desajuste
+        # en su única pasada (medido en 2026: con el pulido delante la desigualdad acababa en 57, con
+        # él detrás en 54, misma cobertura). `coherencia` cierra ordenando las semanas resultantes.
         pulido.resumen(datos, plan, "EQUIDAD antes del pulido")
-        pulido.pulir(datos, plan, inicio, fin)
         pulido.aprovechar(datos, plan, fechas)
-        pulido.coherencia(datos, plan)
+        pulido.canjear(datos, plan, fechas)
+        pulido.pulir(datos, plan, inicio, fin)
+        pulido.coherencia(datos, plan, fechas=fechas)
         pulido.resumen(datos, plan, "EQUIDAD después del pulido")
 
     if plan and max(f for _, f in plan) < fin:

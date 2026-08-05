@@ -12,10 +12,11 @@ un resumen y comprobaciones de la instancia cargada.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from datetime import date, datetime, timedelta , time
 from pathlib import Path
 import csv
+import tomllib
 
 RAIZ = Path(__file__).resolve().parents[1]
 DATA = RAIZ / "data" / "input"
@@ -120,6 +121,26 @@ class Trabajador:
                                     # `offsets_patron`—. None = no declarada (se deduce del orden).
 
 
+@dataclass(frozen=True)
+class Config:
+    """Parámetros de la INSTANCIA (`config.toml`): qué año se resuelve y bajo qué convenio.
+
+    Están aquí y no en el código porque cambian de un año al siguiente y de una provincia a otra:
+    1776 es la jornada de ESTE convenio y ESTE año, no una constante del problema. Antes vivían
+    repartidos entre `modelo.py` y `diagnostico.py`, duplicados — con el efecto de que el
+    diagnóstico podía juzgar viable un dataset usando un objetivo distinto del que luego aplicaba
+    el modelo. Los valores por defecto son los que el código tenía escritos, así que un directorio
+    de datos sin `config.toml` se comporta igual que antes de existir esto.
+
+    `anio` es obligatorio en config.toml: el horizonte lo declaran los datos, no se deduce."""
+    anio: int | None = None      # None solo para poder construir los defaults; _cargar_config lo exige
+    horas_objetivo: int = 1776   # jornada anual objetivo (h): techo de todo lo que no sea cubrir
+    rmin: int = 12               # descanso mínimo entre jornadas (h)              — C4
+    hmax7: int = 48              # máx. trabajo efectivo por semana ISO (h)        — C6
+    cmax: int = 6                # máx. días trabajados por semana ISO             — C5
+    cmax_pool: int = 5           # el mismo tope, para la plantilla FLEXIBLE (correturnos y mixtos)
+
+
 @dataclass
 class Capacidad:
     lv: int                         #Trabaja de lunes a viernes flag 0/1
@@ -145,6 +166,7 @@ class Datos:
     patrones: dict[str, list[dict[str, str]]]      # patron -> [ {weekday: turno|LIBRE} ]
     offsets: dict[str, int] = field(default_factory=dict)  # trabajador de patrón -> fila de arranque
                                                    # (ver `offsets_patron`). Lo deriva `cargar()`.
+    config: Config = field(default_factory=Config)  # año y parámetros del convenio (config.toml)
 
     # -- Consultas derivadas ------------------------------------------------- #
     def es_festivo(self, f: date, municipio: str) -> bool:
@@ -322,6 +344,34 @@ def _cargar_capacidades(directorio: Path) -> dict[tuple[str, str], Capacidad]:
     return capacidades
 
 
+def _cargar_config(directorio: Path, anio: int | None = None) -> Config:
+    """Lee `config.toml`. Los parámetros del convenio son opcionales (caen a los defaults); `anio`
+    no: o está en el fichero o llega por `--anio`. Que los valores tengan sentido lo dice
+    `validar_datos.py`, como con los CSV."""
+    ruta = directorio / "config.toml"
+    valores: dict[str, object] = {}
+    if ruta.is_file():
+        with open(ruta, "rb") as archivo:              # tomllib exige binario
+            crudo = tomllib.load(archivo)
+        campos = {f.name for f in fields(Config)}
+        for seccion, cuerpo in crudo.items():
+            if not isinstance(cuerpo, dict):
+                raise ValueError(f"config.toml: '{seccion}' está suelto; todo va dentro de una "
+                                 f"sección ([horizonte], [jornada], [convenio])")
+            for clave, valor in cuerpo.items():
+                if clave not in campos:
+                    raise ValueError(f"config.toml: '{clave}' (en [{seccion}]) no es un parámetro; "
+                                     f"los que hay son {sorted(campos)}")
+                if not isinstance(valor, int) or isinstance(valor, bool):
+                    raise ValueError(f"config.toml: {clave}={valor!r} debería ser un entero")
+                valores[clave] = valor
+    if anio is not None:
+        valores["anio"] = anio
+    if valores.get("anio") is None:
+        raise ValueError(f"{ruta}: falta 'anio' en [horizonte]; el año lo declaran los datos")
+    return Config(**valores)                            # type: ignore[arg-type]
+
+
 def _cargar_patrones(directorio: Path) -> dict[str, list[dict[str, str]]]:
     sin_ordenar = {}
     with open(directorio / "patrones.csv", mode="r", encoding="utf-8",newline="") as archivo:
@@ -497,7 +547,7 @@ def offsets_patron(
     return offsets
 
 
-def cargar(directorio: Path | str = DATA) -> Datos:
+def cargar(directorio: Path | str = DATA, anio: int | None = None) -> Datos:
     d = Path(directorio)
     turnos = _cargar_turnos(d)
     trabajadores = _cargar_trabajadores(d)
@@ -523,6 +573,9 @@ def cargar(directorio: Path | str = DATA) -> Datos:
         # Fila de arranque de cada trabajador de patrón: `fila_inicial` si la declara, orden
         # alfabético si no. Única fuente para todo lo que prescribe la rotación.
         offsets=offsets_patron(trabajadores, patrones),
+        # Año y parámetros del convenio (config.toml). Única fuente: el modelo, el pulido, la
+        # salida, el diagnóstico y el validador leen todos de aquí.
+        config=_cargar_config(d, anio),
     )
 
 
