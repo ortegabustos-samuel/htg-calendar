@@ -82,11 +82,13 @@ def _prescripcion(datos: Datos, patron: str, trabs: list[str],
                   fechas: list[date], ancla: date) -> dict[str, list[tuple[date, str]]]:
     """(trabajador -> [(fecha, turno)]) que la rotación del patrón prescribe en el periodo.
     Misma regla que modelo._prescripcion_patron: una fila por semana desde el ancla, y cada
-    trabajador del grupo arranca en una fila distinta (offset por orden)."""
+    trabajador del grupo arranca en la fila que le fija `datos.offsets` (declarada en
+    trabajadores.csv, o el orden del grupo si no se declara)."""
     filas = datos.patrones.get(patron) or []
     T = len(filas)
     pres: dict[str, list[tuple[date, str]]] = {}
-    for off, w in enumerate(sorted(trabs)):
+    for w in sorted(trabs):
+        off = datos.offsets.get(w, 0)
         items = []
         for f in fechas:
             s = filas[(off + (f - ancla).days // 7) % T][DIAS[f.weekday()]]

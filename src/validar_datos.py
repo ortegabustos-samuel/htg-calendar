@@ -33,7 +33,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from cargar_datos import DATA, DIAS, LIBRE, cargar                              # noqa: E402
 
 # Columnas que cada fichero DEBE traer. Las opcionales (factor_jornada, grupo, linea, municipio,
-# prioridad) no se exigen: el cargador les da valor por defecto.
+# prioridad, fila_inicial) no se exigen: el cargador les da valor por defecto.
 OBLIGATORIAS = {
     "turnos.csv": ["id_turno", "municipio", "lv", "sabado", "domingo", "festivo",
                    "hora_entrada", "hora_salida", "horas_computadas", "dem"],
@@ -274,6 +274,40 @@ def revisar_contrato(crudo: dict[str, list[dict]], inf: Informe) -> None:
         elif nf != ng:
             inf.error(f"patrones: '{p}' tiene {nf} filas y {ng} trabajadores; deben coincidir")
 
+    # `fila_inicial` (opcional): la fila que hace el trabajador en la PRIMERA semana del horizonte.
+    # Es lo que enlaza la rotación con la del año anterior, así que un valor mal puesto no rompe
+    # nada visible — sale un cuadrante válido que sencillamente NO continúa donde tocaba.
+    # (Que dos acaben en la MISMA fila se comprueba en revisar_viabilidad, sobre los offsets ya
+    # resueltos: aquí solo se ven los declarados, y una colisión puede darse entre uno declarado y
+    # otro deducido del orden alfabético.)
+    declarados_pat: Counter = Counter()
+    for w, r in trabs.items():
+        crudo_fila = (r.get("fila_inicial") or "").strip()
+        if not crudo_fila:
+            continue
+        if r["tipo"].strip() != "patron":
+            inf.aviso(f"trabajadores: {w} no es de patrón pero declara fila_inicial; se ignora")
+            continue
+        p = (r.get("patron") or "").strip()
+        try:
+            fi = int(crudo_fila)
+        except ValueError:
+            inf.error(f"trabajadores: {w} tiene fila_inicial='{crudo_fila}'; se espera un entero")
+            continue
+        nf = filas_pat.get(p, 0)
+        if fi < 0 or (nf and fi >= nf):
+            inf.error(f"trabajadores: {w} tiene fila_inicial={fi}, fuera del patrón '{p}' "
+                      f"(tiene {nf} filas: 0..{nf - 1})")
+            continue
+        declarados_pat[p] += 1
+    # Mezclar declarados y deducidos es legítimo (el que no declara cae al orden alfabético), pero
+    # casi siempre es un olvido: quien empieza a fijar filas suele querer fijarlas todas.
+    for p, n in sorted(declarados_pat.items()):
+        if n < gente_pat.get(p, 0):
+            inf.aviso(f"patrones: en '{p}' solo {n} de {gente_pat.get(p, 0)} trabajadores declaran "
+                      f"fila_inicial; los demás la deducen del orden alfabético, que cambia al "
+                      f"entrar o salir gente del grupo")
+
     # Índices de fila: 0..T-1 sin huecos (el cargador ordena por el índice, pero si falta el 2 la
     # rotación se desplaza y nadie lo nota).
     por_patron: dict[str, list[str]] = defaultdict(list)
@@ -360,6 +394,19 @@ def revisar_viabilidad(directorio: Path, inf: Informe) -> None:
     ini = date(anio, 1, 1) - timedelta(days=date(anio, 1, 1).weekday())
     fechas = rango_fechas(ini, date(anio, 12, 31))
     inf.nota(f"horizonte deducido de los festivos: año {anio}")
+
+    # Filas de arranque EFECTIVAS (lo declarado en fila_inicial, o el orden alfabético si no viene).
+    # Se mira aquí y no sobre el CSV porque una colisión puede darse entre un trabajador que declara
+    # su fila y otro que la deduce del orden: por separado, ninguno de los dos parece mal.
+    por_fila: dict[str, dict[int, list[str]]] = defaultdict(lambda: defaultdict(list))
+    for w, off in d.offsets.items():
+        por_fila[d.trabajadores[w].patron][off].append(w)
+    for p, filas_w in sorted(por_fila.items()):
+        for off, ws in sorted(filas_w.items()):
+            if len(ws) > 1:
+                inf.error(f"patrones: en '{p}' la fila {off} la hacen {len(ws)} trabajadores "
+                          f"({', '.join(sorted(ws))}); harían turnos idénticos todo el año y otra "
+                          f"fila se quedaría sin recorrer. Revisa `fila_inicial`")
 
     # Balance anual: horas que hay que cubrir contra horas que la plantilla puede dar.
     dem = sum(t.dem * t.horas for f in fechas for s, t in d.turnos.items()

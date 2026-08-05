@@ -564,9 +564,10 @@ class Modelo:
     def _prescripcion_patron(self) -> dict[tuple[str, date], str]:
         """Turno que la rotación prescribe a cada (trabajador de patrón, fecha) de la ventana
         (incluye LIBRE). La rotación avanza una fila por semana desde el ANCLA GLOBAL (lunes fijo,
-        igual para todas las ventanas); cada trabajador del grupo arranca en una fila distinta (offset
-        por orden en el grupo). Fuente ÚNICA para el warm-start (_warm_start_patron) y la fijación
-        (_fijacion_patron)."""
+        igual para todas las ventanas); cada trabajador del grupo arranca en la fila que le fija
+        `datos.offsets` (declarada en trabajadores.csv, o el orden del grupo si no se declara — ver
+        cargar_datos.offsets_patron). Fuente ÚNICA para el warm-start (_warm_start_patron) y la
+        fijación (_fijacion_patron)."""
         base = self.ancla_patron or self.fechas[0]           # ancla global (rodante) o inicio de ventana (1 sola)
         ancla = base - timedelta(days=base.weekday())        # lunes de la semana ancla
         grupos: dict[str, list[str]] = defaultdict(list)
@@ -579,7 +580,8 @@ class Modelo:
             if not filas:
                 continue
             T = len(filas)
-            for offset, w in enumerate(sorted(trabs)):
+            for w in sorted(trabs):
+                offset = self.datos.offsets.get(w, 0)
                 for f in self.fechas:
                     pres[(w, f)] = filas[(offset + (f - ancla).days // 7) % T][DIAS[f.weekday()]]
         return pres
@@ -1191,7 +1193,8 @@ def _prescripcion_por_ciclo(datos: Datos, patron: str, fechas: list[date],
     T = len(filas)
     trabs = sorted(w for w, t in datos.trabajadores.items() if t.patron == patron)
     pres: dict[str, dict[int, int]] = {}
-    for off, w in enumerate(trabs):
+    for w in trabs:
+        off = datos.offsets.get(w, 0)
         porciclo: dict[int, int] = defaultdict(int)
         for f in fechas:
             k = (f - ancla).days // 7
@@ -1387,7 +1390,8 @@ def reserva_cubridores(datos: Datos, inicio: date, fin: date,
     for p, filas in datos.patrones.items():
         T = len(filas)
         trabs = sorted(w for w, t in datos.trabajadores.items() if t.patron == p)
-        for off, w in enumerate(trabs):
+        for w in trabs:
+            off = datos.offsets.get(w, 0)
             for f in fechas:
                 s = filas[(off + (f - ancla).days // 7) % T][DIAS[f.weekday()]]
                 if s in criticas and datos.opera(s, f):

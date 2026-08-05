@@ -12,7 +12,7 @@ un resumen y comprobaciones de la instancia cargada.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta , time
 from pathlib import Path
 import csv
@@ -115,6 +115,9 @@ class Trabajador:
     factor_jornada: float = 1.0     # reducción de jornada: escala objetivo (1776) y tope (1826). 1.0 = jornada completa
     grupo: str | None = None        # grupo de EQUIDAD: mismos grupo se equiparan entre sí (findes/festivos).
                                     # Lo asigna la empresa; None = sin grupo (no entra en equidad de grupo)
+    fila_inicial: int | None = None  # solo tipo=patron: fila de `patrones.csv` que hace en la PRIMERA
+                                    # semana del horizonte. Es lo que da continuidad entre años —ver
+                                    # `offsets_patron`—. None = no declarada (se deduce del orden).
 
 
 @dataclass
@@ -140,6 +143,8 @@ class Datos:
     festivos: dict[str, set[date]]                 # ambito(calendario) -> fechas
     capacidades: dict[tuple[str, str], Capacidad]  # (id_trab, id_turno) -> flags
     patrones: dict[str, list[dict[str, str]]]      # patron -> [ {weekday: turno|LIBRE} ]
+    offsets: dict[str, int] = field(default_factory=dict)  # trabajador de patrón -> fila de arranque
+                                                   # (ver `offsets_patron`). Lo deriva `cargar()`.
 
     # -- Consultas derivadas ------------------------------------------------- #
     def es_festivo(self, f: date, municipio: str) -> bool:
@@ -242,6 +247,23 @@ def _cargar_trabajadores(directorio: Path) -> dict[str, Trabajador]:
                     f"factor_jornada de {fila['id_trab']} fuera de rango (0,1]: {factor}"
                 )
 
+            # fila_inicial: columna OPCIONAL (solo tipo=patron). Vacía -> None: el offset se deduce
+            # del orden dentro del grupo, como se hacía antes de existir la columna.
+            crudo_fila = (fila.get("fila_inicial") or "").strip()
+            if crudo_fila:
+                try:
+                    fila_inicial = int(crudo_fila)
+                except ValueError:
+                    raise ValueError(
+                        f"fila_inicial de {fila['id_trab']} no es un entero: '{crudo_fila}'"
+                    ) from None
+                if fila_inicial < 0:
+                    raise ValueError(
+                        f"fila_inicial de {fila['id_trab']} es negativa ({fila_inicial})"
+                    )
+            else:
+                fila_inicial = None
+
             trabajadores[fila["id_trab"]] = Trabajador(
                 id=fila["id_trab"],
                 tipo=fila["tipo"],
@@ -250,6 +272,7 @@ def _cargar_trabajadores(directorio: Path) -> dict[str, Trabajador]:
                 vacaciones = [(vac1, vac1 + timedelta(days=14)),(vac2, vac2 + timedelta(days=14))],
                 factor_jornada=factor,
                 grupo=(fila.get("grupo") or "").strip() or None,   # columna OPCIONAL de grupo de equidad
+                fila_inicial=fila_inicial,
             )
     return trabajadores
 
@@ -434,6 +457,46 @@ def _derivar_grupos_equidad(trabajadores: dict[str, Trabajador]) -> int:
     return asignados
 
 
+def offsets_patron(
+    trabajadores: dict[str, Trabajador],
+    patrones: dict[str, list[dict[str, str]]],
+) -> dict[str, int]:
+    """Fila de la rotación en que arranca cada trabajador de patrón: {id_trab -> offset}.
+
+    La rotación de un trabajador es `filas[(offset + semanas_desde_el_ancla) % T]`, y el ancla es el
+    lunes de la primera semana del horizonte. El offset es, por tanto, LA FILA QUE HACE ESA PRIMERA
+    SEMANA — y es lo único que da continuidad de un año al siguiente: sin él, cada 1 de enero la
+    rotación vuelve a empezar y quien tenga la fila mala del patrón la repite año tras año.
+
+    Fuente ÚNICA para los cuatro sitios que prescriben la rotación (`Modelo._prescripcion_patron`,
+    `_prescripcion_por_ciclo`, `reserva_cubridores` y `diagnostico`), que antes lo deducían cada uno
+    por su cuenta y podían discrepar.
+
+    Dos orígenes, en este orden:
+      · `fila_inicial` en trabajadores.csv — lo declarado MANDA. Es el caso normal: la empresa sabe
+        quién va en qué fila, y al empezar un año nuevo se actualiza la columna con el punto en que
+        quedó la rotación.
+      · si no viene, el ORDEN ALFABÉTICO dentro del grupo (comportamiento anterior a la columna, para
+        que los datos que ya existen sigan funcionando sin tocarlos).
+    Se puede mezclar: los que declaren fila la usan, los demás caen al orden. El validador avisa si
+    dos del mismo grupo acaban en la misma fila (harían turnos idénticos y otra fila quedaría sin
+    recorrer)."""
+    grupos: dict[str, list[str]] = {}
+    for w, t in trabajadores.items():
+        if t.tipo == "patron" and t.patron:
+            grupos.setdefault(t.patron, []).append(w)
+
+    offsets: dict[str, int] = {}
+    for patron, trabs in grupos.items():
+        T = len(patrones.get(patron) or ())
+        if not T:
+            continue                                   # patrón sin filas: no hay rotación que anclar
+        for orden, w in enumerate(sorted(trabs)):
+            declarada = trabajadores[w].fila_inicial
+            offsets[w] = (declarada if declarada is not None else orden) % T
+    return offsets
+
+
 def cargar(directorio: Path | str = DATA) -> Datos:
     d = Path(directorio)
     turnos = _cargar_turnos(d)
@@ -457,6 +520,9 @@ def cargar(directorio: Path | str = DATA) -> Datos:
         festivos=_cargar_festivos(d),
         capacidades=capacidades,
         patrones=patrones,
+        # Fila de arranque de cada trabajador de patrón: `fila_inicial` si la declara, orden
+        # alfabético si no. Única fuente para todo lo que prescribe la rotación.
+        offsets=offsets_patron(trabajadores, patrones),
     )
 
 

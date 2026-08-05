@@ -55,6 +55,18 @@ id_trab,tipo,patron,vac1_inicio,vac2_inicio,linea
 | `vac1_inicio`,`vac2_inicio` | inicio de cada periodo; duran 15 días naturales |
 | `factor_jornada` | OPCIONAL, default 1.0. Reducción de jornada en (0,1]: escala objetivo y tope |
 | `grupo` | OPCIONAL. Grupo de equidad de findes/festivos. Si se omite, cada patrón forma su propio grupo y mixtos/correturnos van al pool general |
+| `fila_inicial` | OPCIONAL, solo `tipo=patron`. Fila de `patrones.csv` que hace en la **primera semana del horizonte**. Entero en `[0, nº de filas)`. Si se omite, se deduce del orden alfabético del NIF dentro del grupo |
+
+**`fila_inicial` es lo que enlaza la rotación de un año con la del anterior.** Sin ella, cada 1 de
+enero la rotación vuelve a empezar y quien tenga la fila mala del patrón la repite año tras año;
+además el orden alfabético depende de *quién más está en el grupo*, así que un alta o una baja
+desplaza de fila a todos los que ordenan por detrás. Al preparar un año nuevo hay que mirar por
+dónde iba la rotación al cerrar el anterior y poner aquí ese valor.
+
+Ojo al calcularlo a mano: el salto entre el ancla de un año y la del siguiente **no siempre es de
+52 semanas** (2028→2029 son 53, porque depende de en qué día caiga el 1 de enero). Un valor mal
+puesto no rompe nada visible — sale un cuadrante perfectamente válido que sencillamente no
+continúa donde tocaba.
 
 ## `patrones.csv` — las rotaciones pactadas
 
@@ -64,7 +76,8 @@ UVI_VAL,0,LIBRE,LIBRE,VADU47127,VADU47127,LIBRE,LIBRE,LIBRE
 ```
 
 Una **fila = una semana** de la rotación; el patrón avanza una fila por semana desde un lunes
-ancla, y cada trabajador del grupo arranca en una fila distinta. Celdas: id de turno o `LIBRE`.
+ancla, y cada trabajador del grupo arranca en una fila distinta — la que le fija su `fila_inicial`
+en `trabajadores.csv`. Celdas: id de turno o `LIBRE`.
 
 De aquí se derivan **automáticamente** las capacidades de los trabajadores de patrón (todos los
 días), así que **esas filas no deben ponerse en capacidades.csv**.
