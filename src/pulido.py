@@ -35,7 +35,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from cargar_datos import Datos                                            # noqa: E402
 from modelo import (JORNADA_LOCALIZADO_SEMANA, jornada_minutos,           # noqa: E402
-                    lineas_localizadas, semana)
+                    lineas_localizadas, semana, semanas_adoptadas)
 
 METRICAS_PULIDO = ("sabado", "domingo", "festivo")
 
@@ -492,6 +492,7 @@ def aprovechar(datos: Datos, plan: dict) -> int:
     fechas = datos.fechas
     pares = _pares_pactados(datos)
     loc = lineas_localizadas(datos)
+    adoptadas = semanas_adoptadas(datos)
     ocupado: Counter = Counter()
     # `horas` = jornada contra el objetivo anual (moneda del libro); `hsem` = jornada LEGAL semanal,
     # que es la que topa config.hmax7. Son dos contabilidades distintas y aquí se mueven por separado.
@@ -515,9 +516,11 @@ def aprovechar(datos: Datos, plan: dict) -> int:
 
     cambios, por_prio = 0, Counter()
     for f in fechas:
-        # Las plazas de LOCALIZADO no se tapan con un refuerzo suelto: quien las coge asume la
-        # semana entera con sus descansos (modelo._handover_critico), y aquí solo se cambia un día.
-        huecos = [s for s in _huecos_dia(datos, ocupado, f) if s not in loc]
+        # Una plaza de localizado solo es intocable la semana en que se ADOPTA entera: entonces
+        # quien la coge se lleva sus descansos (modelo._adopcion_plaza) y aquí solo se cambia un
+        # día. Si el hueco es de una semana de cobertura parcial, es un turno normal y sí se tapa.
+        huecos = [s for s in _huecos_dia(datos, ocupado, f)
+                  if s not in loc or (s, semana(f)) not in adoptadas]
         if not huecos:
             continue
         libres = [w for w in dia.get(f, [])
@@ -615,6 +618,7 @@ def canjear(datos: Datos, plan: dict) -> int:
         return 0
     pares = _pares_pactados(datos)
     loc = lineas_localizadas(datos)
+    adoptadas = semanas_adoptadas(datos)
     semanas = _semanas_completas(fechas)
     pos = {sm: i for i, sm in enumerate(semanas)}
 
@@ -725,11 +729,11 @@ def canjear(datos: Datos, plan: dict) -> int:
             elegible, es_ref = datos.elegible(w, s, f)
             if not elegible:
                 continue
-            if actual is None and any(datos.turnos[x].prioridad >= 2
-                                      for x in sem_turnos[(w, sm)]):
-                continue    # esa semana cubre una línea CRÍTICA: asumió la plaza entera con sus
-                            # descansos (modelo._handover_critico), y sus días libres son parte de
-                            # ella. Cambiarle un refuerzo por otro turno del mismo día sí vale.
+            if actual is None and any((x, sm) in adoptadas for x in sem_turnos[(w, sm)]):
+                continue    # esa semana ADOPTÓ una plaza crítica entera: se llevó la plaza con sus
+                            # descansos (modelo._adopcion_plaza) y sus días libres son parte de ella.
+                            # Si solo tapó días sueltos, su semana es normal y sí admite turnos.
+                            # Cambiarle un refuerzo por otro turno del mismo día sí vale.
             previo = datos.turnos[actual] if actual else None
             dj = t.horas_consumo - (previo.horas_consumo if previo else 0.0)
             sueltos = a_soltar(w, f, horas[w] + dj - techo[w])

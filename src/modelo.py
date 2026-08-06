@@ -29,7 +29,7 @@ from ortools.sat.python import cp_model
 
 # Jornada que COMPUTA una SEMANA de plaza de LOCALIZADO 24h asumida entera (h). Es la unidad en que
 # se contabiliza esa plaza para el objetivo anual, y no la suma de sus turnos, por dos motivos:
-#  · quien la cubre se lleva la plaza CON sus descansos (_handover_critico): esa semana no hace
+#  · si falta la fila ENTERA, quien la cubre se lleva la plaza CON sus descansos (_adopcion_plaza):
 #    NINGÚN otro turno, así que es una semana de trabajo completa aunque la rotación solo le ponga
 #    2 turnos (la fila corta libra miércoles y jueves; la larga son 5);
 #  · sus turnos computan 8 h LEGALES cada uno, que es lo que exige el convenio, pero no describe lo
@@ -191,7 +191,7 @@ def semana(f: date) -> tuple[int, int]:
 
 def lineas_localizadas(datos: Datos) -> set[str]:
     """Líneas de los patrones UVI (localizado 24h): las únicas que se ceden como PLAZA ENTERA con
-    sus descansos (_handover_critico) y, por tanto, las únicas que computan por SEMANA y no por
+    sus descansos (_adopcion_plaza) y, por tanto, las únicas que computan por SEMANA y no por
     turno (ver JORNADA_LOCALIZADO_SEMANA)."""
     return {s for p in _patrones_uvi(datos)
             for fila in datos.patrones.get(p, []) for s in fila.values()
@@ -290,6 +290,9 @@ class Modelo:
         # 'cesiones' = {(trabajador, ciclo)} que el NIVEL 0 decidió que se libran (ver
         # calendario_cesiones). Manda sobre el cap: los ciclos que no están aquí se trabajan.
         self.cesiones = cesiones
+        # Semanas en que un titular de línea crítica falta ENTERA: quien la cubra adopta la plaza
+        # con sus descansos. Si falta solo parte, son turnos normales (ver AusenciaCritica).
+        self.adopciones = [a for a in ausencias_criticas(datos, cesiones) if a.entera]
         self.tope_paced = tope_paced   # cap prorrateado acumulado (min) hasta el fin de la ventana, por NO-fijo
         self.cola = set(cola)
         self.retira: dict[tuple[str, date], cp_model.BoolVar] = {}   # Etapa 4: día quitado a un fijo
@@ -311,7 +314,7 @@ class Modelo:
             elif "24h" in tipos and len(filas) <= 2:
                 self.patrones_uvi.add(p)
         # Líneas de los patrones DEDICADOS (noche y UVI): quien cubre una de ellas adopta la plaza
-        # ENTERA esa semana, descansos incluidos (ver _handover_critico).
+        # ENTERA esa semana, descansos incluidos (ver _adopcion_plaza).
         # OJO, el criterio NO es la prioridad. H también es prioridad 3, pero eso está puesto para que
         # no se quede desatendido, no porque arrastre descansos: H sí admite cubrirse sin heredar los
         # libres de nadie. Si se le aplicara el handover, quien lo tapa un día no podría hacer su
@@ -353,7 +356,7 @@ class Modelo:
         self.prescripcion = self._prescripcion_patron()   # turno de rotación por (patrón, fecha)
         self._activo_patron()                     # noches: acopla su rotación por QUINCENA (ciclo 14d)
         self._solo_rotacion_uvi()                 # UVI: solo su rotación → vacantes al cubridor, no al par
-        self._handover_critico()                  # cubrir una crítica = adoptar la plaza y sus descansos
+        self._adopcion_plaza()                    # fila entera = adoptar la plaza y sus descansos
         self._warm_start_patron()                 # arranque pegado al patrón
 
     # -- Variables ----------------------------------------------------------- #
@@ -1058,46 +1061,100 @@ class Modelo:
                 cota += len(dias) - 5
         return sum(excesos), cota
 
-    def _handover_critico(self) -> None:
-        """DURA: quien cubre una línea CRÍTICA una semana no hace NINGÚN otro turno esa semana.
+    def _adopcion_plaza(self) -> None:
+        """DURA: quien cubre una plaza crítica cuya fila falta ENTERA la hace completa y no hace
+        nada más esa semana.
 
-        Cubrir una noche o un localizado no es coger unos turnos sueltos: es asumir la plaza, y la
-        plaza viene con sus DESCANSOS. La rotación del UVI libra miércoles y jueves; si el cubridor
-        los rellena con otra línea se ha quedado con el trabajo y no con el descanso, que es lo que
-        la empresa no acepta. Sin esta regla, en 2026 el 70% de las semanas con cobertura crítica
-        (44 de 63) llevaban además otros turnos.
+        Cubrir una plaza de noche o de localizado no es coger unos turnos sueltos: es asumir la
+        plaza, y la plaza viene con sus DESCANSOS. La rotación del UVI libra miércoles y jueves; si
+        el cubridor los rellena con otra línea se ha quedado con el trabajo y no con el descanso,
+        que es lo que la empresa no acepta.
 
-        C4 NO basta para conseguirlo: solo mira el día siguiente a cada turno, no los libres que la
-        rotación reparte más adelante en la semana. Por eso hace falta la restricción explícita.
+        La regla NO se aplica cuando falta solo PARTE de la fila (o un día suelto): ahí son turnos
+        normales, se cubren como cualquier otro y el cubridor sigue su propia rotación el resto de
+        la semana. La versión anterior se disparaba por TOCAR una línea crítica, con lo que tapar
+        un jueves suelto costaba la semana entera del cubridor —cinco días de desvío de patrón, 500,
+        contra los 300 que vale el hueco— y salía más barato dejar la línea sin cubrir. Es lo que
+        dejaba 11 huecos críticos en 2026 con gente libre y capacitada ese mismo día.
 
-        La semana ISO es la granularidad correcta aquí: el bloque del localizado cabe dentro de una
-        (libra miércoles y jueves) y el de noche, que son 4+3 noches a caballo de dos semanas, se
-        parte justo por donde toca — en cada una de las dos el cubridor hace sus noches y descansa
-        el resto.
+        C4 sigue garantizando el descanso INMEDIATO por su cuenta: estas líneas son 22:00→22:00, así
+        que tras un turno el día siguiente es imposible. Lo que aporta esta regla es la protección
+        frente a la carga ACUMULADA de asumir la plaza una semana entera.
 
-        Es DURA por decisión de la empresa: no es algo que se pueda penalizar y ceder según convenga.
-        El precio a vigilar es que un turno normal que solo pudiera hacer ese cubridor se convierte
-        en hueco, porque ya no puede compaginarlo."""
-        if not self.lineas_criticas:
-            return
-        semanas: dict[tuple[int, int], list[date]] = defaultdict(list)
-        for f in self.fechas:
-            if f not in self.cola:
-                semanas[semana(f)].append(f)
-        for w in self.datos.trabajadores:
-            for sem, dias in semanas.items():
-                crit = [self.x[(w, f, s)] for f in dias for s in self.lineas_criticas
-                        if (w, f, s) in self.x]
-                if not crit:
-                    continue
-                otras = [self.x[(w, f, s)] for f in dias
+        Es DURA por decisión de la empresa: no es algo que se pueda penalizar y ceder según convenga."""
+        for a in self.adopciones:
+            dias_sem = [f for f in self.fechas
+                        if f not in self.cola and semana(f) == a.semana]
+            if not dias_sem:
+                continue                       # esa semana no cae en la parte que decide la ventana
+            for w in self.datos.trabajadores:
+                mios = [self.x[(w, f, a.linea)] for f in sorted(a.faltan)
+                        if (w, f, a.linea) in self.x]
+                if len(mios) < len(a.faltan):
+                    continue      # no puede con todos los días: nunca adopta, nada que restringir
+                otras = [self.x[(w, f, s)] for f in dias_sem
                          for s in self.turnos_wd.get((w, f), [])
-                         if s not in self.lineas_criticas and (w, f, s) in self.x]
+                         if (w, f, s) in self.x and not (s == a.linea and f in a.faltan)]
                 if not otras:
                     continue
-                cubre = self.m.new_bool_var(f"cubre_crit_{w}_{sem[0]}w{sem[1]}")
-                self.m.add(sum(crit) <= len(crit) * cubre)          # toca una crítica -> cubre=1
-                self.m.add(sum(otras) <= len(otras) * (1 - cubre))  # entonces, nada más
+                # `adopta` = hace TODOS los días de la fila. Es una IMPLICACIÓN, no una obligación:
+                # nadie está forzado a adoptar, y dos cubridores pueden repartirse la fila sin que
+                # ninguno adopte —imprescindible en las noches, donde dos personas cubren dos líneas
+                # y exigir la fila entera a una sola dejaba 46 noches sin cubrir—. Lo que la regla
+                # garantiza es lo que pidió la empresa: QUIEN la hace entera se lleva los descansos.
+                adopta = self.m.new_bool_var(f"adopta_{w}_{a.linea}_{a.semana[0]}w{a.semana[1]}")
+                self.m.add_bool_and(mios).only_enforce_if(adopta)
+                self.m.add_bool_or([v.Not() for v in mios]).only_enforce_if(adopta.Not())
+                # Adoptar => nada más esa semana, ni siquiera otra línea crítica: los LIBRE de la
+                # fila son el descanso que viene con la plaza y tienen que quedar vacíos de verdad.
+                self.m.add(sum(otras) <= len(otras) * (1 - adopta))
+
+    def _obligacion_principal(self) -> None:
+        """DURA: el cubridor PRINCIPAL de una línea crítica la cubre los días que su titular falta,
+        aunque tenga que dejar su propio turno —que queda como hueco y lo recoge un correturno—.
+        Solo cuando el principal no puede entra el siguiente en el orden `v`.
+
+        "No puede" son exactamente dos casos: estar de vacaciones (dato, `datos.disponible`) o estar
+        ya haciendo otra línea crítica de prioridad IGUAL O SUPERIOR (variable). Sin la segunda se
+        sacaría a alguien de una línea de prioridad 4 para taparle una de 3, al revés de lo que se
+        quiere; es el caso real de 72918050T, titular de VADP003 y cubridor de VADU47127.
+
+        NO hace falta escape por bloqueo legal: al ser dura, C4 propaga hacia atrás por sí sola y el
+        modelo no puede asignarle al principal, el día anterior, nada incompatible con lo que está
+        obligado a cubrir. Ese turno se libera y queda como hueco.
+
+        Se evalúa por AUSENCIA, no por día. En una adopción `_adopcion_plaza` exige la fila entera o
+        nada, así que obligar día a día ataría al principal a los días en que puede y se lo prohibiría
+        por los que no: infactible. El obligado es el primero del orden que puede con TODOS los días
+        que faltan.
+
+        Antes esto vivía solo en `_preferencia_cubridor`, blando y sumado dentro de W3 junto a la
+        desviación de jornada —que se mide en minutos y es de otro orden de magnitud—, así que no
+        decidía nunca: el plan ponía a un suplente a cubrir mientras el principal de esa misma línea
+        se quedaba en su patrón."""
+        orden = principales(self.datos)
+        for a in ausencias_criticas(self.datos, self.cesiones):
+            cubridores = orden.get(a.linea)
+            if not cubridores:
+                continue
+            prio = self.datos.turnos[a.linea].prioridad
+            grupos = ([sorted(a.faltan)] if a.entera            # la fila entera va en bloque
+                      else [[f] for f in sorted(a.faltan)])     # días sueltos, cada uno por su lado
+            for dias in grupos:
+                dias = [f for f in dias if f not in self.cola]
+                if not dias:
+                    continue
+                for w in cubridores:
+                    variables = [self.x.get((w, f, a.linea)) for f in dias]
+                    if any(v is None for v in variables):
+                        continue          # de vacaciones o sin capacidad algún día: al siguiente
+                    for f, var in zip(dias, variables):
+                        # Escape: ese día ya hace otra crítica de prioridad >= la de esta línea.
+                        ocupado = [self.x[(w, f, s)] for s in self.turnos_wd.get((w, f), [])
+                                   if s != a.linea and (w, f, s) in self.x
+                                   and self.datos.turnos[s].prioridad >= prio]
+                        self.m.add(var + sum(ocupado) >= 1)
+                    break                 # la obligación es del PRIMERO que puede con todo
 
     def _preferencia_cubridor(self) -> tuple[object, int]:
         """P7 (BLANDA): respeta el ORDEN entre los cubridores de una misma línea. El gestor designa
@@ -1794,13 +1851,13 @@ def rellenar_refuerzos(datos: Datos, plan: dict[tuple[str, date], str]) -> int:
     comodines = [s for s, t in datos.turnos.items() if t.prioridad == 0]
     if not comodines:
         return 0
-    # Semanas en que alguien cubre una línea de noche o UVI: ahí adoptó la plaza entera y sus
-    # descansos (ver Modelo._handover_critico), así que el relleno tampoco puede meterle un
-    # refuerzo. Esta pasada corre fuera del modelo y no lo sabría por su cuenta.
-    lineas_criticas = {s for p_ in (_patrones_noche(datos) | _patrones_uvi(datos))
-                       for fila in datos.patrones.get(p_, []) for s in fila.values()
-                       if s and s != LIBRE and s in datos.turnos}
-    sem_bloqueada = {(w, semana(f)) for (w, f), s in plan.items() if s in lineas_criticas}
+    # Semanas en que alguien ADOPTÓ una plaza crítica: se llevó la plaza con sus descansos (ver
+    # Modelo._adopcion_plaza), así que el relleno no puede meterle un refuerzo. Solo cuenta la
+    # adopción de fila entera: si tapó días sueltos, su semana es normal y sí admite relleno. Esta
+    # pasada corre fuera del modelo y no lo sabría por su cuenta.
+    adoptadas = semanas_adoptadas(datos)
+    sem_bloqueada = {(w, semana(f)) for (w, f), s in plan.items()
+                     if (s, semana(f)) in adoptadas}
     # Solo el AÑO: los días del lunes anterior al 1 de enero son jornada del año pasado. Ni cuentan
     # en el libro ni se rellenan (un refuerzo ahí no acercaría a nadie a sus 1776 de este año).
     # Los contadores SEMANALES sí se construyen con el plan entero: la semana ISO es la real.
