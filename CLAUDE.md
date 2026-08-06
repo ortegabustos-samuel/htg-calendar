@@ -66,7 +66,7 @@ else is pinned to the pattern.
 **Pipeline** (`generar_anual.py` orchestrates all of it):
 
 1. `validar_datos.py` — five-level check (config → format → references → contract → feasibility)
-   over `config.toml` + the 6 CSVs; refuses to proceed on ERROR unless `--sin-validar`.
+   over `config.toml` + the 6 CSVs; `generar_anual.py` refuses to start on any ERROR.
 2. `cargar_datos.py` (`cargar()`) — loads `config.toml` (year + convenio limits: `horas_objetivo`,
    `rmin`, `hmax7`, `cmax`, `cmax_pool` — reachable everywhere as `datos.config`, the single source;
    `anio` is mandatory and never inferred) and the 6 CSVs into `Datos`, derives everything not
@@ -79,7 +79,7 @@ else is pinned to the pattern.
    between windows and (b) accumulated equity/hours "books" (`offset`, `offset_horas`) so
    fairness is computed *across* the whole year even though it's solved in pieces. Also builds
    `calendario_cesiones` (Nivel 0: a precomputed calendar spreading night-binomial free blocks
-   across the year — see `doc/`-referenced memory on this) and `reserva_cubridores` before
+   across the year) and `reserva_cubridores` before
    rolling, and `rellenar_refuerzos` after, to fill REF CAL (priority-0 "wildcard"/filler) slack
    with real demand.
 4. `pulido.py` — post-solve passes, in this order: turn leftover REF CAL filler into real coverage,

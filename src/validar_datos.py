@@ -11,7 +11,7 @@ Revisa en cuatro niveles, de lo que impide leer a lo que solo es sospechoso:
 No corrige nada, solo informa: el arreglo va en el CSV, que es la fuente de verdad.
 Sale con código 1 si hay algún ERROR.
 
-Uso:  python3 src/validar_datos.py [directorio_datos]
+Uso:  python3 src/validar_datos.py
 """
 from __future__ import annotations
 
@@ -82,11 +82,11 @@ def _fecha(txt: str) -> date | None:
 # --------------------------------------------------------------------------- #
 #  1. FORMATO — lo que impide leer bien el fichero
 # --------------------------------------------------------------------------- #
-def revisar_config(directorio: Path, inf: Informe) -> bool:
+def revisar_config(inf: Informe) -> bool:
     """`config.toml`: año y parámetros del convenio. Devuelve si se puede seguir (sin año no hay
     horizonte y el nivel 4 no puede hacer nada)."""
     try:
-        cfg = _cargar_config(directorio)
+        cfg = _cargar_config()
     except Exception as e:                                  # noqa: BLE001 — el mensaje ya es claro
         inf.error(f"config.toml: {e}")
         return False
@@ -105,7 +105,7 @@ def revisar_config(directorio: Path, inf: Informe) -> bool:
     return not inf.errores
 
 
-def revisar_formato(directorio: Path, inf: Informe) -> tuple[dict[str, list[dict]], list[str]]:
+def revisar_formato(inf: Informe) -> tuple[dict[str, list[dict]], list[str]]:
     """Lee los CSV en crudo, sin pasar por el cargador, para ver el texto tal cual está.
 
     Devuelve (filas de cada fichero, ficheros ILEGIBLES). La distinción importa: un espacio
@@ -116,9 +116,9 @@ def revisar_formato(directorio: Path, inf: Informe) -> tuple[dict[str, list[dict
     ilegibles: list[str] = []
     for nombre, obligatorias in OBLIGATORIAS.items():
         crudo[nombre] = []
-        ruta = directorio / nombre
+        ruta = DATA / nombre
         if not ruta.exists():
-            inf.error(f"{nombre}: no existe en {directorio}")
+            inf.error(f"{nombre}: no existe en {DATA}")
             ilegibles.append(nombre)
             continue
         with open(ruta, encoding="utf-8-sig", newline="") as fh:
@@ -219,7 +219,7 @@ def revisar_referencias(crudo: dict[str, list[dict]], inf: Informe) -> None:
 
 
 # --------------------------------------------------------------------------- #
-#  3. CONTRATO — las reglas de doc/contrato_datos.md
+#  3. CONTRATO — las reglas que los CSV deben cumplir
 # --------------------------------------------------------------------------- #
 def revisar_contrato(crudo: dict[str, list[dict]], inf: Informe) -> None:
     trabs = {r["id_trab"]: r for r in crudo["trabajadores.csv"]}
@@ -397,12 +397,12 @@ def revisar_contrato(crudo: dict[str, list[dict]], inf: Informe) -> None:
 # --------------------------------------------------------------------------- #
 #  4. VIABILIDAD — no rompe la carga, pero anticipa un mal cuadrante
 # --------------------------------------------------------------------------- #
-def revisar_viabilidad(directorio: Path, inf: Informe) -> None:
+def revisar_viabilidad(inf: Informe) -> None:
     """Solo corre si el resto pasó: necesita los datos ya cargados por cargar_datos."""
     from modelo import (_patrones_noche, _patrones_uvi,                   # noqa: PLC0415
                         jornada_minutos, rango_fechas)
 
-    d = cargar(directorio)
+    d = cargar()
     objetivo = d.config.horas_objetivo
     anio = d.config.anio
     ini = date(anio, 1, 1) - timedelta(days=date(anio, 1, 1).weekday())
@@ -487,7 +487,7 @@ def revisar_viabilidad(directorio: Path, inf: Informe) -> None:
 # --------------------------------------------------------------------------- #
 #  Orquestación
 # --------------------------------------------------------------------------- #
-def validar(directorio: Path | str = DATA) -> Informe:
+def validar() -> Informe:
     """Ejecuta los cuatro niveles, informando de todo lo que se pueda en una sola pasada: arreglar
     los CSV de uno en uno, relanzando entre cada arreglo, sería insufrible.
 
@@ -496,13 +496,12 @@ def validar(directorio: Path | str = DATA) -> Informe:
         y los niveles 2 y 3 lo verían como si estuviera vacío: todo lo que lo cita saldría roto.
       * el nivel 4 mide el año entero (balance, profundidad, horas por patrón); con referencias
         rotas esos números serían inventados, así que solo corre si no hay ningún error."""
-    directorio = Path(directorio)
     inf = Informe()
 
-    if not revisar_config(directorio, inf):
+    if not revisar_config(inf):
         inf.nota("no se ha revisado nada más: sin config.toml válido no hay horizonte que medir")
         return inf
-    crudo, ilegibles = revisar_formato(directorio, inf)
+    crudo, ilegibles = revisar_formato(inf)
     if ilegibles:
         inf.nota(f"no se ha revisado nada más: {', '.join(ilegibles)} no se puede(n) leer")
         return inf
@@ -513,16 +512,15 @@ def validar(directorio: Path | str = DATA) -> Informe:
                  "errores los números no significarían nada")
         return inf
     try:
-        revisar_viabilidad(directorio, inf)
+        revisar_viabilidad(inf)
     except Exception as e:                                          # noqa: BLE001
         inf.error(f"los datos no se pueden cargar: {type(e).__name__}: {e}")
     return inf
 
 
 def main() -> int:
-    directorio = Path(sys.argv[1]) if len(sys.argv) > 1 else DATA
-    print(f"Validando {directorio}\n")
-    inf = validar(directorio)
+    print(f"Validando {DATA}\n")
+    inf = validar()
 
     for etiqueta, mensajes in (("ERROR", inf.errores), ("aviso", inf.avisos), ("nota ", inf.notas)):
         for m in mensajes:

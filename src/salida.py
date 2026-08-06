@@ -18,10 +18,10 @@ from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
-from cargar_datos import Datos, cargar
+from cargar_datos import Datos
 from modelo import (JORNADA_LOCALIZADO_SEMANA, LAMBDA, METRICAS,
-                    Modelo, _patrones_uvi, jornada_minutos, lineas_localizadas,
-                    peso_cobertura, rango_fechas, semana)
+                    _patrones_uvi, jornada_minutos, lineas_localizadas,
+                    peso_cobertura, semana)
 
 RAIZ = Path(__file__).resolve().parents[1]
 SALIDA = RAIZ / "data" / "output"
@@ -38,17 +38,7 @@ FILL_VAC_XL, FILL_HUECO_XL = "FFFF00", "F4B084"
 # --------------------------------------------------------------------------- #
 #  Extracción de la solución
 # --------------------------------------------------------------------------- #
-def asignaciones(modelo: Modelo, solver) -> dict[tuple[str, date], str]:
-    """(trabajador, fecha) -> id_turno asignado."""
-    return {(w, f): s for (w, f, s), var in modelo.x.items() if solver.value(var)}
 
-
-def sin_cubrir(modelo: Modelo, solver) -> list[tuple[date, str]]:
-    """Lista de (fecha, id_turno) no cubiertos (una entrada por unidad de demanda)."""
-    huecos = []
-    for (turno, f), u in modelo.u.items():
-        huecos += [(f, turno)] * solver.value(u)
-    return sorted(huecos)
 
 # --------------------------------------------------------------------------- #
 #  Excel (formato de la empresa)
@@ -422,44 +412,6 @@ def escribir_excel(datos: Datos, fechas: list[date], asign, huecos, kpis: dict) 
 # --------------------------------------------------------------------------- #
 #  Resumen por consola
 # --------------------------------------------------------------------------- #
-def resumen_consola(datos: Datos, fechas: list[date], huecos, kpis: dict,
-                    desviaciones, solver) -> None:
-    print(f"Estado: {kpis['estado']}")
-    print(f"Cobertura: {kpis['cubiertos']}/{kpis['demanda']} ({kpis['pct']:.1f}%)  "
-          f"| sin cubrir: {kpis['huecos']}  | P1={kpis['p1']}  P2={kpis['p2']}")
-    print("Equidad (desviación ponderada por métrica): "
-          + ", ".join(f"{m}={sum(solver.value(v) for v in vars_desv)}"
-                      for m, vars_desv in desviaciones.items()))
-    # sin cubrir por día
-    por_dia = {}
-    for d, _ in huecos:
-        por_dia[d] = por_dia.get(d, 0) + 1
-    if por_dia:
-        peor = sorted(por_dia.items(), key=lambda kv: -kv[1])[:5]
-        print("Días con más huecos: " + ", ".join(f"{d:%d/%m}:{n}" for d, n in peor))
-    print(f"\nFichero en {SALIDA.relative_to(RAIZ)}/: calendario.xlsx")
-
-
-# --------------------------------------------------------------------------- #
-def generar(modelo: Modelo, solver, estado) -> None:
-    datos, fechas = modelo.datos, modelo.fechas
-    asign = asignaciones(modelo, solver)
-    huecos = sin_cubrir(modelo, solver)
-
-    n_huecos = len(huecos)
-    demanda = sum(datos.turnos[t].dem for (t, _) in modelo.u)
-    kpis = {
-        "demanda": demanda, "huecos": n_huecos, "cubiertos": demanda - n_huecos,
-        "pct": 100 * (demanda - n_huecos) / demanda if demanda else 0,
-        "p1": sum(peso_cobertura(datos.turnos[t]) * solver.value(u)
-                  for (t, _), u in modelo.u.items()),
-        "p2": sum(LAMBDA[m] * sum(solver.value(v) for v in vars_desv)
-                  for m, vars_desv in modelo.desviaciones.items()),
-        "estado": solver.status_name(estado),
-    }
-    escribir_excel(datos, fechas, asign, huecos, kpis)
-    resumen_consola(datos, fechas, huecos, kpis, modelo.desviaciones, solver)
-
 
 # --------------------------------------------------------------------------- #
 #  Salida a partir de un PLAN anual (horizonte rodante): dict {(trab,fecha):turno}
@@ -731,9 +683,10 @@ def escribir_informe_cobertura(datos: Datos, huecos: list[tuple[date, str]]) -> 
     return ruta
 
 
-def generar_anual(datos: Datos, fechas: list[date], plan: dict,
-                  estado: str = "HORIZONTE RODANTE") -> None:
+def generar_anual(datos: Datos, plan: dict) -> None:
     """Vuelca a Excel el plan anual del horizonte rodante e imprime el report de equidad."""
+    fechas = datos.fechas
+    estado = "HORIZONTE RODANTE"
     huecos = huecos_del_plan(datos, fechas, plan)
     escribir_informe_cobertura(datos, huecos)
     kpis = _kpis_plan(datos, fechas, plan, huecos, estado)
@@ -758,16 +711,3 @@ def generar_anual(datos: Datos, fechas: list[date], plan: dict,
     metricas_trabajadores(datos, plan, fechas)
     print(f"\nFicheros en {SALIDA.relative_to(RAIZ)}/: calendario.xlsx · "
           f"metricas_trabajadores.csv · informe_cobertura.csv")
-
-
-if __name__ == "__main__":
-    # Prueba de resolución COMPLETA (sin horizonte rodante ni ventanas): todo el
-    # mes se decide en un único modelo, para ver hasta dónde llega el solver en
-    # un tiempo razonable. Para producción (año completo) usar resolver_anual.
-    datos = cargar("data/input")
-    anio = datos.config.anio
-    inicio, fin = date(anio, 1, 1), date(anio, 1, 31)
-    fechas = rango_fechas(inicio, fin)
-    modelo = Modelo(datos, fechas)
-    solver, estado = modelo.resolver(trabajadores_cpu=16, log=True)
-    generar(modelo, solver, estado)

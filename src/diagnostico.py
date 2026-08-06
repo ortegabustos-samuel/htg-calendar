@@ -17,14 +17,14 @@ no hay semántica de turno (noche/UVI/localizado) escrita en el código:
   4. LÍNEAS       profundidad de cobertura de cada turno (titulares/cubridores): dónde un
                   solo hueco de disponibilidad deja la línea sin nadie.
 
-Uso:  python3 src/diagnostico.py [directorio_datos] [año]
+Uso:  python3 src/diagnostico.py
 """
 from __future__ import annotations
 
 from collections import defaultdict
 from datetime import date, datetime, timedelta
 
-from cargar_datos import DATA, DIAS, LIBRE, Datos, cargar
+from cargar_datos import DIAS, LIBRE, Datos, cargar
 from modelo import jornada_minutos
 
 
@@ -41,13 +41,13 @@ def _intervalo(f: date, t) -> tuple[datetime, datetime]:
 
 
 # --------------------------------------------------------------------------- #
-def balance(datos: Datos, fechas: list[date], objetivo: int | None = None) -> None:
+def balance(datos: Datos, fechas: list[date]) -> None:
     """¿Cuadra la aritmética gruesa? Horas que EXIGE la demanda del año frente a las que
     APORTA la plantilla a `objetivo` h/año. Si el balance es negativo, el cuadrante es
     imposible sin huecos o sin superar el objetivo: es un problema de plantilla, no de
     solver. Se da en las dos métricas: computada (legal) y de consumo (capacidad real,
     que es mayor cuando hay localizados)."""
-    objetivo = objetivo if objetivo is not None else datos.config.horas_objetivo
+    objetivo = datos.config.horas_objetivo
     dem_h = dem_c = 0.0
     for s, t in datos.turnos.items():
         if t.prioridad < 1:                     # comodines: no son demanda
@@ -95,14 +95,13 @@ def _prescripcion(datos: Datos, patron: str, trabs: list[str],
     return pres
 
 
-def patrones(datos: Datos, fechas: list[date], ancla: date,
-             objetivo: int | None = None) -> None:
+def patrones(datos: Datos, fechas: list[date], ancla: date) -> None:
     """Horas/año que PRESCRIBE cada patrón (contando solo días en que la línea opera y el
     trabajador está disponible) frente al objetivo. El EXCEDENTE es la cantidad que ese
     patrón debe ceder al año — el mecanismo de 'libranzas' NO es propio de las noches: lo
     necesita todo patrón con excedente. Se expresa en unidades de cesión para que se vea
     cuántas hay que liberar: una SEMANA de la rotación y un PERIODO completo (len(filas))."""
-    objetivo = objetivo if objetivo is not None else datos.config.horas_objetivo
+    objetivo = datos.config.horas_objetivo
     grupos: dict[str, list[str]] = defaultdict(list)
     for w, t in datos.trabajadores.items():
         if t.tipo == "patron" and t.patron:
@@ -224,14 +223,11 @@ def lineas(datos: Datos, fechas: list[date]) -> None:
 
 # --------------------------------------------------------------------------- #
 def main() -> None:
-    import sys
-    directorio = sys.argv[1] if len(sys.argv) > 1 else DATA
-    anio = int(sys.argv[2]) if len(sys.argv) > 2 else None
-    datos = cargar(directorio, anio)
-    anio = datos.config.anio
-    inicio, fin = date(anio, 1, 1), date(anio, 12, 31)
-    inicio -= timedelta(days=inicio.weekday())       # alinear a lunes, como el modelo
-    fechas = _rango(inicio, fin)
+    datos = cargar()
+    # El rodante arranca el lunes anterior al 1 de enero; el diagnóstico mira el mismo tramo para
+    # que sus cifras sean las que verá el modelo.
+    inicio = datos.inicio - timedelta(days=datos.inicio.weekday())
+    fechas = _rango(inicio, datos.fin)
 
     balance(datos, fechas)
     patrones(datos, fechas, ancla=inicio)

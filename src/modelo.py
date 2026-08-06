@@ -6,11 +6,10 @@ restricciones duras
 """
 from __future__ import annotations
 
-import sys
 from collections import Counter, defaultdict
-from datetime import date, timedelta, time, datetime
+from datetime import date, timedelta, datetime
 
-from cargar_datos import DIAS, DATA, LIBRE, Datos, Turno, cargar
+from cargar_datos import DIAS, LIBRE, Datos, Turno
 
 from ortools.sat.python import cp_model
 
@@ -38,6 +37,12 @@ from ortools.sat.python import cp_model
 # El titular de la rotación queda igualmente FUERA del libro anual (ver _c9_jornada_anual): cubre su
 # año entero salvo vacaciones y por acuerdo eso ES su jornada.
 JORNADA_LOCALIZADO_SEMANA = 40
+
+# Horizonte rodante: días que DECIDE cada ventana y días de contexto congelado por detrás (la
+# 'cola', que da la costura legal entre ventanas). No son ajustables desde fuera: tocarlos cambia
+# la costura y el prorrateo, no es un dial de usuario.
+DIAS_VENTANA = 14
+DIAS_COLA = 28
 
 # Cap PRORRATEADO (dos funciones a la vez): además del tope anual duro (config.horas_objetivo), la jornada acumulada
 # de cada NO-fijo hasta el fin de cada ventana se limita al ritmo lineal hacia el OBJETIVO 1776
@@ -246,30 +251,29 @@ def carga_diaria(datos: Datos, fechas: list[date]) -> dict[date, float]:
 
 class Modelo:
     def __init__(self, datos: Datos, fechas: list[date],
-                 congelar: dict[tuple[str, date], str] | None = None,
-                 offset_equidad: dict[str, dict[str, int]] | None = None,
-                 cola: set[date] | None = None,
-                 offset_horas: dict[str, int] | None = None,
-                 objetivo_horas: dict[str, int] | None = None,
-                 objetivo_horas_fijo: dict[str, int] | None = None,
-                 tope_paced: dict[str, int] | None = None,
-                 cesiones: set[tuple[str, int]] | None = None,
-                 ancla_patron: date | None = None,
-                 desde: date | None = None):
+                 congelar: dict[tuple[str, date], str],
+                 offset_equidad: dict[str, dict[str, int]],
+                 cola: set[date],
+                 offset_horas: dict[str, int],
+                 objetivo_horas: dict[str, int],
+                 objetivo_horas_fijo: dict[str, int],
+                 tope_paced: dict[str, int],
+                 cesiones: set[tuple[str, int]],
+                 ancla_patron: date,
+                 desde: date):
         self.datos = datos
         self.fechas = fechas
         # Primer día que cuenta para el LIBRO ANUAL de jornada (C9, cap prorrateado y equidad de
         # horas). El horizonte arranca el LUNES de la semana del 1 de enero para que las semanas ISO
         # estén completas, pero esos días de diciembre son jornada del año anterior y su libro está
         # cerrado: se trabajan y cuentan para lo LEGAL (C5/C6/C7, que miran la semana real), no para
-        # las 1776 de este año. Si es None, cuenta todo el horizonte.
+        # la jornada anual de este año.
         self.desde = desde
         self.m = cp_model.CpModel()
         # Ancla GLOBAL de la rotación de patrones: fecha fija (misma para todas las ventanas del
         # horizonte) desde la que se cuenta la semana de rotación. IMPRESCINDIBLE que sea global: si se
         # tomara el inicio de cada ventana, el desfase ventana-ancla se queda constante y la rotación se
-        # CONGELA (cada trabajador repite 1-2 filas todo el año). Si None, cae al inicio de la ventana
-        # (solo válido para un modelo de una sola ventana, p.ej. la prueba de __main__).
+        # CONGELA (cada trabajador repite 1-2 filas todo el año).
         self.ancla_patron = ancla_patron
 
         # Horizonte rodante: 'cola' = fechas de contexto (ya resueltas, no se deciden);
@@ -277,16 +281,16 @@ class Modelo:
         # 'offset_horas' = minutos ya trabajados en ventanas previas (libro de jornada anual, C9);
         # 'objetivo_horas' = minutos objetivo de ESTA ventana por NO-fijo (pacing blando, P_horas);
         # 'objetivo_horas_fijo' = objetivo ACUMULADO (min) de 1776 hasta esta ventana por fijo (Etapa 4).
-        self.congelar = congelar or {}
-        self.offset_equidad = offset_equidad or {}
-        self.offset_horas = offset_horas or {}
-        self.objetivo_horas = objetivo_horas or {}
-        self.objetivo_horas_fijo = objetivo_horas_fijo or {}
+        self.congelar = congelar
+        self.offset_equidad = offset_equidad
+        self.offset_horas = offset_horas
+        self.objetivo_horas = objetivo_horas
+        self.objetivo_horas_fijo = objetivo_horas_fijo
         # 'cesiones' = {(trabajador, ciclo)} que el NIVEL 0 decidió que se libran (ver
         # calendario_cesiones). Manda sobre el cap: los ciclos que no están aquí se trabajan.
-        self.cesiones = cesiones or set()
-        self.tope_paced = tope_paced or {}   # cap prorrateado acumulado (min) hasta el fin de la ventana, por NO-fijo
-        self.cola = set(cola) if cola is not None else {f for (_, f) in self.congelar}
+        self.cesiones = cesiones
+        self.tope_paced = tope_paced   # cap prorrateado acumulado (min) hasta el fin de la ventana, por NO-fijo
+        self.cola = set(cola)
         self.retira: dict[tuple[str, date], cp_model.BoolVar] = {}   # Etapa 4: día quitado a un fijo
         self.fijos_activos: list[str] = []                          # fijos con línea congelada (retirables)
         # Clasificación de patrones por tipo de turno, para el trato de HORAS:
@@ -548,20 +552,12 @@ class Modelo:
         esos días son jornada del año anterior. Lo LEGAL (C5/C6/C7) sí los cuenta —son días reales de
         una semana real—, así que esos límites usan la lista sin filtrar."""
         return [f for f in self.fechas
-                if f not in self.cola and not (libro and self.desde and f < self.desde)]
+                if f not in self.cola and not (libro and f < self.desde)]
 
     def _minutos(self, trab: str, dias: list[date]) -> list:
         """Términos horas(s)*x (en minutos efectivos COMPUTABLES = jornada legal) del trabajador en
         esos días. Base del tope anual duro (C9) y de la retirada de fijos."""
         return [round(self.datos.turnos[s].horas * 60) * self.x[(trab, f, s)]
-                for f in dias for s in self.turnos_wd.get((trab, f), [])]
-
-    def _minutos_consumo(self, trab: str, dias: list[date]) -> list:
-        """Términos horas_consumo(s)*x (minutos de CONSUMO de capacidad) del trabajador en esos días.
-        Base de la EQUIDAD de jornada (no de lo legal): un localizado 24h consume CONSUMO_LOCALIZADO
-        (≈11.43 h), no sus 8 h computadas, así el localizado puro y quien lo cubre de forma excepcional
-        quedan ~1776 de CONSUMO y no se les penaliza el defecto de horas computadas."""
-        return [round(self.datos.turnos[s].horas_consumo * 60) * self.x[(trab, f, s)]
                 for f in dias for s in self.turnos_wd.get((trab, f), [])]
 
     def _cubre_localizado(self, trab: str, sem_: tuple[int, int], loc: list):
@@ -697,7 +693,7 @@ class Modelo:
         `datos.offsets` (declarada en trabajadores.csv, o el orden del grupo si no se declara — ver
         cargar_datos.offsets_patron). Fuente ÚNICA para el warm-start (_warm_start_patron) y la
         fijación (_fijacion_patron)."""
-        base = self.ancla_patron or self.fechas[0]           # ancla global (rodante) o inicio de ventana (1 sola)
+        base = self.ancla_patron
         ancla = base - timedelta(days=base.weekday())        # lunes de la semana ancla
         grupos: dict[str, list[str]] = defaultdict(list)
         for w, t in self.datos.trabajadores.items():
@@ -723,7 +719,7 @@ class Modelo:
         quincenas se liberan lo decide el recorte de horas hacia 1776 (cap prorrateado + P_horas); la
         quincena liberada la cubre el pool. Los demás patrones NO pasan por aquí (fijación blanda)."""
         self.activo: dict[tuple[str, int], cp_model.BoolVar] = {}
-        base = self.ancla_patron or self.fechas[0]
+        base = self.ancla_patron
         ancla = base - timedelta(days=base.weekday())     # mismo lunes ancla que la rotación
         prescritos: set[tuple[str, date, str]] = set()
         por_ciclo: dict[tuple[str, int], list] = defaultdict(list)
@@ -1167,7 +1163,7 @@ class Modelo:
         return sum(penalizaciones), cota
 
     # -- Resolución (objetivo jerárquico por pesos) -------------------------- #
-    def resolver(self,gap:float = 0.05,tiempo:int = 600,trabajadores_cpu: int = 4, log: bool = False):
+    def resolver(self, tiempo: int = 600, trabajadores_cpu: int = 4, log: bool = False):
         """Objetivo jerárquico en uno solo:  W1·(P1+exceso+desvío_patrón) + W2·P2 + W3·(P_horas+P5),
         con W1>W2>W3. NIVEL COBERTURA (todo con peso pequeño < valor de cubrir un turno, así solo
         se acepta si rescata cobertura): P1 turnos no cubiertos (UNIFORME, sin criticidad por tipo de
@@ -1197,7 +1193,6 @@ class Modelo:
         solver = cp_model.CpSolver()
         solver.parameters.num_search_workers = trabajadores_cpu
         solver.parameters.log_search_progress = log
-        solver.parameters.relative_gap_limit = gap
         solver.parameters.max_time_in_seconds = tiempo
         self.m.minimize(W1 * (p1 + p_exceso + p_dev) + W2 * p2
                         + W3 * (p_horas + p_ret + PESO_RETIRA * p_retira + PESO_ESTAB * p5
@@ -1205,65 +1200,6 @@ class Modelo:
         return solver, solver.solve(self.m)
 
     # -- Resolución LEXICOGRÁFICA (por pasadas; no desborda a ningún horizonte) ---------- #
-    def resolver_lexicografico(self, tiempos: tuple[int, int, int] = (900, 600, 600),
-                               trabajadores_cpu: int = 8, gap: float = 0.0, log: bool = False):
-        """Objetivo lexicográfico por PASADAS (sin torre de pesos → no desborda int64 ni con el año
-        completo). Tres niveles en orden estricto de prioridad, cada uno con sus coeficientes
-        NATURALES (pequeños); la prioridad se impone CONGELANDO cada nivel con una restricción
-        (nivel ≤ su óptimo) antes de optimizar el siguiente:
-          1) cobertura: huecos + 6-días-seguidos + desvío del patrón
-          2) equidad:   nº de findes/festivos entre capaces
-          3) horas:     desviación de jornada (no-fijos) + retirada de fijos + estabilidad del mixto
-        Cada pasada arranca warm-started con la solución de la anterior. Devuelve (solver, estado)."""
-        p1 = self._coste_cobertura()
-        p_exceso, _ = self._exceso_semanal()
-        p_dev, _ = self._fijacion_patron()
-        desviaciones, _ = self._equidad_ponderada()
-        self.desviaciones = desviaciones
-        p2 = sum(LAMBDA[m] * sum(v) for m, v in desviaciones.items())
-        p_horas, _ = self._desviacion_jornada()
-        p_ret, _ = self._retirada_fijos()
-        p_retira = sum(self.retira.values())
-        p5, _ = self._inestabilidad_mixto()
-        p7, _ = self._preferencia_cubridor()
-
-        niveles = [
-            ("cobertura", p1 + p_exceso + p_dev),
-            ("equidad", p2),
-            ("horas", p_horas + p_ret + PESO_RETIRA * p_retira + PESO_ESTAB * p5
-                      + PESO_ORDEN * p7),
-        ]
-
-        solver = cp_model.CpSolver()
-        solver.parameters.num_search_workers = trabajadores_cpu
-        solver.parameters.log_search_progress = log
-        if gap > 0:
-            solver.parameters.relative_gap_limit = gap
-
-        self.plan_lexico: dict[tuple[str, date], str] = {}   # última solución COMPLETA buena
-        st = cp_model.UNKNOWN
-        for i, (nombre, expr) in enumerate(niveles):
-            solver.parameters.max_time_in_seconds = tiempos[i]
-            self.m.minimize(expr)
-            st = solver.solve(self.m)
-            if st not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-                print(f"  nivel {nombre}: {solver.status_name(st)} — me quedo con la solución del "
-                      f"nivel previo ({len(self.plan_lexico)} asignaciones)", flush=True)
-                return solver, st
-            self.plan_lexico = {(w, f): s for (w, f, s), v in self.x.items() if solver.value(v)}
-            val = round(solver.objective_value)
-            print(f"  nivel {nombre}: óptimo={val}  ({solver.status_name(st)}, {solver.wall_time:.0f}s)",
-                  flush=True)
-            if not isinstance(expr, int):
-                self.m.add(expr <= val)                       # congela este nivel (prioridad estricta)
-            if i + 1 < len(niveles):                          # warm-start de la siguiente pasada
-                asignados = [self.x[k] for k in self.x if solver.value(self.x[k])]
-                quitados = [self.retira[k] for k in self.retira if solver.value(self.retira[k])]
-                self.m.clear_hints()
-                for var in asignados + quitados:
-                    self.m.add_hint(var, 1)
-        return solver, st
-
 
 # --------------------------------------------------------------------------- #
 #  Horizonte rodante: resuelve el periodo por ventanas cosidas
@@ -1353,8 +1289,7 @@ def _prescripcion_por_ciclo(datos: Datos, patron: str, fechas: list[date],
     return pres
 
 
-def calendario_cesiones(datos: Datos, inicio: date, fin: date,
-                        log: bool = True) -> set[tuple[str, int]]:
+def calendario_cesiones(datos: Datos) -> set[tuple[str, int]]:
     """NIVEL 0 — decide, viendo el AÑO ENTERO, qué BLOQUES libra cada trabajador de rotación
     acoplada (hoy los de noche) para bajar su jornada anual al objetivo.
 
@@ -1386,8 +1321,8 @@ def calendario_cesiones(datos: Datos, inicio: date, fin: date,
     noche = _patrones_noche(datos)
     if not noche:
         return set()
-    ancla = inicio - timedelta(days=inicio.weekday())
-    fechas = rango_fechas(ancla, fin)
+    ancla = datos.inicio - timedelta(days=datos.inicio.weekday())
+    fechas = rango_fechas(ancla, datos.fin)
     nciclos = (fechas[-1] - ancla).days // 14 + 1
 
     # TENSIÓN de cada ciclo: cuánto se aparta su carga por persona de la media del horizonte, en
@@ -1494,7 +1429,7 @@ def calendario_cesiones(datos: Datos, inicio: date, fin: date,
         return set()
 
     elegidas = {k for k, var in cede.items() if solver.value(var)}
-    if log and resumen:
+    if resumen:
         print("Calendario de cesiones (bloques libres por exceso de jornada):", flush=True)
         for w, total, n in sorted(resumen):
             ks = sorted(k for (ww, k) in elegidas if ww == w)
@@ -1507,8 +1442,7 @@ def calendario_cesiones(datos: Datos, inicio: date, fin: date,
     return elegidas
 
 
-def reserva_cubridores(datos: Datos, inicio: date, fin: date,
-                       cesiones: set[tuple[str, int]], log: bool = True) -> dict[str, dict[date, float]]:
+def reserva_cubridores(datos: Datos, cesiones: set[tuple[str, int]]) -> dict[str, dict[date, float]]:
     """NIVEL 0 — horas que cada CUBRIDOR debe guardarse para la cobertura crítica que aún tiene por
     delante. Devuelve {trabajador: {fecha: horas pendientes a partir de esa fecha}}.
 
@@ -1525,8 +1459,8 @@ def reserva_cubridores(datos: Datos, inicio: date, fin: date,
 
     Es la pieza que da visión global sin agrandar el modelo: el año entra como un parámetro, no como
     medio millón de variables (el monolítico de 647.000 no encontró ni una solución en 900 s)."""
-    ancla = inicio - timedelta(days=inicio.weekday())
-    fechas = rango_fechas(ancla, fin)
+    ancla = datos.inicio - timedelta(days=datos.inicio.weekday())
+    fechas = rango_fechas(ancla, datos.fin)
     criticas = {s for s, t in datos.turnos.items() if t.prioridad >= 2}
     if not criticas:
         return {}
@@ -1584,24 +1518,24 @@ def reserva_cubridores(datos: Datos, inicio: date, fin: date,
             curva[f] = acum                    # lo pendiente ESTRICTAMENTE después de f
             acum += porfecha.get(f, 0.0)
         restante[w] = curva
-    if log and restante:
+    if restante:
         print("Reserva de horas para cobertura crítica (Nivel 0):", flush=True)
         for w in sorted(total, key=lambda x: -total[x]):
             print(f"  {w}: {total[w]:.0f} h de cobertura previstas en el año", flush=True)
     return restante
 
 
-def resolver_anual(datos: Datos, inicio: date, fin: date, dias_ventana: int = 14,
-                   dias_cola: int = 28, segundos: int = 60, hilos: int = 8,
-                   gap: float = 0.0, log: bool = False) -> dict[tuple[str, date], str]:
-    """Horizonte rodante: resuelve [inicio, fin] por ventanas alineadas a lunes, con cola
-    congelada (costura legal) y libro de equidad acumulada. Devuelve el plan completo."""
-    # El AÑO que se contabiliza es [inicio, fin]; el horizonte que se RESUELVE arranca el lunes
-    # anterior, para que las semanas ISO estén completas y los topes semanales (C5/C6/C7) cuadren
-    # desde el primer día. Esos días de diciembre se planifican y se muestran, pero su jornada es del
-    # año anterior: no entran ni en el libro de las 1776 ni en el prorrateo (ver Modelo.desde).
-    anio = inicio
-    inicio -= timedelta(days=inicio.weekday())          # alinear a lunes
+def resolver_anual(datos: Datos, segundos: int = 60, hilos: int = 8,
+                   log: bool = False) -> dict[tuple[str, date], str]:
+    """Horizonte rodante: resuelve el año por ventanas alineadas a lunes, con cola congelada
+    (costura legal) y libro de equidad acumulada. Devuelve el plan completo."""
+    # El AÑO que se contabiliza es el de config.toml; el horizonte que se RESUELVE arranca el lunes
+    # anterior al 1 de enero, para que las semanas ISO estén completas y los topes semanales
+    # (C5/C6/C7) cuadren desde el primer día. Esos días de diciembre se planifican y se muestran,
+    # pero su jornada es del año anterior: no entran ni en el libro anual ni en el prorrateo (ver
+    # Modelo.desde).
+    anio, fin = datos.inicio, datos.fin
+    inicio = anio - timedelta(days=anio.weekday())      # alinear a lunes
     plan: dict[tuple[str, date], str] = {}
     offset: dict[str, dict[str, int]] = {}
     offset_horas: dict[str, int] = {}                   # libro de jornada anual (minutos), C9
@@ -1612,9 +1546,9 @@ def resolver_anual(datos: Datos, inicio: date, fin: date, dias_ventana: int = 14
     # NIVEL 0: qué bloques libra cada nochero, decidido sobre el AÑO ENTERO (repartidos, sin
     # coincidir con las vacaciones del binomio ni de los cubridores). Si sale vacío se cae al
     # comportamiento anterior (lo decide el cap prorrateado, con riesgo de coincidencia).
-    cesiones = calendario_cesiones(datos, inicio, fin)
+    cesiones = calendario_cesiones(datos)
     # Horas que cada cubridor debe guardarse para la cobertura crítica que le queda por delante.
-    reserva = reserva_cubridores(datos, inicio, fin, cesiones)
+    reserva = reserva_cubridores(datos, cesiones)
     # PESO de cada día para el prorrateo de la jornada. NO se cuentan los días a pelo: la carga que
     # toca a cada persona disponible NO es uniforme a lo largo del año. En agosto la demanda es la
     # misma pero hay menos gente (vacaciones), así que cada disponible tiene que dar un ~8% MÁS de lo
@@ -1644,8 +1578,8 @@ def resolver_anual(datos: Datos, inicio: date, fin: date, dias_ventana: int = 14
         fijo_elig[w] = [f for f in dias_horizonte if datos.elegible(w, phi, f)[0]]
     ini_v, v = inicio, 0
     while ini_v <= fin:
-        fin_v = min(ini_v + timedelta(days=dias_ventana - 1), fin)
-        fechas_cola = [f for f in rango_fechas(ini_v - timedelta(days=dias_cola),
+        fin_v = min(ini_v + timedelta(days=DIAS_VENTANA - 1), fin)
+        fechas_cola = [f for f in rango_fechas(ini_v - timedelta(days=DIAS_COLA),
                                                ini_v - timedelta(days=1)) if f >= inicio]
         fechas_ventana = rango_fechas(ini_v, fin_v)
         cola = set(fechas_cola)
@@ -1716,7 +1650,7 @@ def resolver_anual(datos: Datos, inicio: date, fin: date, dias_ventana: int = 14
                      objetivo_horas_fijo=objetivo_horas_fijo, tope_paced=tope_paced,
                      cesiones=cesiones, ancla_patron=inicio,   # ancla GLOBAL fija: la rotación es consistente entre ventanas
                      desde=anio)                          # ...y el libro de horas empieza el 1 de enero
-        solver, st = mod.resolver(tiempo=segundos, trabajadores_cpu=hilos, gap=gap, log=log)
+        solver, st = mod.resolver(tiempo=segundos, trabajadores_cpu=hilos, log=log)
 
         # GUARDIA: sin solución, solver.value() devuelve BASURA en silencio (se llegó a coser un
         # diciembre entero de valores arbitrarios y a reportar coberturas negativas de 1e19). Se corta
@@ -1745,12 +1679,11 @@ def resolver_anual(datos: Datos, inicio: date, fin: date, dias_ventana: int = 14
     # PASADA FINAL: repartir los comodines (REF CAL) entre quienes quedaron por debajo del objetivo.
     # Va aquí y no dentro del modelo para que el relleno use lo que SOBRA y no compita con la
     # cobertura por el presupuesto anual de horas (ver rellenar_refuerzos).
-    rellenar_refuerzos(datos, plan, anio, fin, log=True)
+    rellenar_refuerzos(datos, plan)
     return plan
 
 
-def rellenar_refuerzos(datos: Datos, plan: dict[tuple[str, date], str],
-                       inicio: date, fin: date, log: bool = True) -> int:
+def rellenar_refuerzos(datos: Datos, plan: dict[tuple[str, date], str]) -> int:
     """PASADA FINAL de relleno: reparte los turnos COMODÍN (prioridad 0, los REF CAL) entre quienes
     han quedado por DEBAJO del objetivo de jornada, una vez la cobertura real ya está decidida.
 
@@ -1778,7 +1711,7 @@ def rellenar_refuerzos(datos: Datos, plan: dict[tuple[str, date], str],
     # Solo el AÑO: los días del lunes anterior al 1 de enero son jornada del año pasado. Ni cuentan
     # en el libro ni se rellenan (un refuerzo ahí no acercaría a nadie a sus 1776 de este año).
     # Los contadores SEMANALES sí se construyen con el plan entero: la semana ISO es la real.
-    fechas = rango_fechas(inicio, fin)
+    fechas = datos.fechas
 
     # `horas` = jornada acumulada contra el objetivo anual -> moneda del libro (semana entera para
     # las plazas de localizado). `horas_sem` = jornada LEGAL de la semana, que es lo que topa config.hmax7.
@@ -1825,7 +1758,7 @@ def rellenar_refuerzos(datos: Datos, plan: dict[tuple[str, date], str],
                         reverse=True)
         for falta, w in faltan:
             if falta <= 0:
-                return _fin_relleno(asignados, log)
+                return _fin_relleno(asignados)
             t = datos.trabajadores[w]
             tope = datos.config.horas_objetivo * t.factor_jornada
             hueco = None
@@ -1859,118 +1792,10 @@ def rellenar_refuerzos(datos: Datos, plan: dict[tuple[str, date], str],
             asignados += 1
             break                             # vuelve a ordenar: siempre sirve al que va más corto
         else:
-            return _fin_relleno(asignados, log)
+            return _fin_relleno(asignados)
 
 
-def _fin_relleno(asignados: int, log: bool) -> int:
-    if log:
-        print(f"Relleno final de refuerzos: {asignados} turnos comodín asignados "
-              f"a quienes iban por debajo del objetivo", flush=True)
+def _fin_relleno(asignados: int) -> int:
+    print(f"Relleno final de refuerzos: {asignados} turnos comodín asignados "
+          f"a quienes iban por debajo del objetivo", flush=True)
     return asignados
-
-
-def resolver_monolitico(datos: Datos, inicio: date, fin: date,
-                        tiempos: tuple[int, int, int] = (900, 600, 600), hilos: int = 8,
-                        warm_plan: dict[tuple[str, date], str] | None = None,
-                        log: bool = False) -> tuple[dict[tuple[str, date], str], Modelo,
-                                                    cp_model.CpSolver, int]:
-    """Modelo de AÑO COMPLETO (sin ventanas) resuelto por lexicográfico secuencial: ve todo el
-    horizonte → reparte huecos y horas por todo el año (sin acantilado de fin de año) y no desborda
-    int64. Opcionalmente WARM-STARTED con un plan (p.ej. el del rodante): parte de esa solución y
-    solo la pule. Sin cola ni libros: todo se decide de una; objetivos = anuales completos (el tope
-    duro lo impone C9 directamente, off=0). Devuelve (plan, modelo, solver, estado)."""
-    inicio -= timedelta(days=inicio.weekday())          # alinear a lunes (restricciones semanales)
-    fechas = rango_fechas(inicio, fin)
-    objetivo_horas, objetivo_horas_fijo = {}, {}
-    for w, t in datos.trabajadores.items():
-        obj = round(datos.config.horas_objetivo * t.factor_jornada * 60)     # objetivo anual completo
-        if t.tipo == "fijo":
-            objetivo_horas_fijo[w] = obj                # cumulativo hasta fin de año = objetivo pleno
-        else:
-            objetivo_horas[w] = obj
-    mod = Modelo(datos, fechas, objetivo_horas=objetivo_horas, objetivo_horas_fijo=objetivo_horas_fijo)
-    if warm_plan:
-        mod.m.clear_hints()                             # sustituye el hint del patrón por el plan dado
-        for (w, f), s in warm_plan.items():
-            if (w, f, s) in mod.x:
-                mod.m.add_hint(mod.x[(w, f, s)], 1)
-    print(f"monolítico {fechas[0]:%d/%m/%Y}–{fechas[-1]:%d/%m/%Y}  ({len(mod.x):,} vars, "
-          f"warm_start={'sí' if warm_plan else 'no'})", flush=True)
-    solver, st = mod.resolver_lexicografico(tiempos=tiempos, trabajadores_cpu=hilos, log=log)
-    return mod.plan_lexico, mod, solver, st        # última solución COMPLETA buena (no basura si un nivel falla)
-
-
-def imprimir_resumen(modelo: Modelo, solver: cp_model.CpSolver, status: int) -> None:
-    """Imprime un resumen básico de la solución."""
-    print("\n" + "=" * 80)
-    print("RESUMEN DEL SOLVER")
-    print("=" * 80)
-    estados = {
-        cp_model.OPTIMAL: "OPTIMAL",
-        cp_model.FEASIBLE: "FEASIBLE",
-        cp_model.INFEASIBLE: "INFEASIBLE",
-        cp_model.MODEL_INVALID: "MODEL_INVALID",
-        cp_model.UNKNOWN: "UNKNOWN",
-    }
-    print(f"Estado: {estados.get(status, status)}")
-    print(f"Tiempo: {solver.WallTime():.2f} s")
-    print(f"Conflictos: {solver.NumConflicts()}")
-    print(f"Ramas: {solver.NumBranches()}")
-
-    if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-        print(f"Objetivo: {solver.ObjectiveValue():.0f}")
-        print(f"Mejor cota: {solver.BestObjectiveBound():.0f}")
-
-        if solver.ObjectiveValue() != 0:
-            gap = abs(solver.ObjectiveValue() - solver.BestObjectiveBound()) / abs(solver.ObjectiveValue())
-            print(f"Gap aproximado: {gap:.2%}")
-
-        print("\n" + "-" * 80)
-        print("TURNOS NO CUBIERTOS")
-        print("-" * 80)
-
-        total_holguras = 0
-
-        if hasattr(modelo, "u"):
-            for (turno, f), holgura in sorted(modelo.u.items(), key=lambda x: (x[0][1], x[0][0])):
-                valor = solver.Value(holgura)
-                if valor:
-                    total_holguras += valor
-                   #print(f"{f} | {turno}: {valor}")
-
-        if total_holguras == 0:
-            print("Todos los turnos quedaron cubiertos.")
-        else:
-            print(f"Total huecos sin cubrir: {total_holguras}")
-
-        print("=" * 80 + "\n")
-# --------------------------------------------------------------------------- #
-#  Prueba: resolver una ventana (enero de 2026)
-# --------------------------------------------------------------------------- #
-def main() -> None:
-    datos = cargar(DATA)
-    anio = datos.config.anio
-    fechas = rango_fechas(date(anio, 1, 1), date(anio, 1, 31))
-
-    print("=" * 80)
-    print("CONSTRUCCIÓN DEL MODELO")
-    print("=" * 80)
-    print(f"Horizonte: {fechas[0]} -> {fechas[-1]}")
-    print(f"Nº días: {len(fechas)}")
-    print(f"Nº trabajadores: {len(datos.trabajadores)}")
-    print(f"Nº turnos: {len(datos.turnos)}")
-    print("=" * 80)
-
-    modelo = Modelo(datos, fechas)
-
-    
-    solver, status = modelo.resolver(
-        tiempo=120,
-        trabajadores_cpu=8,
-        log=False,
-    )
-
-    imprimir_resumen(modelo, solver, status)
-
-if __name__ == "__main__":
-    main()

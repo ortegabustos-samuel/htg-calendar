@@ -25,7 +25,6 @@ La unidad de intercambio es la SEMANA ISO COMPLETA, no el turno suelto. Es delib
 """
 from __future__ import annotations
 
-import argparse
 import statistics as st
 import sys
 from collections import Counter, defaultdict
@@ -34,11 +33,16 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from cargar_datos import Datos, cargar                                    # noqa: E402
+from cargar_datos import Datos                                            # noqa: E402
 from modelo import (JORNADA_LOCALIZADO_SEMANA, jornada_minutos,           # noqa: E402
-                    lineas_localizadas, rango_fechas, semana)
+                    lineas_localizadas, semana)
 
 METRICAS_PULIDO = ("sabado", "domingo", "festivo")
+
+# Tope de movimientos de cada pasada: son bucles de mejora, paran solos cuando dejan de encontrar
+# intercambios que mejoren, y esto es el corte por tiempo si no lo hacen.
+MAX_MOV_PULIR = 200
+MAX_MOV_COHERENCIA = 400
 
 
 # --------------------------------------------------------------------------- #
@@ -217,8 +221,7 @@ def _valida_tras_cambio(datos: Datos, plan: dict, w: str, sm: tuple[int, int],
     return True
 
 
-def pulir(datos: Datos, plan: dict, inicio: date, fin: date,
-          max_mov: int = 200, log: bool = True) -> int:
+def pulir(datos: Datos, plan: dict) -> int:
     """Bucle de mejora: busca el intercambio de semana que más baja la desigualdad y lo aplica,
     mientras siga mejorando. Devuelve el nº de intercambios aplicados.
 
@@ -231,18 +234,18 @@ def pulir(datos: Datos, plan: dict, inicio: date, fin: date,
     loc = lineas_localizadas(datos)
     horas: dict[str, float] = defaultdict(float)
     horas.update({w: m / 60 for w, m in
-                  jornada_minutos(datos, plan, rango_fechas(inicio, fin)).items()})
+                  jornada_minutos(datos, plan, datos.fechas).items()})
 
     horas_ini = dict(horas)        # jornada de partida: el pulido no puede empeorarla
     cargas = _cargas(datos, plan)
     aplicados = 0
-    for _ in range(max_mov):
+    for _ in range(MAX_MOV_PULIR):
         # Fuera las semanas que tocan días ANTERIORES al año: la del lunes 29 de diciembre es una
         # semana ISO real y está en el plan (el descanso del 1 de enero se mide contra ella), pero
         # esos días son cuadrante del año pasado, ya entregado. Ni cuentan en el libro ni se cambian
         # de dueño para igualar findes de este año.
         porsem = {k: items for k, items in _semanas(plan).items()
-                  if all(f >= inicio for f, _ in items)}
+                  if all(f >= datos.inicio for f, _ in items)}
         # Aporte de cada semana a las métricas y a las horas: se calcula UNA vez y se reutiliza
         # para todos los candidatos. Evaluar un intercambio pasa a ser restar y sumar tres números
         # en vez de copiar el plan entero y recontarlo (miles de millones de operaciones por
@@ -321,11 +324,9 @@ def pulir(datos: Datos, plan: dict, inicio: date, fin: date,
             cargas[A][m] += aB[i] - aA[i]
             cargas[B][m] += aA[i] - aB[i]
         aplicados += 1
-        if log:
-            print(f"  {aplicados:>3}. semana {sm[1]:>2}: {A} <-> {B}   "
-                  f"Σrangos {delta:+.0f}", flush=True)
-    if log:
-        print(f"Pulido: {aplicados} intercambios de semana aplicados", flush=True)
+        print(f"  {aplicados:>3}. semana {sm[1]:>2}: {A} <-> {B}   "
+              f"Σrangos {delta:+.0f}", flush=True)
+    print(f"Pulido: {aplicados} intercambios de semana aplicados", flush=True)
     return aplicados
 
 
@@ -364,8 +365,7 @@ def _incoherencia(datos: Datos, plan: dict, gente: list[str]) -> float:
     return sum(_coste_semana(datos, t) for t in porsem.values())
 
 
-def coherencia(datos: Datos, plan: dict, max_mov: int = 400, log: bool = True,
-               fechas: list[date] | None = None) -> int:
+def coherencia(datos: Datos, plan: dict) -> int:
     """ÚLTIMA fase del pulido: intercambia turnos DEL MISMO DÍA entre correturnos para que cada uno
     pase la semana en la misma franja y, a poder ser, en el mismo municipio. Hoy solo el 31% de sus
     semanas tienen una sola franja y el 35% un solo municipio: es normal ver Mayorga, Íscar y
@@ -381,6 +381,7 @@ def coherencia(datos: Datos, plan: dict, max_mov: int = 400, log: bool = True,
 
     Va la ÚLTIMA y solo acepta movimientos que no empeoren nada de lo anterior: es una comodidad,
     no una prioridad."""
+    fechas = datos.fechas
     corre = [w for w, t in datos.trabajadores.items() if t.tipo == "correturno"]
     if len(corre) < 2:
         return 0
@@ -394,12 +395,12 @@ def coherencia(datos: Datos, plan: dict, max_mov: int = 400, log: bool = True,
 
     en_corre = set(corre)
     aplicados = 0
-    for _ in range(max_mov):
+    for _ in range(MAX_MOV_COHERENCIA):
         # En un trueque del mismo día solo cambian DOS entradas: la semana de A y la de B. El delta
         # se calcula ahí y no recorriendo las 543 semanas por cada uno de los ~20.000 candidatos.
         porsem: dict[tuple[str, tuple[int, int]], list[str]] = defaultdict(list)
         pordia: dict[date, list[str]] = defaultdict(list)
-        dentro = set(fechas) if fechas is not None else None
+        dentro = set(datos.fechas)
         for (w, f), s in plan.items():
             if w in en_corre:
                 porsem[(w, semana(f))].append(s)
@@ -445,12 +446,11 @@ def coherencia(datos: Datos, plan: dict, max_mov: int = 400, log: bool = True,
         plan[(A, f)], plan[(B, f)] = sB, sA
         horas[A], horas[B] = hA, hB
         aplicados += 1
-        if log and aplicados % 25 == 0:
+        if aplicados % 25 == 0:
             print(f"  {aplicados:>3} trueques · incoherencia "
                   f"{_incoherencia(datos, plan, corre):.0f}", flush=True)
-    if log:
-        print(f"Coherencia: {aplicados} turnos intercambiados entre correturnos "
-              f"(incoherencia final {_incoherencia(datos, plan, corre):.0f})", flush=True)
+    print(f"Coherencia: {aplicados} turnos intercambiados entre correturnos "
+          f"(incoherencia final {_incoherencia(datos, plan, corre):.0f})", flush=True)
     return aplicados
 
 
@@ -467,7 +467,7 @@ def _huecos_dia(datos: Datos, ocupado: Counter, f: date) -> list[str]:
     return sorted(huecos, key=lambda s: -datos.turnos[s].prioridad)
 
 
-def aprovechar(datos: Datos, plan: dict, fechas: list[date], log: bool = True) -> int:
+def aprovechar(datos: Datos, plan: dict) -> int:
     """PRIMERA fase: cambia un REFUERZO DE CALENDARIO por un turno con demanda real sin cubrir del
     mismo día, cuando quien lo hace puede atenderlo.
 
@@ -489,6 +489,7 @@ def aprovechar(datos: Datos, plan: dict, fechas: list[date], log: bool = True) -
     tope semanal de días, el fin de semana libre y el reparto de sábados y domingos quedan intactos
     por construcción. Se comprueban las tres cosas que sí pueden moverse: el descanso entre jornadas,
     las horas de la semana y el tope anual."""
+    fechas = datos.fechas
     pares = _pares_pactados(datos)
     loc = lineas_localizadas(datos)
     ocupado: Counter = Counter()
@@ -562,10 +563,9 @@ def aprovechar(datos: Datos, plan: dict, fechas: list[date], log: bool = True) -
             libres.remove(w)
             cambios += 1
             por_prio[t.prioridad] += 1
-    if log:
-        detalle = ", ".join(f"prioridad {p}: {n}" for p, n in sorted(por_prio.items(), reverse=True))
-        print(f"Refuerzos aprovechados: {cambios} cambiados por un turno real sin cubrir"
-              + (f" ({detalle})" if detalle else ""), flush=True)
+    detalle = ", ".join(f"prioridad {p}: {n}" for p, n in sorted(por_prio.items(), reverse=True))
+    print(f"Refuerzos aprovechados: {cambios} cambiados por un turno real sin cubrir"
+          + (f" ({detalle})" if detalle else ""), flush=True)
     return cambios
 
 
@@ -579,7 +579,7 @@ def _semanas_completas(fechas: list[date]) -> list[tuple[int, int]]:
     return sorted(s for s, n in cuenta.items() if n == 7)
 
 
-def canjear(datos: Datos, plan: dict, fechas: list[date], log: bool = True) -> int:
+def canjear(datos: Datos, plan: dict) -> int:
     """SEGUNDA fase: suelta REFUERZOS DE CALENDARIO de CUALQUIER día del año para poder cubrir un
     turno real que se quedó vacío. Devuelve el nº de huecos rescatados.
 
@@ -609,6 +609,7 @@ def canjear(datos: Datos, plan: dict, fechas: list[date], log: bool = True) -> i
     entre jornadas (C4, con las exenciones de rotación pactada), días por semana (C5), 48 h semanales
     (C6), finde libre cada 4 semanas (C7) y tope anual de jornada—. Las plazas de LOCALIZADO quedan
     fuera: se ceden como semana entera con sus descansos, no como día suelto."""
+    fechas = datos.fechas
     comodines = {s for s, t in datos.turnos.items() if t.prioridad == 0}
     if not comodines:
         return 0
@@ -766,48 +767,7 @@ def canjear(datos: Datos, plan: dict, fechas: list[date], log: bool = True) -> i
         cambios += 1
         soltados += len(sueltos)
         por_prio[t.prioridad] += 1
-    if log:
-        detalle = ", ".join(f"prioridad {p}: {n}" for p, n in sorted(por_prio.items(), reverse=True))
-        print(f"Refuerzos canjeados: {cambios} huecos cubiertos soltando {soltados} refuerzos del año"
-              + (f" ({detalle})" if detalle else ""), flush=True)
+    detalle = ", ".join(f"prioridad {p}: {n}" for p, n in sorted(por_prio.items(), reverse=True))
+    print(f"Refuerzos canjeados: {cambios} huecos cubiertos soltando {soltados} refuerzos del año"
+          + (f" ({detalle})" if detalle else ""), flush=True)
     return cambios
-
-
-def main() -> int:
-    p = argparse.ArgumentParser(description="Pule la equidad de findes/festivos de un plan")
-    p.add_argument("plan", help="CSV con id_trab,fecha,id_turno")
-    p.add_argument("--anio", type=int, default=None)
-    p.add_argument("--datos", default=str(Path(__file__).resolve().parents[1] / "data" / "input"))
-    p.add_argument("--max-mov", type=int, default=200)
-    p.add_argument("--sin-coherencia", action="store_true",
-                   help="omite la 2ª fase (semanas coherentes de los correturnos)")
-    p.add_argument("--salida", help="CSV donde escribir el plan pulido")
-    a = p.parse_args()
-
-    import csv
-    datos = cargar(a.datos, a.anio)
-    plan = {}
-    with open(a.plan, encoding="utf-8") as fh:
-        for w, f, s in csv.reader(fh):
-            plan[(w, date.fromisoformat(f))] = s
-    inicio, fin = date(datos.config.anio, 1, 1), date(datos.config.anio, 12, 31)
-
-    resumen(datos, plan, "ANTES del pulido")
-    fechas = rango_fechas(inicio, fin)       # el AÑO: lo anterior al 1 de enero es de otro libro
-    aprovechar(datos, plan, fechas)          # mismo orden que generar_anual: primero la cobertura,
-    canjear(datos, plan, fechas)             # que mueve gente de día, y luego la equidad
-    pulir(datos, plan, inicio, fin, max_mov=a.max_mov)
-    if not a.sin_coherencia:
-        coherencia(datos, plan, fechas=fechas)
-    resumen(datos, plan, "DESPUÉS del pulido")
-
-    if a.salida:
-        with open(a.salida, "w", encoding="utf-8") as fh:
-            for (w, f), s in sorted(plan.items(), key=lambda kv: (kv[0][0], kv[0][1])):
-                fh.write(f"{w},{f.isoformat()},{s}\n")
-        print(f"\nplan pulido en {a.salida}")
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
