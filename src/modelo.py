@@ -7,6 +7,7 @@ restricciones duras
 from __future__ import annotations
 
 from collections import Counter, defaultdict
+from dataclasses import dataclass
 from datetime import date, timedelta, datetime
 
 from cargar_datos import DIAS, LIBRE, Datos, Turno
@@ -1289,6 +1290,9 @@ def _prescripcion_por_ciclo(datos: Datos, patron: str, fechas: list[date],
     return pres
 
 
+_CESIONES: dict[int, set[tuple[str, int]]] = {}
+
+
 def calendario_cesiones(datos: Datos) -> set[tuple[str, int]]:
     """NIVEL 0 — decide, viendo el AÑO ENTERO, qué BLOQUES libra cada trabajador de rotación
     acoplada (hoy los de noche) para bajar su jornada anual al objetivo.
@@ -1318,8 +1322,14 @@ def calendario_cesiones(datos: Datos) -> set[tuple[str, int]]:
 
     Entre los ciclos que cumplen todo eso se eligen los que dejan la jornada anual más cerca del
     objetivo, garantizando no superarlo. Devuelve {(trabajador, ciclo)}."""
+    # Memoizado por instancia de Datos: es un PARÁMETRO precomputado del año, no una decisión que
+    # deba rehacerse. Lo consultan el modelo, el relleno de refuerzos y las dos pasadas de pulido,
+    # y las cuatro tienen que ver EL MISMO calendario o el pulido corregiría contra otro plan.
+    if id(datos) in _CESIONES:
+        return _CESIONES[id(datos)]
     noche = _patrones_noche(datos)
     if not noche:
+        _CESIONES[id(datos)] = set()
         return set()
     ancla = datos.inicio - timedelta(days=datos.inicio.weekday())
     fechas = rango_fechas(ancla, datos.fin)
@@ -1411,6 +1421,7 @@ def calendario_cesiones(datos: Datos) -> set[tuple[str, int]]:
                 m.add(sum(par) <= 1)
 
     if not cede:
+        _CESIONES[id(datos)] = set()
         return set()
     # Los desvíos van en MINUTOS y apenas discriminan: todos los ciclos de una misma rotación
     # prescriben casi las mismas horas, así que ceder uno u otro deja la jornada anual casi igual.
@@ -1422,13 +1433,21 @@ def calendario_cesiones(datos: Datos) -> set[tuple[str, int]]:
                                                     for (w, k), var in cede.items()))
     solver = cp_model.CpSolver()
     solver.parameters.max_time_in_seconds = 30
+    # DETERMINISTA a propósito: un hilo y semilla fija. Con los 8 por defecto, dos ejecuciones
+    # seguidas sobre los mismos datos daban calendarios distintos (49 y 50 ausencias críticas), y
+    # este calendario es un dato de entrada del resto del proceso, no una decisión que pueda
+    # bailar. Cuesta poco: el modelo es de semanas × nocheros y resuelve en segundos.
+    solver.parameters.num_search_workers = 1
+    solver.parameters.random_seed = 0
     st = solver.solve(m)
     if st not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
         print(f"calendario de cesiones: {solver.status_name(st)} — se sigue SIN él; las cesiones "
               f"las decidirá el cap y pueden coincidir", flush=True)
+        _CESIONES[id(datos)] = set()
         return set()
 
     elegidas = {k for k, var in cede.items() if solver.value(var)}
+    _CESIONES[id(datos)] = elegidas
     if resumen:
         print("Calendario de cesiones (bloques libres por exceso de jornada):", flush=True)
         for w, total, n in sorted(resumen):
@@ -1440,6 +1459,102 @@ def calendario_cesiones(datos: Datos) -> set[tuple[str, int]]:
             print(f"  {w} ({patron}): {total/60:.0f} h -> cede {n} bloque(s) [{cuando}] "
                   f"-> {final:.0f} h", flush=True)
     return elegidas
+
+
+@dataclass(frozen=True)
+class AusenciaCritica:
+    """Días de una línea crítica que su titular no puede hacer en una semana ISO.
+
+    `prescritos` son los días que la fila de la rotación le asigna esa semana; `faltan`, el
+    subconjunto que no puede hacer (vacaciones o bloque cedido); `libres`, los días de la semana
+    que su fila deja LIBRE — el descanso que viene con la plaza.
+
+    La distinción que gobierna las dos reglas: si faltan TODOS los días prescritos, quien cubra
+    ADOPTA la plaza y hereda `libres`; si falta solo parte, son turnos normales."""
+    linea: str
+    titular: str
+    semana: tuple[int, int]
+    prescritos: frozenset[date]
+    faltan: frozenset[date]
+    libres: frozenset[date]
+
+    @property
+    def entera(self) -> bool:
+        return bool(self.faltan) and self.faltan == self.prescritos
+
+
+def ausencias_criticas(datos: Datos, cesiones: set[tuple[str, int]]) -> list[AusenciaCritica]:
+    """Recorre el año y devuelve, por titular y semana ISO, qué días de su línea crítica se quedan
+    sin él. Es dato conocido antes de resolver: las vacaciones vienen en trabajadores.csv y las
+    cesiones las acaba de decidir `calendario_cesiones`.
+
+    Fuente ÚNICA de la regla de adopción: la consultan la restricción del modelo, el relleno de
+    refuerzos y las dos pasadas de pulido, que antes la replicaban cada una por su cuenta."""
+    ancla = datos.inicio - timedelta(days=datos.inicio.weekday())
+    fechas = rango_fechas(ancla, datos.fin)
+    criticas = {s for s, t in datos.turnos.items() if t.prioridad >= 2}
+    if not criticas:
+        return []
+
+    acum: dict[tuple[str, tuple[int, int], str], dict[str, set]] = {}
+    for w, t in datos.trabajadores.items():
+        filas = datos.patrones.get(t.patron or "")
+        if not filas:
+            continue
+        T = len(filas)
+        off = datos.offsets.get(w, 0)
+        for f in fechas:
+            s = filas[(off + (f - ancla).days // 7) % T][DIAS[f.weekday()]]
+            if s not in criticas or not datos.opera(s, f):
+                continue
+            reg = acum.setdefault((w, semana(f), s),
+                                  {"prescritos": set(), "faltan": set(), "libres": set()})
+            reg["prescritos"].add(f)
+            cede = (w, (f - ancla).days // 14) in cesiones
+            if not datos.disponible(w, f) or cede:
+                reg["faltan"].add(f)
+
+    # Los LIBRE de la fila: días de esa semana ISO en que la rotación no le asigna nada.
+    for (w, _sem, _s), reg in acum.items():
+        filas = datos.patrones[datos.trabajadores[w].patron]
+        T = len(filas)
+        off = datos.offsets.get(w, 0)
+        alguno = min(reg["prescritos"])
+        lunes = alguno - timedelta(days=alguno.weekday())
+        for i in range(7):
+            f = lunes + timedelta(days=i)
+            if f < datos.inicio or f > datos.fin:
+                continue
+            if filas[(off + (f - ancla).days // 7) % T][DIAS[f.weekday()]] == LIBRE:
+                reg["libres"].add(f)
+
+    return [AusenciaCritica(linea=s, titular=w, semana=sem,
+                            prescritos=frozenset(reg["prescritos"]),
+                            faltan=frozenset(reg["faltan"]),
+                            libres=frozenset(reg["libres"]))
+            for (w, sem, s), reg in sorted(acum.items()) if reg["faltan"]]
+
+
+def principales(datos: Datos) -> dict[str, list[str]]:
+    """{línea -> cubridores designados, del principal al último suplente}.
+
+    El gestor designa un principal (v=1) porque considera que hace mejor esa línea, y suplentes
+    (v=2, 3…) que solo deberían entrar si el principal no puede. Ojo: los cubridores pueden estar
+    CRUZADOS —en estos datos cada uno es principal de una línea y suplente de la otra—, así que el
+    orden es por LÍNEA, nunca por persona."""
+    orden: dict[str, list[tuple[int, str]]] = defaultdict(list)
+    for (w, s), cap in datos.capacidades.items():
+        if cap.v >= 1:
+            orden[s].append((cap.v, w))
+    return {s: [w for _, w in sorted(pares)] for s, pares in orden.items()}
+
+
+def semanas_adoptadas(datos: Datos) -> set[tuple[str, tuple[int, int]]]:
+    """{(línea, semana ISO)} en que la fila del titular falta ENTERA y por tanto quien la cubra
+    adopta la plaza con sus descansos. Lo consultan `rellenar_refuerzos` y las dos pasadas de
+    `pulido`, que corren fuera del modelo y no lo sabrían por su cuenta."""
+    return {(a.linea, a.semana)
+            for a in ausencias_criticas(datos, calendario_cesiones(datos)) if a.entera}
 
 
 def reserva_cubridores(datos: Datos, cesiones: set[tuple[str, int]]) -> dict[str, dict[date, float]]:
@@ -1461,27 +1576,14 @@ def reserva_cubridores(datos: Datos, cesiones: set[tuple[str, int]]) -> dict[str
     medio millón de variables (el monolítico de 647.000 no encontró ni una solución en 900 s)."""
     ancla = datos.inicio - timedelta(days=datos.inicio.weekday())
     fechas = rango_fechas(ancla, datos.fin)
-    criticas = {s for s, t in datos.turnos.items() if t.prioridad >= 2}
-    if not criticas:
-        return {}
 
-    # Quién tiene prescrito cada día de cada línea crítica. NO vale preguntar si "algún titular está
-    # disponible": los dos de un binomio se reparten la semana —uno lun-jue y otro vie-dom— así que
-    # hay que mirar a quién se lo asigna SU rotación ese día concreto.
-    prescrito: dict[tuple[str, date], str] = {}
-    for p, filas in datos.patrones.items():
-        T = len(filas)
-        trabs = sorted(w for w, t in datos.trabajadores.items() if t.patron == p)
-        for w in trabs:
-            off = datos.offsets.get(w, 0)
-            for f in fechas:
-                s = filas[(off + (f - ancla).days // 7) % T][DIAS[f.weekday()]]
-                if s in criticas and datos.opera(s, f):
-                    prescrito[(s, f)] = w
+    faltan_por_linea: dict[str, set[date]] = defaultdict(set)
+    for a in ausencias_criticas(datos, cesiones):
+        faltan_por_linea[a.linea] |= a.faltan
 
     pendiente: dict[str, dict[date, float]] = defaultdict(lambda: defaultdict(float))
     total: dict[str, float] = defaultdict(float)
-    for s in sorted(criticas):
+    for s in sorted(faltan_por_linea):
         cubridores = sorted(((c.v, w) for (w, ss), c in datos.capacidades.items()
                              if ss == s and c.v >= 1))
         if not cubridores:
@@ -1491,19 +1593,10 @@ def reserva_cubridores(datos: Datos, cesiones: set[tuple[str, int]]) -> dict[str
         # ciclo —la semana corta ocupa más de lo que suma y la larga menos—, suficiente para
         # dimensionar la reserva; el reparto exacto por semana lo hace el modelo (_minutos_jornada).
         horas = datos.turnos[s].horas_consumo
-        for f in fechas:
-            if not datos.opera(s, f):
-                continue
-            titular = prescrito.get((s, f))
-            if titular is None:
-                continue                       # nadie la tiene prescrita ese día
-            cede = (titular, (f - ancla).days // 14) in cesiones
-            if datos.disponible(titular, f) and not cede:
-                continue                       # su titular puede: no hace falta cubridor
-            # De vacaciones o con el bloque cedido: hace falta un cubridor. Se reparte entre los
-            # disponibles dando el día al que MENOS lleve acumulado, con el orden `v` como desempate.
-            # Adjudicárselo siempre al primero por orden daría una reserva irreal —1012 h para
-            # Y0945237C cuando en la práctica hace 550— y le estrangularía el cap sin motivo.
+        for f in sorted(faltan_por_linea[s]):
+            # Se reparte entre los disponibles dando el día al que MENOS lleve acumulado, con el
+            # orden `v` como desempate. Adjudicárselo siempre al primero por orden daría una reserva
+            # irreal —1012 h para Y0945237C cuando en la práctica hace 550— y estrangularía su cap.
             libres = [(total[w], v, w) for v, w in cubridores if datos.disponible(w, f)]
             if libres:
                 _, _, w = min(libres)
