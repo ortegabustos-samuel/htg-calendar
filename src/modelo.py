@@ -357,6 +357,7 @@ class Modelo:
         self._activo_patron()                     # noches: acopla su rotación por QUINCENA (ciclo 14d)
         self._solo_rotacion_uvi()                 # UVI: solo su rotación → vacantes al cubridor, no al par
         self._adopcion_plaza()                    # fila entera = adoptar la plaza y sus descansos
+        self._obligacion_principal()              # el principal cubre salvo vacaciones o crítica mayor
         self._warm_start_patron()                 # arranque pegado al patrón
 
     # -- Variables ----------------------------------------------------------- #
@@ -1132,29 +1133,19 @@ class Modelo:
         desviación de jornada —que se mide en minutos y es de otro orden de magnitud—, así que no
         decidía nunca: el plan ponía a un suplente a cubrir mientras el principal de esa misma línea
         se quedaba en su patrón."""
-        orden = principales(self.datos)
-        for a in ausencias_criticas(self.datos, self.cesiones):
-            cubridores = orden.get(a.linea)
-            if not cubridores:
-                continue
-            prio = self.datos.turnos[a.linea].prioridad
-            grupos = ([sorted(a.faltan)] if a.entera            # la fila entera va en bloque
-                      else [[f] for f in sorted(a.faltan)])     # días sueltos, cada uno por su lado
-            for dias in grupos:
-                dias = [f for f in dias if f not in self.cola]
-                if not dias:
+        for w, linea, dias in obligaciones(self.datos, self.cesiones):
+            prio = self.datos.turnos[linea].prioridad
+            for f in dias:
+                if f in self.cola:
+                    continue                  # contexto congelado, no lo decide esta ventana
+                var = self.x.get((w, f, linea))
+                if var is None:
                     continue
-                for w in cubridores:
-                    variables = [self.x.get((w, f, a.linea)) for f in dias]
-                    if any(v is None for v in variables):
-                        continue          # de vacaciones o sin capacidad algún día: al siguiente
-                    for f, var in zip(dias, variables):
-                        # Escape: ese día ya hace otra crítica de prioridad >= la de esta línea.
-                        ocupado = [self.x[(w, f, s)] for s in self.turnos_wd.get((w, f), [])
-                                   if s != a.linea and (w, f, s) in self.x
-                                   and self.datos.turnos[s].prioridad >= prio]
-                        self.m.add(var + sum(ocupado) >= 1)
-                    break                 # la obligación es del PRIMERO que puede con todo
+                # Escape: ese día ya hace otra crítica de prioridad >= la de esta línea.
+                ocupado = [self.x[(w, f, s)] for s in self.turnos_wd.get((w, f), [])
+                           if s != linea and (w, f, s) in self.x
+                           and self.datos.turnos[s].prioridad >= prio]
+                self.m.add(var + sum(ocupado) >= 1)
 
     def _preferencia_cubridor(self) -> tuple[object, int]:
         """P7 (BLANDA): respeta el ORDEN entre los cubridores de una misma línea. El gestor designa
@@ -1606,6 +1597,58 @@ def principales(datos: Datos) -> dict[str, list[str]]:
     return {s: [w for _, w in sorted(pares)] for s, pares in orden.items()}
 
 
+def obligaciones(datos: Datos, cesiones: set[tuple[str, int]]) -> list[tuple[str, str, list[date]]]:
+    """Quién queda OBLIGADO a cubrir qué días de cada línea crítica: [(trabajador, línea, días)].
+
+    El obligado es el primero del orden `v` que puede con TODOS los días del grupo. Los grupos son
+    la fila entera si la ausencia es completa —`_adopcion_plaza` exige entonces todo o nada, así que
+    repartir la obligación día a día ataría al principal a los días que puede y se lo prohibiría por
+    los que no— y cada día por separado si es parcial.
+
+    UNA ADOPCIÓN POR SEMANA Y PERSONA. Adoptar una fila es llevarse sus días de trabajo Y sus
+    LIBRE, y las dos filas de un binomio son COMPLEMENTARIAS: los días de trabajo de una son los
+    libres de la otra. Darle las dos a la misma persona en la misma semana ISO es lunes a domingo
+    sin un solo descanso — contradice la propia regla de adopción y es lo que volvía infactibles las
+    ventanas de junio, septiembre y noviembre. Que encadene 7 días SÍ es correcto cuando son los del
+    bloque del patrón (viernes a domingo más lunes a jueves de la semana siguiente, con sus siete
+    libres detrás): eso es la rotación, y por eso el corte se hace por SEMANA y no por racha.
+
+    Fuente ÚNICA para las dos piezas que tienen que estar de acuerdo: la restricción dura
+    (`Modelo._obligacion_principal`) y el cap prorrateado de `resolver_anual`, que necesita saber
+    cuántas horas forzosas lleva cada cubridor para no dejarlas fuera de su presupuesto."""
+    orden = principales(datos)
+    salida: list[tuple[str, str, list[date]]] = []
+    adoptada: set[tuple[str, tuple[int, int]]] = set()     # (cubridor, semana) con fila adoptada
+    con_carga: set[tuple[str, tuple[int, int]]] = set()    # (cubridor, semana) con cualquier obligación
+    # Las adopciones primero: son las que reclaman la semana entera, así que deciden antes de que
+    # una cobertura suelta ocupe a quien luego tendría que adoptar.
+    for a in sorted(ausencias_criticas(datos, cesiones), key=lambda x: not x.entera):
+        cubridores = orden.get(a.linea)
+        if not cubridores:
+            continue
+        grupos = ([sorted(a.faltan)] if a.entera else [[f] for f in sorted(a.faltan)])
+        for dias in grupos:
+            semanas = {semana(f) for f in dias}
+            for w in cubridores:
+                if not all(datos.elegible(w, a.linea, f)[0] for f in dias):
+                    continue
+                # Adoptar reclama la semana ENTERA: ni se adopta dos veces, ni se adopta una semana
+                # en la que ya hay cobertura suelta, ni se añade cobertura suelta a una semana ya
+                # adoptada. Lo último es lo que volvía infactible agosto: 18029935M adoptaba
+                # VADU47127 el 12 y 13 —y con ello tenía prohibido el resto de la semana— mientras
+                # la obligación le exigía la misma línea el 16, dentro de esa misma semana ISO.
+                if a.entera and any((w, sm) in con_carga for sm in semanas):
+                    continue
+                if not a.entera and any((w, sm) in adoptada for sm in semanas):
+                    continue
+                salida.append((w, a.linea, dias))
+                con_carga |= {(w, sm) for sm in semanas}
+                if a.entera:
+                    adoptada |= {(w, sm) for sm in semanas}
+                break
+    return salida
+
+
 def semanas_adoptadas(datos: Datos) -> set[tuple[str, tuple[int, int]]]:
     """{(línea, semana ISO)} en que la fila del titular falta ENTERA y por tanto quien la cubra
     adopta la plaza con sus descansos. Lo consultan `rellenar_refuerzos` y las dos pasadas de
@@ -1699,6 +1742,25 @@ def resolver_anual(datos: Datos, segundos: int = 60, hilos: int = 8,
     cesiones = calendario_cesiones(datos)
     # Horas que cada cubridor debe guardarse para la cobertura crítica que le queda por delante.
     reserva = reserva_cubridores(datos, cesiones)
+    # Y las que está OBLIGADO a hacer, por fecha: no cuentan contra el cap (ver más abajo).
+    # OJO a la MONEDA: tiene que ser la del libro anual (`Modelo._minutos_jornada`), no las horas
+    # computadas. Para una línea de LOCALIZADO el libro cobra la SEMANA ENTERA
+    # (JORNADA_LOCALIZADO_SEMANA = 40 h) por tocarla un solo día, no las 8 h del turno; relajar el
+    # cap con las computadas se quedaba corto y volvía infactible la ventana de agosto. Para el
+    # resto —las noches— es el consumo por turno.
+    localizadas = lineas_localizadas(datos)
+    horas_forzadas: dict[str, dict[date, float]] = defaultdict(dict)
+    sem_loc: set[tuple[str, tuple[int, int]]] = set()
+    for w, linea, dias in obligaciones(datos, cesiones):
+        for f in dias:
+            if linea in localizadas:
+                if (w, semana(f)) in sem_loc:
+                    continue                       # esa semana ya está cobrada entera
+                sem_loc.add((w, semana(f)))
+                cargo = JORNADA_LOCALIZADO_SEMANA
+            else:
+                cargo = datos.turnos[linea].horas_consumo
+            horas_forzadas[w][f] = horas_forzadas[w].get(f, 0.0) + cargo
     # PESO de cada día para el prorrateo de la jornada. NO se cuentan los días a pelo: la carga que
     # toca a cada persona disponible NO es uniforme a lo largo del año. En agosto la demanda es la
     # misma pero hay menos gente (vacaciones), así que cada disponible tiene que dar un ~8% MÁS de lo
@@ -1793,6 +1855,16 @@ def resolver_anual(datos: Datos, segundos: int = 60, hilos: int = 8,
             if pendiente:
                 tope_paced[w] = min(tope_paced[w],
                                     round((datos.config.horas_objetivo * factor - pendiente) * 60))
+            # OBLIGATORIO (Nivel 0, espejo de la reserva): la cobertura crítica que el cubridor está
+            # OBLIGADO a hacer hasta esta fecha no cuenta contra el cap. El cap frena el
+            # front-loading, es decir, que alguien ELIJA gastarse el año antes de diciembre; lo que
+            # no puede es prohibir lo que no es una elección. Sin esto, la ventana del 12/01 salía
+            # INFEASIBLE: el cap al 25/01 son 147 h, la cola congelada ya había gastado ~113 y las
+            # cuatro noches obligatorias del 12 al 15 sumaban 44 más.
+            forzadas = horas_forzadas.get(w, {})
+            extra = sum(h for f, h in forzadas.items() if f <= fin_v)
+            if extra:
+                tope_paced[w] += round(extra * 60)
 
         mod = Modelo(datos, fechas_cola + fechas_ventana,
                      congelar=congelar, offset_equidad=offset, cola=cola,
