@@ -18,7 +18,7 @@
 - **Convenio:** `datos.config.rmin` (12), `hmax7` (48), `cmax` (6), `cmax_pool` (5). Nunca constantes a pelo.
 - **Determinismo:** todo orden de iteración debe ser total. Al recorrer conjuntos o diccionarios, ordenar siempre — desempate final por `id_trab` ascendente. Un `set` sin ordenar en un bucle que asigna es un bug.
 - **Sin `random`, sin `datetime.now()`, sin dependencia del orden de inserción de un `dict` construido a partir de un `set`.**
-- **No tocar:** `cargar_datos.py`, `validar_datos.py`, `salida.py`, `diagnostico.py`, ni ningún CSV de `data/input/`.
+- **No tocar:** `cargar_datos.py`, ni ningún CSV de `data/input/`, ni `config.toml`. De `salida.py`, `validar_datos.py` y `diagnostico.py` se cambia **exclusivamente su línea de `import`** en la Task 0, y nada más en ningún otro momento.
 - **Espec:** `docs/superpowers/specs/2026-08-10-pipeline-determinista-design.md`.
 
 ## Estructura de ficheros
@@ -34,9 +34,12 @@
 | `src/reparto.py` | Paso 4. Pool semana a semana, escasez dentro, deuda decide. |
 | `src/reparacion.py` | Paso 5. Cinco movimientos, itera hasta punto fijo. |
 | `src/generar_anual.py` | Orquesta, escribe `decisiones.csv`, llama a `salida.generar_anual`. |
-| `src/calendario.py` | `semana(f)` y utilidades de fecha compartidas (hoy en `modelo.py:186`). |
+| `src/calendario.py` | Fechas: `semana`, `rango_fechas`, `fila_patron`, `turno_prescrito`. |
+| `src/metricas.py` | Métricas e informe: constantes, `peso_cobertura`, `jornada_minutos`, helpers de patrón. |
 
 Se **borran** al final: `src/modelo.py`, `src/pulido.py`.
+
+**Por qué existe la Task 0.** `salida.py`, `validar_datos.py` y `diagnostico.py` importan diez símbolos de `modelo.py`, y ninguno tiene que ver con CP-SAT: son utilidades de fecha, métricas y pesos de informe que acabaron dentro del fichero del solver por acumulación histórica. Si no se mudan primero, borrar `modelo.py` en la Task 11 deja el proyecto sin arrancar.
 
 ## Interfaces que ya existen y NO se tocan
 
@@ -76,17 +79,195 @@ turno = filas[fila][DIAS[f.weekday()]]
 
 ---
 
-### Task 1: `calendario.py` y `plan.py` — el sustrato
+### Task 0: mudar las utilidades compartidas fuera de `modelo.py`
 
 **Files:**
 - Create: `src/calendario.py`
+- Create: `src/metricas.py`
+- Modify: `src/salida.py:22` (solo la línea de import)
+- Modify: `src/validar_datos.py:402` (solo la línea de import)
+- Modify: `src/diagnostico.py:28` (solo la línea de import)
+- Test: `tests/test_mudanza.py`
+
+**Interfaces:**
+- Consumes: nada nuevo
+- Produces:
+  - `calendario.semana(f: date) -> tuple[int, int]` (de `modelo.py:186`)
+  - `calendario.rango_fechas(inicio: date, fin: date) -> list[date]` (de `modelo.py:181`)
+  - `metricas.JORNADA_LOCALIZADO_SEMANA = 40` (de `modelo.py:40`)
+  - `metricas.METRICAS` (de `modelo.py:111`), `metricas.LAMBDA` (de `modelo.py:112`)
+  - `metricas.peso_cobertura(t: Turno) -> int` (de `modelo.py:86`)
+  - `metricas.lineas_localizadas(datos) -> set[str]` (de `modelo.py:192`)
+  - `metricas.jornada_minutos(datos, plan, fechas=None) -> dict[str, int]` (de `modelo.py:201`)
+  - `metricas._patrones_uvi(datos) -> set[str]` (de `modelo.py:1291`)
+  - `metricas._patrones_noche(datos) -> set[str]` (de `modelo.py:1303`)
+
+**Qué es esta tarea:** una **mudanza literal**, no una reescritura. Copia cada símbolo con su cuerpo y su docstring **intactos** desde `modelo.py` a su nuevo módulo, y arregla los imports. El comportamiento de `salida.py`, `validar_datos.py` y `diagnostico.py` debe quedar **idéntico** — si cambia una sola salida, la mudanza está mal hecha.
+
+`metricas.jornada_minutos` sigue usando la moneda de CONSUMO (`horas_consumo`, `JORNADA_LOCALIZADO_SEMANA`). Eso es correcto y no contradice al resto del proyecto: el motor nuevo retira esa moneda del **libro anual**, pero `salida` y `diagnostico` la usan para **informar**, que es otra cosa. No la toques.
+
+`metricas.py` importa de `calendario` lo que necesite (`semana`); `calendario.py` no importa de `metricas` (sin ciclos).
+
+- [ ] **Step 1: Capturar la salida ACTUAL como referencia**
+
+```bash
+/home/samu/anaconda3/envs/ortools_env/bin/python src/diagnostico.py > /tmp/diagnostico_antes.txt 2>&1
+/home/samu/anaconda3/envs/ortools_env/bin/python src/validar_datos.py > /tmp/validar_antes.txt 2>&1
+wc -l /tmp/diagnostico_antes.txt /tmp/validar_antes.txt
+```
+
+Ambos deben tener contenido. Son la referencia de que la mudanza no cambia nada.
+
+- [ ] **Step 2: Escribir el test que falla**
+
+```python
+#!/usr/bin/env python3
+"""La mudanza es literal: los simbolos viven en su casa nueva y valen lo mismo."""
+import sys
+from datetime import date
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+
+import calendario
+import metricas
+from cargar_datos import cargar
+
+
+def main() -> int:
+    assert calendario.semana(date(2026, 1, 1)) == (2026, 1)
+    assert calendario.semana(date(2025, 12, 29)) == (2026, 1)
+    assert len(calendario.rango_fechas(date(2026, 1, 1), date(2026, 1, 31))) == 31
+
+    assert metricas.JORNADA_LOCALIZADO_SEMANA == 40
+    assert metricas.METRICAS == ("sabado", "domingo", "festivo")
+    assert set(metricas.LAMBDA) == set(metricas.METRICAS)
+
+    datos = cargar()
+    loc = metricas.lineas_localizadas(datos)
+    assert "VADU47127" in loc, loc          # la linea UVI es localizada
+    assert "VADN001" not in loc
+
+    uvi = metricas._patrones_uvi(datos)
+    assert uvi == {"UVI_VAL", "UVI_PRIV"}, uvi
+    assert metricas._patrones_noche(datos), "deberia detectar los patrones de noche"
+
+    # peso_cobertura: prioridad 0 no vale cero, y lo critico pesa mas que lo normal
+    assert metricas.peso_cobertura(datos.turnos["VADU47127"]) > \
+           metricas.peso_cobertura(datos.turnos["VADN001"])
+
+    # jornada_minutos sigue en la moneda de CONSUMO (informe), no en la legal
+    p = {("X", date(2026, 3, 16)): "VADN001"}
+    assert metricas.jornada_minutos(datos, p)["X"] > 0
+
+    # NADIE del codigo vivo importa ya de modelo salvo el propio modelo/pulido
+    raiz = Path(__file__).resolve().parents[1]
+    for f in ("salida.py", "validar_datos.py", "diagnostico.py"):
+        txt = (raiz / "src" / f).read_text(encoding="utf-8")
+        assert "from modelo import" not in txt, f"{f} sigue importando de modelo"
+
+    print("OK  mudanza · calendario y metricas en su sitio")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+```
+
+- [ ] **Step 3: Ejecutar el test y ver que falla**
+
+Run: `/home/samu/anaconda3/envs/ortools_env/bin/python tests/test_mudanza.py`
+Expected: FAIL con `ModuleNotFoundError: No module named 'calendario'`
+
+- [ ] **Step 4: Crear `src/calendario.py` con los dos símbolos de fecha**
+
+Copia `rango_fechas` (`modelo.py:181-184`) y `semana` (`modelo.py:186-189`) **verbatim**, con sus docstrings. Encabeza el módulo con:
+
+```python
+"""Utilidades de fecha compartidas por todo el proyecto.
+
+Vivían en `modelo.py` por acumulación histórica, no por diseño: no tienen nada que ver con el
+solver y las consultan `salida`, `validar_datos` y los cinco pasos del pipeline."""
+```
+
+- [ ] **Step 5: Crear `src/metricas.py` con los ocho símbolos restantes**
+
+Copia **verbatim** desde `modelo.py`: `JORNADA_LOCALIZADO_SEMANA` (l.40), `peso_cobertura` (l.86), `METRICAS` (l.111), `LAMBDA` (l.112), `lineas_localizadas` (l.192), `jornada_minutos` (l.201), `_patrones_uvi` (l.1291), `_patrones_noche` (l.1303). Mantén los comentarios que llevan encima. Encabeza con:
+
+```python
+"""Métricas y pesos de INFORME: lo que se cuenta y cómo se pondera al reportar.
+
+Ojo a la moneda: `jornada_minutos` cuenta en horas de CONSUMO (una semana de localizado ocupa
+`JORNADA_LOCALIZADO_SEMANA` entera). El motor nuevo NO usa esa moneda para el libro anual —el
+objetivo de 1776 es una cifra de convenio y se lleva en horas legales—, pero los informes sí la
+enseñan, que es otra cosa. Las dos contabilidades conviven a propósito."""
+```
+
+- [ ] **Step 6: Cambiar las tres líneas de import**
+
+`src/salida.py:22-24`, sustituye el bloque `from modelo import (...)` por:
+
+```python
+from calendario import semana
+from metricas import (JORNADA_LOCALIZADO_SEMANA, LAMBDA, METRICAS, _patrones_uvi,
+                      jornada_minutos, lineas_localizadas, peso_cobertura)
+```
+
+`src/validar_datos.py:402`, sustituye por:
+
+```python
+    from calendario import rango_fechas                                   # noqa: PLC0415
+    from metricas import _patrones_noche, _patrones_uvi, jornada_minutos  # noqa: PLC0415
+```
+
+`src/diagnostico.py:28`, sustituye por:
+
+```python
+from metricas import jornada_minutos
+```
+
+**No cambies nada más en esos tres ficheros.**
+
+- [ ] **Step 7: Verificar que la salida es IDÉNTICA**
+
+```bash
+/home/samu/anaconda3/envs/ortools_env/bin/python tests/test_mudanza.py
+/home/samu/anaconda3/envs/ortools_env/bin/python src/diagnostico.py > /tmp/diagnostico_despues.txt 2>&1
+/home/samu/anaconda3/envs/ortools_env/bin/python src/validar_datos.py > /tmp/validar_despues.txt 2>&1
+diff /tmp/diagnostico_antes.txt /tmp/diagnostico_despues.txt && echo "DIAGNOSTICO IDENTICO"
+diff /tmp/validar_antes.txt /tmp/validar_despues.txt && echo "VALIDAR IDENTICO"
+```
+Expected: el test pasa y **los dos `diff` salen vacíos**. Si alguno difiere, la mudanza no fue literal — arréglalo antes de commitear.
+
+- [ ] **Step 8: Commit**
+
+```bash
+git add src/calendario.py src/metricas.py src/salida.py src/validar_datos.py \
+        src/diagnostico.py tests/test_mudanza.py
+git commit -m "muda a calendario.py y metricas.py lo que salida y validar usan de modelo
+
+Diez simbolos que salida.py, validar_datos.py y diagnostico.py importaban de
+modelo.py y que no tienen nada que ver con CP-SAT: fechas, metricas y pesos de
+informe que acabaron dentro del fichero del solver por acumulacion historica.
+Sin esta mudanza, borrar modelo.py deja el proyecto sin arrancar.
+
+Mudanza literal: diagnostico y validar producen una salida identica byte a byte.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
+```
+
+---
+
+### Task 1: `calendario.py` (ampliación) y `plan.py` — el sustrato
+
+**Files:**
+- Modify: `src/calendario.py` (**ya existe** desde la Task 0 con `semana` y `rango_fechas`; se le **añaden** dos funciones, no se reescribe)
 - Create: `src/plan.py`
 - Test: `tests/test_plan.py`
 
 **Interfaces:**
-- Consumes: `cargar_datos.LIBRE`
+- Consumes: `cargar_datos.LIBRE`, `calendario.semana` (de la Task 0)
 - Produces:
-  - `calendario.semana(f: date) -> tuple[int, int]`
   - `calendario.fila_patron(datos, w: str, f: date) -> int | None`
   - `calendario.turno_prescrito(datos, w: str, f: date) -> str | None` — turno que el patrón/línea fija prescribe ese día, `None` si LIBRE o si no es de patrón/fijo
   - `plan.Decision` (frozen dataclass), `plan.Hueco` (frozen dataclass), `plan.Plan`
@@ -176,26 +357,11 @@ if __name__ == "__main__":
 Run: `/home/samu/anaconda3/envs/ortools_env/bin/python tests/test_plan.py`
 Expected: FAIL con `ModuleNotFoundError: No module named 'calendario'`
 
-- [ ] **Step 3: Escribir `src/calendario.py`**
+- [ ] **Step 3: AÑADIR a `src/calendario.py` las dos funciones de patrón**
+
+`semana` y `rango_fechas` ya están ahí desde la Task 0 — **no las reescribas ni las dupliques**. Añade al final del módulo, y amplía el import de `cargar_datos` a `DIAS, LIBRE, Datos`:
 
 ```python
-"""Utilidades de fecha compartidas por todos los pasos.
-
-`semana` vivía en `modelo.py`; se mueve aquí porque el convenio se mide por semana ISO y eso lo
-consultan los cinco pasos, no solo el que resuelve."""
-from __future__ import annotations
-
-from datetime import date
-
-from cargar_datos import DIAS, LIBRE, Datos
-
-
-def semana(f: date) -> tuple[int, int]:
-    """Clave (año, nº) de la semana ISO (lunes-domingo) a la que pertenece la fecha."""
-    a, n, _ = f.isocalendar()
-    return (a, n)
-
-
 def fila_patron(datos: Datos, w: str, f: date) -> int | None:
     """Fila de `patrones.csv` que le toca a `w` el día `f`, o None si no es de patrón.
 
@@ -686,9 +852,8 @@ from __future__ import annotations
 from datetime import date
 
 from cargar_datos import Datos
+from metricas import METRICAS      # ("sabado", "domingo", "festivo") — una sola definicion
 from plan import Plan
-
-METRICAS = ("sabado", "domingo", "festivo")
 
 
 class Deuda:
@@ -2324,7 +2489,7 @@ Expected: PASS. **Anota las cifras del pool** — son las que deciden si la equi
 
 Run:
 ```bash
-for t in plan legal deuda libranzas criticos rotacion reparto reparacion aceptacion_v2 benchmark; do
+for t in mudanza plan legal deuda libranzas criticos rotacion reparto reparacion aceptacion_v2 benchmark; do
   echo "--- $t ---"
   /home/samu/anaconda3/envs/ortools_env/bin/python tests/test_$t.py || echo "FALLO EN $t"
 done
@@ -2342,7 +2507,7 @@ git rm tests/test_adopcion.py tests/test_ausencias.py tests/test_principal.py \
 - [ ] **Step 5: Verificar que no queda ninguna referencia**
 
 Run: `grep -rn "modelo\|pulido\|ortools\|cp_model" src/ tests/ --include="*.py"`
-Expected: sin resultados. Si `salida.py` o `validar_datos.py` importan algo de `modelo`, sustituye ese import por el equivalente de `calendario.py` o `legal.py` y vuelve a ejecutar los diez tests.
+Expected: sin resultados. La Task 0 ya mudó los diez símbolos que `salida.py`, `validar_datos.py` y `diagnostico.py` importaban de `modelo`, así que no debería quedar ninguna referencia. Si aparece alguna, **no la parchees a mano**: es señal de que la mudanza de la Task 0 quedó incompleta — muévela también a `calendario.py` o `metricas.py` según corresponda y vuelve a ejecutar los once tests.
 
 - [ ] **Step 6: Actualizar `CLAUDE.md`**
 
