@@ -54,9 +54,9 @@ De ahí el principio rector, que además es una frase que se dice en una reunió
 | Plantilla | 88 · 6 fijo, 65 patrón, 6 mixto, 11 correturno |
 | Pool flexible (mixto + correturno) | 17 personas = **19 %** |
 | Holgura anual | +3.491 h = +2,0 FTE (2,2 % sobre la demanda de consumo) |
-| Horas que los patrones deben ceder | **5.955 h** = 3,35 FTE = 744 turnos de 8 h |
+| Horas que los patrones deben ceder | **5.207 h** = 2,93 FTE = 651 turnos de 8 h |
 | Huecos que dejan las vacaciones de los de patrón | ~11.196 h (1.950 días) |
-| Huecos estructurales / capacidad del pool | 17.151 h ÷ 30.192 h = **57 %** |
+| Huecos estructurales / capacidad del pool | 16.403 h ÷ 30.192 h = **54 %** |
 
 El pool llega al último paso con más de la mitad de su capacidad ya comprometida. Todo lo que el
 procedimiento pueda resolver **antes** de llegar ahí es capacidad que se libera.
@@ -152,33 +152,66 @@ Ya vienen resueltas en `Datos`: dos bloques de 15 días por trabajador (`vac1_in
 ### Paso 1 — libranzas por exceso de horas
 
 **Qué reparte.** Cada trabajador de patrón tiene un exceso = lo que su patrón prescribe menos
-`horas_objetivo` (1776), ajustado por `factor_jornada`. `diagnostico.py` ya lo calcula. Total:
-5.955 h.
+`horas_objetivo` (1776), ajustado por `factor_jornada`. `diagnostico.py` ya lo calcula.
+
+**La moneda es la jornada (ocupación), no las horas computadas.** Una semana de localizado ocupa
+la semana entera (`JORNADA_LOCALIZADO_SEMANA` = 40 h) aunque compute menos horas legales, y lo que
+cuenta contra el objetivo anual es lo que la plaza **ocupa**. Se mantiene el criterio de la rama
+base.
+
+**Exención de UVI.** `UVI_PRIV` y `UVI_VAL` **no ceden por exceso**, por acuerdo. Su exceso
+nominal (+207 y +167 h) es un artefacto de esa contabilidad: en horas legales computadas están en
+1.352 y 1.344, más de 400 h **por debajo** del objetivo. Hacerles ceder días sería quitar horas a
+quien ya va corto. La exención se declara en `config.toml`; no se deriva.
+
+| | h/año computadas | jornada (ocupación) | cede |
+|---|---|---|---|
+| UVI_PRIV | 1.352 | 1.983 | **0 h** (exento) |
+| UVI_VAL | 1.344 | 1.943 | **0 h** (exento) |
+
+**Total a ceder: 5.207 h** = 651 turnos de 8 h = 2,93 FTE.
 
 **De horas a días.** El exceso se expresa en horas pero se cede en unidades enteras. Para un
 patrón suelto, el número de días a ceder es `round(exceso_h / horas_consumo del turno que
 prescribe ese día)`; el redondeo se acumula en un residuo por trabajador para que el error no se
 sesgue siempre en la misma dirección. Para un patrón de bloque, el número de filas es
 `round(exceso_h / horas de la fila)`. `PAT_GRANDE_VALL` cede 92 h ≈ 11,5 turnos de 8 h por
-persona; `UVI_PRIV` cede 207 h ≈ 5,2 semanas.
+persona; `UVI_PRIV` y `UVI_VAL` no ceden por exceso.
 
 **Dos granularidades.** La unidad de cesión **no es la misma para todos los patrones**:
 
-| granularidad | criterio | patrones | horas |
+| granularidad | criterio | patrones | horas a ceder |
 |---|---|---|---|
-| **bloque** (fila entera) | exactamente **una fila trabaja cada día de la semana** | UVI_VAL, UVI_PRIV, VAL_NOCHES, VAL_NOCHES2 | 1.080 h (18 %) |
-| **suelto** (días sueltos) | el resto | PAT_GRANDE_VALL, PAT_ISCAR, PAT_MEDINA, PAT_MAYORGA, PAT_TORDESILLAS | 4.875 h (82 %) |
+| **bloque** (fila entera) | exactamente **una fila trabaja cada día de la semana** | VAL_NOCHES, VAL_NOCHES2 | 332 h (**6 %**) |
+| | | UVI_VAL, UVI_PRIV | 0 h (exentos) |
+| **suelto** (días sueltos) | el resto | PAT_GRANDE_VALL, PAT_ISCAR, PAT_MEDINA, PAT_MAYORGA, PAT_TORDESILLAS | 4.875 h (**94 %**) |
 
 El criterio se **deriva de `patrones.csv`**, no se declara: para cada día de la semana se cuenta
 cuántas filas del grupo trabajan; si el mínimo es 1, el patrón es de bloque. Los cuatro binomios
 dan `1 1 1 1 1 1 1`; `PAT_GRANDE_VALL` da `35 33 34 34 35 14 5`.
 
+Granularidad y exención son **cosas distintas**: los dos UVI siguen siendo patrones de bloque
+aunque no cedan, porque cuando su titular se va de vacaciones la fila se adopta entera igual (lo
+usan los pasos 2 y 3). Lo que la exención apaga es solo la cesión por exceso.
+
+**Que el 94 % de las cesiones sean de día suelto es la mejor noticia del diseño.** Un día suelto se
+coloca exactamente en la fecha de menor carga; un bloque de siete cae donde cae. El paso 1 tiene
+mucha más precisión de la que parecía, y el paso 5 recibe muchos menos huecos que arreglar.
+
 La regla se explica en una frase: **si en tu grupo solo hay una fila trabajando cada día, tu
 libranza arrastra la fila entera, porque si no ese día la línea se queda a cero.** En un patrón
 con 34 filas trabajando el martes, quitar a uno baja a 33 y no rompe nada.
 
-`config.toml` admite una lista opcional `[libranzas] patrones_bloque` para forzar excepciones que
-la estructura no revele. Vacía por defecto.
+`config.toml` gana una sección `[libranzas]` con dos listas:
+
+```toml
+[libranzas]
+patrones_exentos = ["UVI_PRIV", "UVI_VAL"]   # no ceden por exceso (acuerdo)
+patrones_bloque  = []                        # fuerza granularidad de bloque; vacía = derivar
+```
+
+`patrones_exentos` es un acuerdo y **hay que declararlo**. `patrones_bloque` solo existe para
+forzar excepciones que la estructura no revele; vacía por defecto.
 
 Una cesión de bloque arrastra también los **descansos** de la fila, no solo sus turnos: adoptar
 una fila es llevarse la plaza entera. Una cesión suelta arrastra solo el turno de ese día.
@@ -333,8 +366,8 @@ difícil.*
 
 **El listón del 99 % es exigente para un procedimiento sin backtracking global.** Es el riesgo
 principal y se asume con los ojos abiertos. La mitigación es el paso 5 reforzado (movimiento 5 +
-iteración) y el hecho de que el 82 % de las cesiones sean de día suelto, que da al paso 1 mucha
-más precisión para colocarlas donde no degradan.
+iteración) y el hecho de que el **94 %** de las cesiones sean de día suelto, que da al paso 1
+mucha más precisión para colocarlas donde no degradan.
 
 **Compromiso por escrito:** si al medir se aterriza por debajo del 99 %, no se decide sobre la
 marcha. Se lleva el número real a la mesa y se elige entre apretar el paso 5, bajar el listón, o
