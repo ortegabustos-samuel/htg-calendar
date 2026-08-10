@@ -54,9 +54,9 @@ De ahí el principio rector, que además es una frase que se dice en una reunió
 | Plantilla | 88 · 6 fijo, 65 patrón, 6 mixto, 11 correturno |
 | Pool flexible (mixto + correturno) | 17 personas = **19 %** |
 | Holgura anual | +3.491 h = +2,0 FTE (2,2 % sobre la demanda de consumo) |
-| Horas que los patrones deben ceder | **5.207 h** = 2,93 FTE = 651 turnos de 8 h |
+| Horas que los patrones deben ceder | **4.847 h** = 2,73 FTE = 606 turnos de 8 h |
 | Huecos que dejan las vacaciones de los de patrón | ~11.196 h (1.950 días) |
-| Huecos estructurales / capacidad del pool | 16.403 h ÷ 30.192 h = **54 %** |
+| Huecos estructurales / capacidad del pool | 16.043 h ÷ 30.192 h = **53 %** |
 
 El pool llega al último paso con más de la mitad de su capacidad ya comprometida. Todo lo que el
 procedimiento pueda resolver **antes** de llegar ahí es capacidad que se libera.
@@ -154,47 +154,81 @@ Ya vienen resueltas en `Datos`: dos bloques de 15 días por trabajador (`vac1_in
 **Qué reparte.** Cada trabajador de patrón tiene un exceso = lo que su patrón prescribe menos
 `horas_objetivo` (1776), ajustado por `factor_jornada`. `diagnostico.py` ya lo calcula.
 
-**La moneda es la jornada (ocupación), no las horas computadas.** Una semana de localizado ocupa
-la semana entera (`JORNADA_LOCALIZADO_SEMANA` = 40 h) aunque compute menos horas legales, y lo que
-cuenta contra el objetivo anual es lo que la plaza **ocupa**. Se mantiene el criterio de la rama
-base.
+**La moneda son las HORAS LEGALES COMPUTADAS**, no la ocupación:
 
-**Exención de UVI.** `UVI_PRIV` y `UVI_VAL` **no ceden por exceso**, por acuerdo. Su exceso
-nominal (+207 y +167 h) es un artefacto de esa contabilidad: en horas legales computadas están en
-1.352 y 1.344, más de 400 h **por debajo** del objetivo. Hacerles ceder días sería quitar horas a
-quien ya va corto. La exención se declara en `config.toml`; no se deriva.
+```
+cede_h = max(0, horas_legales_del_patrón − horas_objetivo)
+```
 
-| | h/año computadas | jornada (ocupación) | cede |
-|---|---|---|---|
-| UVI_PRIV | 1.352 | 1.983 | **0 h** (exento) |
-| UVI_VAL | 1.344 | 1.943 | **0 h** (exento) |
+Una sola línea, sin excepciones y sin lista que mantener. Esto **diverge a propósito de la rama
+base**, cuyo libro anual (`_minutos_jornada`) se llevaba en ocupación. La divergencia no es
+estética: el objetivo de 1776 h es una cifra de **convenio**, y un convenio cuenta horas legales.
+Ceder por ocupación deja al trabajador por debajo de las horas que tiene pactadas.
 
-**Total a ceder: 5.207 h** = 651 turnos de 8 h = 2,93 FTE.
+El proyecto maneja tres monedas y conviene tenerlas separadas:
+
+| moneda | 24 h localizado vale | para qué sirve |
+|---|---|---|
+| `horas` (legal) | 8,0 h | topes del convenio C4/C5/C6 **y el objetivo anual** |
+| `horas_consumo` | 11,4 h (= 80 h ÷ 7) | — se retira del libro anual (ver abajo) |
+| `JORNADA_LOCALIZADO_SEMANA` | 40 h/semana | solo líneas UVI, solo en la rama base |
+
+**Lo que la regla produce**, y por qué sale sola:
+
+| patrón | personas | h legales | cede/persona | total |
+|---|---|---|---|---|
+| PAT_GRANDE_VALL | 38 | 1.868 | 92 h | 3.496 h |
+| PAT_ISCAR | 3 | 1.869 | 93 h | 279 h |
+| PAT_MAYORGA | 4 | 1.850 | 74 h | 296 h |
+| PAT_MEDINA | 9 | 1.796 | **20 h** | 180 h |
+| PAT_TORDESILLAS | 3 | 1.864 | 88 h | 264 h |
+| VAL_NOCHES ×2 | 4 | 1.859 | 83 h | 332 h |
+| **UVI_PRIV** | 2 | **1.352** | **0 h** | 0 h |
+| **UVI_VAL** | 2 | **1.344** | **0 h** | 0 h |
+
+Los dos casos que obligaron a fijar la moneda:
+
+- **UVI no cede** porque sus horas legales (1.352 y 1.344) están más de 400 h **por debajo** del
+  objetivo. Su exceso nominal de +207 y +167 h era un artefacto de cobrar la semana de localizado
+  entera. No hace falta declararlo exento: la regla lo deja en cero sola.
+- **PAT_MEDINA cede 20 h, no 60.** Es el único patrón no-UVI que toca un localizado de 24 h
+  (`VADN177`, 22:00→22:00, sábado y domingo de la fila 8). Le toca 12 veces al año y cada una
+  carga 3,43 h de más en la moneda de consumo: 12 × 3,43 = 41 h, que es toda la diferencia entre
+  sus 1.796 h legales y sus 1.836 de ocupación. Cediendo 60 h cerraría el año en 1.736 h legales,
+  cuarenta por debajo de convenio.
+
+**Consecuencia: `horas_consumo` se retira del libro anual.** Con la moneda legal, el recargo del
+localizado (11,4 h frente a 8) deja de intervenir en el objetivo de 1776 y en las colas de deuda.
+La disponibilidad que ese recargo pretendía representar ya está protegida por `rmin` y por los
+topes semanales, que sí impiden encadenar una guardia de 24 h con otra cosa. `horas_consumo` deja
+de usarse en el motor nuevo.
+
+**Total a ceder: 4.847 h** = 606 turnos de 8 h = 2,73 FTE.
 
 **De horas a días.** El exceso se expresa en horas pero se cede en unidades enteras. Para un
-patrón suelto, el número de días a ceder es `round(exceso_h / horas_consumo del turno que
+patrón suelto, el número de días a ceder es `round(exceso_h / horas legales del turno que
 prescribe ese día)`; el redondeo se acumula en un residuo por trabajador para que el error no se
 sesgue siempre en la misma dirección. Para un patrón de bloque, el número de filas es
-`round(exceso_h / horas de la fila)`. `PAT_GRANDE_VALL` cede 92 h ≈ 11,5 turnos de 8 h por
-persona; `UVI_PRIV` y `UVI_VAL` no ceden por exceso.
+`round(exceso_h / horas legales de la fila)`. `PAT_GRANDE_VALL` cede 92 h ≈ 11,5 turnos de 8 h por
+persona; `PAT_MEDINA` cede 20 h ≈ 2,5 turnos; `UVI_PRIV` y `UVI_VAL` no ceden.
 
 **Dos granularidades.** La unidad de cesión **no es la misma para todos los patrones**:
 
 | granularidad | criterio | patrones | horas a ceder |
 |---|---|---|---|
-| **bloque** (fila entera) | exactamente **una fila trabaja cada día de la semana** | VAL_NOCHES, VAL_NOCHES2 | 332 h (**6 %**) |
-| | | UVI_VAL, UVI_PRIV | 0 h (exentos) |
-| **suelto** (días sueltos) | el resto | PAT_GRANDE_VALL, PAT_ISCAR, PAT_MEDINA, PAT_MAYORGA, PAT_TORDESILLAS | 4.875 h (**94 %**) |
+| **bloque** (fila entera) | exactamente **una fila trabaja cada día de la semana** | VAL_NOCHES, VAL_NOCHES2 | 332 h (**7 %**) |
+| | | UVI_VAL, UVI_PRIV | 0 h (no ceden) |
+| **suelto** (días sueltos) | el resto | PAT_GRANDE_VALL, PAT_ISCAR, PAT_MEDINA, PAT_MAYORGA, PAT_TORDESILLAS | 4.515 h (**93 %**) |
 
 El criterio se **deriva de `patrones.csv`**, no se declara: para cada día de la semana se cuenta
 cuántas filas del grupo trabajan; si el mínimo es 1, el patrón es de bloque. Los cuatro binomios
 dan `1 1 1 1 1 1 1`; `PAT_GRANDE_VALL` da `35 33 34 34 35 14 5`.
 
-Granularidad y exención son **cosas distintas**: los dos UVI siguen siendo patrones de bloque
-aunque no cedan, porque cuando su titular se va de vacaciones la fila se adopta entera igual (lo
-usan los pasos 2 y 3). Lo que la exención apaga es solo la cesión por exceso.
+Granularidad y cesión son **cosas distintas**: los dos UVI siguen siendo patrones de bloque aunque
+no cedan nada, porque cuando su titular se va de vacaciones la fila se adopta entera igual (lo usan
+los pasos 2 y 3). Que no cedan por exceso no los saca de la mecánica de adopción.
 
-**Que el 94 % de las cesiones sean de día suelto es la mejor noticia del diseño.** Un día suelto se
+**Que el 93 % de las cesiones sean de día suelto es la mejor noticia del diseño.** Un día suelto se
 coloca exactamente en la fecha de menor carga; un bloque de siete cae donde cae. El paso 1 tiene
 mucha más precisión de la que parecía, y el paso 5 recibe muchos menos huecos que arreglar.
 
@@ -202,16 +236,16 @@ La regla se explica en una frase: **si en tu grupo solo hay una fila trabajando 
 libranza arrastra la fila entera, porque si no ese día la línea se queda a cero.** En un patrón
 con 34 filas trabajando el martes, quitar a uno baja a 33 y no rompe nada.
 
-`config.toml` gana una sección `[libranzas]` con dos listas:
+`config.toml` gana una sección `[libranzas]` con una única lista opcional:
 
 ```toml
 [libranzas]
-patrones_exentos = ["UVI_PRIV", "UVI_VAL"]   # no ceden por exceso (acuerdo)
-patrones_bloque  = []                        # fuerza granularidad de bloque; vacía = derivar
+patrones_bloque = []    # fuerza granularidad de bloque; vacía = derivar de patrones.csv
 ```
 
-`patrones_exentos` es un acuerdo y **hay que declararlo**. `patrones_bloque` solo existe para
-forzar excepciones que la estructura no revele; vacía por defecto.
+**No hay lista de exenciones.** La regla de la moneda legal deja a UVI en cero sola, así que no hay
+ningún acuerdo que declarar ni que mantener sincronizado. Es el resultado de haber elegido bien la
+moneda, y es lo que permite contar el paso 1 sin asteriscos.
 
 Una cesión de bloque arrastra también los **descansos** de la fila, no solo sus turnos: adoptar
 una fila es llevarse la plaza entera. Una cesión suelta arrastra solo el turno de ese día.
@@ -366,7 +400,7 @@ difícil.*
 
 **El listón del 99 % es exigente para un procedimiento sin backtracking global.** Es el riesgo
 principal y se asume con los ojos abiertos. La mitigación es el paso 5 reforzado (movimiento 5 +
-iteración) y el hecho de que el **94 %** de las cesiones sean de día suelto, que da al paso 1
+iteración) y el hecho de que el **93 %** de las cesiones sean de día suelto, que da al paso 1
 mucha más precisión para colocarlas donde no degradan.
 
 **Compromiso por escrito:** si al medir se aterriza por debajo del 99 %, no se decide sobre la
