@@ -54,9 +54,9 @@ De ahí el principio rector, que además es una frase que se dice en una reunió
 | Plantilla | 88 · 6 fijo, 65 patrón, 6 mixto, 11 correturno |
 | Pool flexible (mixto + correturno) | 17 personas = **19 %** |
 | Holgura anual | +3.491 h = +2,0 FTE (2,2 % sobre la demanda de consumo) |
-| Horas que los patrones deben ceder | **4.847 h** = 2,73 FTE = 606 turnos de 8 h |
+| Horas que los patrones deben ceder | **3.609 h** = 2,03 FTE = 451 turnos de 8 h |
 | Huecos que dejan las vacaciones de los de patrón | ~11.196 h (1.950 días) |
-| Huecos estructurales / capacidad del pool | 16.043 h ÷ 30.192 h = **53 %** |
+| Huecos estructurales / capacidad del pool | 14.805 h ÷ 30.192 h = **49 %** |
 
 El pool llega al último paso con más de la mitad de su capacidad ya comprometida. Todo lo que el
 procedimiento pueda resolver **antes** de llegar ahí es capacidad que se libera.
@@ -201,7 +201,17 @@ La disponibilidad que ese recargo pretendía representar ya está protegida por 
 topes semanales, que sí impiden encadenar una guardia de 24 h con otra cosa. `horas_consumo` deja
 de usarse en el motor nuevo.
 
-**Total a ceder: 4.847 h** = 606 turnos de 8 h = 2,73 FTE.
+**Total a ceder: 3.609 h** = 451 turnos de 8 h = 2,03 FTE. De ellas, **266 h (7 %) de bloque** y
+**3.343 h (93 %) de día suelto**.
+
+> **Corrección medida en implementación (Task 4).** Esta cifra era 4.847 h en la primera versión de
+> la especificación, tomada de `diagnostico.py`. Ese número es un promedio **por patrón**; el
+> reparto real es **por persona**, y las horas que la rotación prescribe a cada uno van de 1.816 a
+> 1.888 dentro del mismo `PAT_GRANDE_VALL` — porque las vacaciones de cada trabajador caen en
+> semanas distintas de la rotación y unas semanas pesan más que otras. El caso extremo es
+> `PAT_MEDINA`: solo **2 de sus 9** superan las 1.776 h; a los otros siete sus vacaciones ya los
+> dejan por debajo y no tienen nada que ceder. La proporción bloque/suelto apenas se mueve (7/93
+> frente a 6/94), así que la conclusión de diseño se mantiene.
 
 **De horas a días.** El exceso se expresa en horas pero se cede en unidades enteras. Para un
 patrón suelto, el número de días a ceder es `round(exceso_h / horas legales del turno que
