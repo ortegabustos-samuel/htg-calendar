@@ -6,7 +6,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from calendario import semana
+from cargar_datos import cargar
+from calendario import fila_patron, semana
 from plan import Plan
 
 
@@ -15,6 +16,20 @@ def main() -> int:
     assert semana(date(2026, 12, 31)) == (2026, 53)
     # el 29/12/2025 es lunes de la semana 1 de 2026 en ISO
     assert semana(date(2025, 12, 29)) == (2026, 1)
+
+    # fila_patron debe anclar en el LUNES de la semana del 1 de enero, no en el 1 de enero
+    # (jueves en 2026): la fila avanza exactamente una vez entre lunes consecutivos y no se
+    # mueve dentro de la misma semana.
+    datos = cargar()
+    w = next(w for w, t in datos.trabajadores.items() if t.tipo == "patron"
+             and len(datos.patrones.get(t.patron, [])) > 10)
+    lunes1, lunes2 = date(2026, 1, 5), date(2026, 1, 12)
+    jueves, domingo = date(2026, 1, 8), date(2026, 1, 11)
+    f1 = fila_patron(datos, w, lunes1)
+    assert fila_patron(datos, w, jueves) == f1
+    assert fila_patron(datos, w, domingo) == f1
+    n = len(datos.patrones[datos.trabajadores[w].patron])
+    assert fila_patron(datos, w, lunes2) == (f1 + 1) % n
 
     p = Plan()
     f = date(2026, 3, 14)
