@@ -1192,7 +1192,14 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 **Reglas:**
 - **La cobertura crítica GANA al patrón propio del cubridor.** Regla dura, no un peso.
 - **Escape:** el cubridor queda libre si ese día ya hace otra crítica de prioridad ≥ la de esta línea.
-- **Una adopción por semana y persona.** Las dos filas de un binomio son complementarias: darle las dos a la misma persona en la misma semana ISO es lunes a domingo sin un solo descanso. Y una semana ya adoptada no admite además cobertura suelta. Esta regla está pagada con las infactibilidades de junio, agosto, septiembre y noviembre de la rama base.
+- **ADOPCIÓN DE PLAZA — se dispara por FILA ENTERA, nunca por tocar la línea.** Esta es la regla que más cuidado exige, porque implementarla de más cuesta cobertura y de menos cuesta descansos:
+
+  - Si al titular le **falta la fila ENTERA** esa semana (vacaciones o bloque cedido), quien cubra **adopta la plaza**: hace todos sus días de trabajo **y hereda sus LIBRE**, que se marcan con `Plan.ceder`. Nada más esa semana. *«Cubrir una plaza no es coger unos turnos sueltos: es asumir la plaza, y la plaza viene con sus descansos.»*
+  - Si falta solo **parte** de la fila, o un **día suelto**: son turnos normales. Se cubren y el cubridor **sigue su propia rotación el resto de la semana**. Ningún veto semanal.
+
+  Aplicar el veto a toda cobertura es un error medido: deja al cubridor sin poder tapar el jueves de la misma línea que ya cubría el miércoles. La rama base lo pagó y lo arregló en el commit `666cd14` («la adopción de plaza se dispara por fila entera, no por tocar la línea»).
+
+  **Porta `AusenciaCritica` y `ausencias_criticas` desde `modelo.py:1512` y `modelo.py:1534`** — ya calculan exactamente esto: `prescritos`, `faltan`, `libres` y si la ausencia es `entera`. No lo reinventes.
 
 - [ ] **Step 1: Escribir el test que falla**
 
@@ -1333,11 +1340,14 @@ def cubrir(datos: Datos, plan: Plan, ley: Legal) -> None:
                 continue
             if plan.cubierto(f, linea) >= datos.turnos[linea].dem:
                 continue
-            # ¿Hay titular que la haga por su patrón y no la haya cedido?
+            # ¿Cuántas plazas quedan por cubrir? OJO: `dem` puede ser > 1 (la línea H pide 2),
+            # así que no basta con que HAYA titular — hay que contar cuántos y compararlos con la
+            # demanda. Mirar solo si la lista está vacía pierde 43 días de H al año en silencio.
             titulares = [w for w in sorted(datos.trabajadores)
                          if turno_prescrito(datos, w, f) == linea
                          and datos.disponible(w, f) and not plan.cedido(w, f)]
-            if titulares:
+            faltan = datos.turnos[linea].dem - len(titulares) - plan.cubierto(f, linea)
+            if faltan <= 0:
                 continue                        # el paso 3 la estampará
 
             descartados: list[str] = []
