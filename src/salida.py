@@ -19,9 +19,9 @@ from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
 from cargar_datos import Datos
-from modelo import (JORNADA_LOCALIZADO_SEMANA, LAMBDA, METRICAS,
-                    _patrones_uvi, jornada_minutos, lineas_localizadas,
-                    peso_cobertura, semana)
+from calendario import semana
+from metricas import (JORNADA_LOCALIZADO_SEMANA, LAMBDA, METRICAS, _patrones_uvi,
+                      jornada_minutos, lineas_localizadas, peso_cobertura)
 
 RAIZ = Path(__file__).resolve().parents[1]
 SALIDA = RAIZ / "data" / "output"

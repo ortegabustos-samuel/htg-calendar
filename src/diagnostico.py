@@ -25,7 +25,7 @@ from collections import defaultdict
 from datetime import date, datetime, timedelta
 
 from cargar_datos import DIAS, LIBRE, Datos, cargar
-from modelo import jornada_minutos
+from metricas import jornada_minutos
 
 
 def _rango(inicio: date, fin: date) -> list[date]:

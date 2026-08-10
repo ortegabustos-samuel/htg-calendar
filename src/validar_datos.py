@@ -399,8 +399,8 @@ def revisar_contrato(crudo: dict[str, list[dict]], inf: Informe) -> None:
 # --------------------------------------------------------------------------- #
 def revisar_viabilidad(inf: Informe) -> None:
     """Solo corre si el resto pasó: necesita los datos ya cargados por cargar_datos."""
-    from modelo import (_patrones_noche, _patrones_uvi,                   # noqa: PLC0415
-                        jornada_minutos, rango_fechas)
+    from calendario import rango_fechas                                   # noqa: PLC0415
+    from metricas import _patrones_noche, _patrones_uvi, jornada_minutos  # noqa: PLC0415
 
     d = cargar()
     objetivo = d.config.horas_objetivo
