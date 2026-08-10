@@ -71,10 +71,8 @@ procedimiento pueda resolver **antes** de llegar ahí es capacidad que se libera
 | `diagnostico.py` (240, read-only) | |
 | `data/`, `config.toml`, los 6 CSV | |
 
-El contrato de entrada **no cambia**: ningún CSV nuevo, ninguna columna nueva. La granularidad de
-cesión se deriva de `patrones.csv` (ver paso 1). Lo único que crece es `config.toml`, con una
-sección opcional `[libranzas]` para forzar excepciones; vacía por defecto, el sistema funciona sin
-ella.
+El contrato de entrada **no cambia en absoluto**: ningún CSV nuevo, ninguna columna nueva, ninguna
+clave nueva en `config.toml`. La granularidad de cesión se deriva de `patrones.csv` (ver paso 1).
 
 De `pulido.py` se reciclan dos algoritmos, no el archivo: el intercambio de semanas entre
 compatibles (`pulir`) y el canje anual de REF CAL (`canjear`) pasan a ser dos de los movimientos
@@ -236,16 +234,18 @@ La regla se explica en una frase: **si en tu grupo solo hay una fila trabajando 
 libranza arrastra la fila entera, porque si no ese día la línea se queda a cero.** En un patrón
 con 34 filas trabajando el martes, quitar a uno baja a 33 y no rompe nada.
 
-`config.toml` gana una sección `[libranzas]` con una única lista opcional:
+**No hay ninguna lista que mantener**, ni de exenciones ni de granularidad:
 
-```toml
-[libranzas]
-patrones_bloque = []    # fuerza granularidad de bloque; vacía = derivar de patrones.csv
-```
+- La **exención** de UVI no hace falta declararla: la moneda legal la deja en cero sola.
+- La **granularidad** se deriva de `patrones.csv` y acierta con los cuatro binomios.
 
-**No hay lista de exenciones.** La regla de la moneda legal deja a UVI en cero sola, así que no hay
-ningún acuerdo que declarar ni que mantener sincronizado. Es el resultado de haber elegido bien la
-moneda, y es lo que permite contar el paso 1 sin asteriscos.
+Queda una escotilla de escape por si algún día aparece un patrón de bloque que la estructura no
+revele: `libranzas.PATRONES_BLOQUE_FORZADOS`, un `frozenset` vacío en el módulo. Va ahí y no en
+`config.toml` porque llevarla a la configuración obligaría a tocar `cargar_datos.Config` —que es
+`frozen` y está fuera del alcance de este trabajo— para un caso que hoy no existe. Si alguna vez se
+usa de verdad, se mueve.
+
+Esto es lo que permite contar el paso 1 sin asteriscos: **una regla, cero excepciones**.
 
 Una cesión de bloque arrastra también los **descansos** de la fila, no solo sus turnos: adoptar
 una fila es llevarse la plaza entera. Una cesión suelta arrastra solo el turno de ese día.
@@ -413,8 +413,8 @@ no puede compensarlo del todo. Se mide en el golden test.
 
 ## Fuera de alcance (YAGNI)
 
-- No se tocan los CSV de entrada: ni ficheros nuevos, ni columnas nuevas. La única adición es la
-  sección opcional `[libranzas]` de `config.toml`.
+- No se toca el contrato de entrada: ni ficheros nuevos, ni columnas nuevas, ni claves nuevas en
+  `config.toml`.
 - No se generaliza a otras provincias en esta iteración.
 - No se hace interfaz de usuario ni edición manual del cuadrante.
 - No se conserva `modelo.py` como modo alternativo: sería mantener dos motores.
