@@ -1603,6 +1603,16 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 
 **Desempates**, en orden: (1) estabilidad de franja respecto a lo que ya hace esa semana, (2) estabilidad de localización, (3) `id_trab` ascendente.
 
+**LA DEUDA MANDA; LA ESTABILIDAD SOLO DESEMPATA — y el orden dentro de la clave importa.** `min()` compara tuplas elemento a elemento, así que poner `_estabilidad` primero la convierte en criterio dominante y relega la deuda a desempate. Medido con la clave invertida: el **49,6 %** de las asignaciones no iban al candidato de más deuda, y el motivo que quedaba escrito en el libro («más horas acumuladas») era **falso** en todos esos casos. La deuda va delante en la clave.
+
+**PLAZAS, NO PARES.** Un `(día, línea)` con `dem > 1` necesita tantas asignaciones como plazas tenga. Recorrerlo una sola vez deja `REF CAL` (dem = 10) al 20 % y `H` (dem = 2) a medias. El bucle debe repetir mientras `plan.cubierto(f, s) < datos.turnos[s].dem` y queden candidatos — el mismo patrón que ya usa `criticos._cubrir_demanda`.
+
+**Paso 4b — relleno de refuerzos, con freno en el objetivo.** Una pasada **posterior**, cuando la cobertura real ya está fija. `CLAUDE.md` lo pide explícitamente: los correturnos absorben los turnos sobrantes, hay épocas del año en que su carga baja y no llegan a las 1776 h, «para ello debemos de asignarles Refuerzos de Calendario tanto de mañana como de tarde». `REF CAL` es prioridad 0: no es demanda real, es el instrumento para completarles la jornada.
+
+Va después y no dentro del bucle general porque el freno es **por trabajador y por año**: se rellena mientras a esa persona le falten horas para su objetivo y **para en seco al llegar** — literal del comentario de `config.toml`. Sin ese freno nada impediría llevar a alguien de 1776 h hasta el tope legal. **Porta `rellenar_refuerzos` desde `modelo.py:1908-1983`**, incluido su corte `if falta <= 0`.
+
+Solo afecta a los correturnos: `cargar_datos` deriva la capacidad de `REF CAL` únicamente para ellos, no para los mixtos, y eso es correcto — el refuerzo de calendario es una herramienta de correturno.
+
 - [ ] **Step 1: Escribir el test que falla**
 
 ```python
