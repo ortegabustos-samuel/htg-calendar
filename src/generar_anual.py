@@ -1,82 +1,79 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-generar_anual.py — Genera el cuadrante de un año completo y lo vuelca a data/output/.
+"""Orquesta el pipeline determinista de cinco pasos y escribe la salida.
 
-ÚNICO punto de entrada del generador. Lee data/input/ (los 6 CSV y config.toml), resuelve por
-horizonte rodante y escribe calendario.xlsx + metricas_trabajadores.csv + informe_cobertura.csv.
-
-Uso:
-    python3 src/generar_anual.py
-    python3 src/generar_anual.py --segundos 120 --hilos 8
-
-Tarda ~30 min el año entero (27 ventanas × 60 s + construcción del modelo).
-
-El horizonte es SIEMPRE el año natural que declara config.toml: no se pasa por parámetro y no
-admite tramos. `resolver_anual` prorratea la jornada anual sobre él, así que un tramo corto
-intentaría encajar el año entero en esos días y el modelo saldría MODEL_INVALID.
-"""
+El plan se construye por acumulación: los pasos 1 a 4 solo AÑADEN asignaciones, y el 5 es el único
+autorizado a deshacer. Tras cada paso se verifica el convenio entero, para que una infracción se
+detecte donde se causó y no ocho meses después."""
 from __future__ import annotations
 
-import argparse
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import salida                                                   # noqa: E402
-import validar_datos                                            # noqa: E402
-from cargar_datos import cargar                                 # noqa: E402
-import pulido                                                    # noqa: E402
-from modelo import resolver_anual                                # noqa: E402
+import criticos
+import decisiones
+import libranzas
+import reparacion
+import reparto
+import rotacion
+import salida
+import validar_datos
+from cargar_datos import cargar, Datos
+from deuda import Deuda
+from legal import Legal
+from plan import Plan
+
+
+def _paso(nombre: str, plan: Plan, ley: Legal) -> None:
+    fallos = ley.verificar(plan)
+    if fallos:
+        raise SystemExit(f"BUG en el paso «{nombre}»: {len(fallos)} infracciones de convenio\n"
+                         + "\n".join(f"  · {x}" for x in fallos[:10]))
+    print(f"  {nombre:14s} · {len(plan.libro):6d} decisiones · {len(plan.huecos):4d} huecos")
+
+
+def construir(datos: Datos, con_reparacion: bool = True) -> Plan:
+    ley, dd = Legal(datos), Deuda(datos)
+    plan = Plan()
+
+    libranzas.repartir(datos, plan);        _paso("1 libranzas", plan, ley)
+    criticos.cubrir(datos, plan, ley);      _paso("2 criticos", plan, ley)
+    rotacion.estampar(datos, plan, ley)
+    rotacion.adoptar(datos, plan, ley, dd); _paso("3 rotacion", plan, ley)
+    reparto.repartir(datos, plan, ley, dd)
+    reparto.rellenar_refuerzos(datos, plan, ley, dd); _paso("4 reparto", plan, ley)
+    if con_reparacion:
+        reparacion.reparar(datos, plan, ley, dd)
+        _paso("5 reparacion", plan, ley)
+    return plan
+
+
+def cobertura(datos: Datos, plan: Plan) -> tuple[int, int, float]:
+    """(cubiertos, demandados, %) sobre los turnos de prioridad >= 1."""
+    dem = cub = 0
+    for f in datos.fechas:
+        for s, t in datos.turnos.items():
+            if t.prioridad < 1 or not datos.opera(s, f):
+                continue
+            dem += t.dem
+            cub += min(t.dem, plan.cubierto(f, s))
+    return cub, dem, 100.0 * cub / dem if dem else 0.0
 
 
 def main() -> int:
-    p = argparse.ArgumentParser(description="Genera el cuadrante anual en data/output/")
-    p.add_argument("--segundos", type=int, default=60, help="tiempo de solver por ventana")
-    p.add_argument("--hilos", type=int, default=16, help="hilos del solver")
-    p.add_argument("--log", action="store_true", help="log detallado del solver")
-    a = p.parse_args()
-
-    # Validar primero: son 45 minutos de cómputo, y un CSV con un espacio de más no da un fallo
-    # ruidoso sino un cuadrante que parece bueno y no lo es. Mejor no arrancar.
-    inf = validar_datos.validar()
-    for m in inf.errores:
-        print(f"  ERROR  {m}")
-    for m in inf.avisos:
-        print(f"  aviso  {m}")
-    if inf.errores:
-        print(f"\n{len(inf.errores)} errores en los datos de entrada. Arréglalos y vuelve a lanzar.")
+    if validar_datos.main() != 0:
         return 1
-    if inf.avisos:
-        print()
-
     datos = cargar()
-    print(f"Cuadrante {datos.inicio:%d/%m/%Y} – {datos.fin:%d/%m/%Y} · "
-          f"{len(datos.trabajadores)} trabajadores · objetivo {datos.config.horas_objetivo} h/año · "
-          f"{a.segundos}s por ventana, {a.hilos} hilos\n", flush=True)
+    print(f"Resolviendo {datos.config.anio} — pipeline determinista")
+    plan = construir(datos)
 
-    plan = resolver_anual(datos, segundos=a.segundos, hilos=a.hilos, log=a.log)
+    cub, dem, pct = cobertura(datos, plan)
+    print(f"\nCOBERTURA  {cub}/{dem} = {pct:.2f} %   ({dem - cub} turnos sin cubrir)")
 
-    # Pasada final: rescate de cobertura con los refuerzos, equidad por intercambio de semanas y
-    # coherencia. Ninguna puede empeorar la cobertura ni la jornada (invariantes duros).
-    #
-    # El orden importa. Primero se rescata cobertura: `aprovechar` canjea el refuerzo por un turno
-    # real DEL MISMO DÍA (neutro en horas) y `canjear` lo hace ya contra el año entero, soltando
-    # refuerzos de otros meses para que quepa el turno del hueco. Los dos mueven a gente a días —y a
-    # findes— que no eran suyos, así que `pulir` va DESPUÉS y absorbe ese desajuste en su única
-    # pasada (medido en 2026: con el pulido delante la desigualdad acababa en 57, con él detrás en
-    # 54, misma cobertura). `coherencia` cierra ordenando las semanas resultantes.
-    pulido.resumen(datos, plan, "EQUIDAD antes del pulido")
-    pulido.aprovechar(datos, plan)
-    pulido.canjear(datos, plan)
-    pulido.pulir(datos, plan)
-    pulido.coherencia(datos, plan)
-    pulido.resumen(datos, plan, "EQUIDAD después del pulido")
-
-    if plan and max(f for _, f in plan) < datos.fin:
-        print(f"\n*** AVISO: el rodante se detuvo, el plan acaba en {max(f for _, f in plan)} ***")
-    salida.generar_anual(datos, plan)
+    salida.generar_anual(datos, plan.asignaciones())
+    ruta = decisiones.escribir(plan)
+    print(f"Libro de decisiones -> {ruta}")
     return 0
 
 
