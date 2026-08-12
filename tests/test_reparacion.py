@@ -104,6 +104,18 @@ def main() -> int:
     b = construir(datos, con_reparacion=True)
     assert a.asignaciones() == b.asignaciones(), "la reparacion no es determinista"
 
+    # El movimiento 5 existe y esta el ULTIMO: es el mas invasivo.
+    from reparacion import MOVIMIENTOS, mov_rehacer_semana
+    assert MOVIMIENTOS[-1] is mov_rehacer_semana, "el mov.5 debe ir el ultimo"
+    assert len(MOVIMIENTOS) == 5
+
+    # Con los cinco movimientos la cobertura llega al liston
+    from generar_anual import construir as _c
+    final = _c(datos, con_reparacion=True)
+    _, _, pct_final = cobertura(datos, final)
+    assert pct_final >= 99.0, f"cobertura {pct_final:.2f} % < 99 %"
+    assert ley.verificar(final) == [], ley.verificar(final)[:10]
+
     print(f"OK  reparacion · {huecos_antes} -> {huecos_despues} huecos "
           f"({cerrados} cerrados) · cobertura {pct_sin:.2f} -> {pct_con:.2f} %")
     return 0

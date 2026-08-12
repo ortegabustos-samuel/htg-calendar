@@ -16,6 +16,7 @@ from cargar_datos import Datos
 from deuda import Deuda
 from legal import Legal
 from plan import Plan
+from reparto import candidatos as _candidatos_pool
 
 PASO = "reparacion"
 
@@ -168,8 +169,90 @@ def mov_canjear_refcal(datos: Datos, plan: Plan, ley: Legal, dd: Deuda,
     return False
 
 
-MOVIMIENTOS = (mov_cambiar_cubridor, mov_mover_libranza,
-               mov_intercambiar_semana, mov_canjear_refcal)
+def _huecos_semana(datos: Datos, plan: Plan, sem: tuple[int, int]) -> int:
+    """Cuántos (día, línea) de prioridad ≥ 1 siguen sin cubrir, PERO SOLO dentro de esa semana ISO.
+
+    Versión acotada de `huecos_reales` para poder comparar antes/después de un `mov_rehacer_semana`
+    sin pagar el barrido del año entero en cada intento (`huecos_reales` es O(fechas×turnos); esto
+    es O(7×turnos))."""
+    n = 0
+    for f in datos.fechas:
+        if semana(f) != sem:
+            continue
+        for s, t in datos.turnos.items():
+            if t.prioridad < 1 or not datos.opera(s, f):
+                continue
+            if plan.cubierto(f, s) < t.dem:
+                n += 1
+    return n
+
+
+def mov_rehacer_semana(datos: Datos, plan: Plan, ley: Legal, dd: Deuda,
+                       f: date, s: str) -> bool:
+    """MOVIMIENTO 5 — deshace la asignación del POOL de esa semana ISO y la rehace.
+
+    El más invasivo y el último. Se tira todo lo que el paso 4 puso esa semana y se vuelve a
+    repartir EMPEZANDO POR EL TURNO HUÉRFANO, que es lo que cambia el resultado: en la pasada
+    original ese turno llegó tarde y ya no cabía nadie. Se cuenta en una frase: «si no cabe,
+    deshacemos esa semana y la rehacemos empezando por el turno difícil».
+
+    Si tras rehacer el hueco sigue abierto, se revierte: no vale empeorar por intentarlo. NO BASTA
+    con mirar si `(f, s)` quedó cubierto: forzar al huérfano primero puede quitarle a otro turno de
+    la MISMA semana el único candidato que tenía, cerrando uno y abriendo otro — medido: la primera
+    versión (que solo comprobaba el hueco original) cerraba 14 huecos NETOS en vez de los ≥17 que ya
+    daban los movimientos 1-4 solos, empeorando el resultado global. Por eso se compara el recuento
+    de huecos DE LA SEMANA antes y después, y se revierte si no mejora de verdad."""
+    sem = semana(f)
+    pool = [w for w in sorted(datos.trabajadores)
+            if datos.trabajadores[w].tipo in ("mixto", "correturno")]
+
+    # Foto de lo que el paso 4 puso esa semana, para poder revertir.
+    original: list[tuple[str, date, str]] = []
+    for w in pool:
+        for d in plan.dias_de(w):
+            if semana(d) == sem:
+                original.append((w, d, plan.turno_de(w, d)))
+    if not original:
+        return False
+
+    huecos_antes = _huecos_semana(datos, plan, sem)
+
+    for w, d, _ in original:
+        plan.liberar(w, d, PASO, "reparacion mov.5: se deshace la semana")
+
+    # Primero el huérfano.
+    orden: list[tuple[date, str]] = [(f, s)]
+    orden += [(d, t) for (d, t) in ((x[1], x[2]) for x in original) if (d, t) != (f, s)]
+
+    for d, t in orden:
+        if plan.cubierto(d, t) >= datos.turnos[t].dem:
+            continue
+        libres = _candidatos_pool(datos, plan, ley, d, t)
+        if not libres:
+            continue
+        elegido = dd.orden(plan, libres, d, t)[0]
+        plan.asignar(elegido, d, t, PASO,
+                     f"reparacion mov.5: semana {sem[1]} rehecha empezando por {s}")
+
+    orfano_cubierto = plan.cubierto(f, s) >= datos.turnos[s].dem
+    huecos_despues = _huecos_semana(datos, plan, sem)
+    if orfano_cubierto and huecos_despues < huecos_antes:
+        return True
+
+    # No ha servido -o ha servido pero a costa de abrir otro hueco en la misma semana, que es
+    # exactamente el "empeora" que esta prohibido-: se revierte a la foto original.
+    for w in pool:
+        for d in list(plan.dias_de(w)):
+            if semana(d) == sem:
+                plan.liberar(w, d, PASO, "reparacion mov.5 revertido")
+    for w, d, t in original:
+        if not plan.ocupado(w, d):
+            plan.asignar(w, d, t, PASO, "reparacion mov.5 revertido: vuelve lo de antes")
+    return False
+
+
+MOVIMIENTOS = (mov_cambiar_cubridor, mov_mover_libranza, mov_intercambiar_semana,
+               mov_canjear_refcal, mov_rehacer_semana)
 
 
 def reparar(datos: Datos, plan: Plan, ley: Legal, dd: Deuda, vueltas: int = 10) -> int:
