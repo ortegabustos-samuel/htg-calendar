@@ -63,50 +63,50 @@ handovers) — see C10 in `MODELO.md`. This is why the problem is tractable at a
 the (worker, day) pairs actually touched by something get freed as CP-SAT variables; everything
 else is pinned to the pattern.
 
-**Pipeline** (`generar_anual.py` orchestrates all of it):
+**Pipeline** (`generar_anual.py` orchestrates all of it): `validar_datos` → `cargar_datos` →
+cinco pasos deterministas → `salida`. No queda CP-SAT ni ningún otro optimizador en el producto:
+cada paso es una regla escrita, no un término de una función objetivo.
 
-1. `validar_datos.py` — five-level check (config → format → references → contract → feasibility)
-   over `config.toml` + the 6 CSVs; `generar_anual.py` refuses to start on any ERROR.
-2. `cargar_datos.py` (`cargar()`) — loads `config.toml` (year + convenio limits: `horas_objetivo`,
-   `rmin`, `hmax7`, `cmax`, `cmax_pool` — reachable everywhere as `datos.config`, the single source;
-   `anio` is mandatory and never inferred) and the 6 CSVs into `Datos`, derives everything not
-   explicit in the CSVs: shift duration/type/night-hours from entrada/salida, per-worker
-   capacities from patterns and fixed lines (`_anadir_capacidades_patron`,
-   `_anadir_capacidad_fijo`, `_anadir_capacidades_correturno`), and equity groups
-   (`_derivar_grupos_equidad`).
-3. `modelo.py` (`resolver_anual()`) — the rolling horizon: solves consecutive 14-day windows
-   with a 28-day frozen "tail" for continuity, stitched by (a) a 12h-rest boundary condition
-   between windows and (b) accumulated equity/hours "books" (`offset`, `offset_horas`) so
-   fairness is computed *across* the whole year even though it's solved in pieces. Also builds
-   `calendario_cesiones` (Nivel 0: a precomputed calendar spreading night-binomial free blocks
-   across the year) and `reserva_cubridores` before
-   rolling, and `rellenar_refuerzos` after, to fill REF CAL (priority-0 "wildcard"/filler) slack
-   with real demand.
-4. `pulido.py` — post-solve passes, in this order: turn leftover REF CAL filler into real coverage,
-   same day (`aprovechar`) and then against the whole year (`canjear` — drops REF CAL from *any*
-   month to free annual-hours budget so a covered-nowhere shift fits, since a priority-0 filler is
-   always worth less than a real shift); then equity, swapping whole *weeks* between compatible
-   workers to equalize weekends/holidays (`pulir`, which also absorbs the days the two coverage
-   passes moved around); then schedule coherence (`coherencia`). Runs strictly after the model
-   because it can treat "coverage and legality invariant" as a hard constraint instead of a price —
-   trades the model's objective is structurally forbidden from making (patrón workers are nearly
-   free to move in the model's low-priority equity term, since PESO_DEV dominates it), and because
-   the rolling horizon can never see a January filler and an August hole in the same window.
-5. `salida.py` — turns the final `plan` dict into `data/output/calendario.xlsx` (worker × day
-   grid, colored by shift type) + `metricas_trabajadores.csv` + `informe_cobertura.csv`, plus a
-   console summary.
+1. `validar_datos.py` — comprobación en cinco niveles (config → formato → referencias → contrato →
+   factibilidad) sobre `config.toml` + los 6 CSV; `generar_anual.py` se niega a arrancar ante
+   cualquier ERROR.
+2. `cargar_datos.py` (`cargar()`) — carga `config.toml` (año y límites de convenio:
+   `horas_objetivo`, `rmin`, `hmax7`, `cmax`, `cmax_pool` — accesibles en todas partes como
+   `datos.config`, la fuente única; `anio` es obligatorio y nunca se infiere) y los 6 CSV en
+   `Datos`, derivando lo que no es explícito en los CSV: duración/tipo/horas nocturnas del turno a
+   partir de entrada/salida, capacidades por trabajador a partir de patrones y líneas fijas
+   (`_anadir_capacidades_patron`, `_anadir_capacidad_fijo`, `_anadir_capacidades_correturno`), y
+   los grupos de equidad (`_derivar_grupos_equidad`).
+3. **Paso 1 — `libranzas.py`** reparte las libranzas por exceso de jornada: decide cuánto cede
+   cada trabajador y dónde cae, antes que nada, porque es la decisión que más condiciona al resto.
+4. **Paso 2 — `criticos.py`** cubre las líneas críticas con el calendario aún casi vacío, para no
+   llegar al final y descubrir que el único cubridor posible ya está ocupado. Regla dura: la
+   cobertura crítica gana al patrón propio del cubridor.
+5. **Paso 3 — `rotacion.py`** estampa la rotación de cada patrón (Two-layer design, ver abajo) y
+   decide quién adopta las filas que los pasos 1 y 2 dejaron huérfanas, ofreciéndolas primero a
+   otro trabajador de patrón antes de gastar pool.
+6. **Paso 4 — `reparto.py`** reparte lo que queda al pool (mixtos y correturnos) semana a semana,
+   de más difícil a más fácil dentro de cada semana ISO, y asigna cada turno al elegible con más
+   deuda (`deuda.py`); al final `rellenar_refuerzos` reparte los REF CAL sobrantes entre quienes
+   quedaron por debajo de su objetivo anual.
+7. **Paso 5 — `reparacion.py`**, el único autorizado a deshacer: cierra huecos probando movimientos
+   de menos a más invasivo, en un orden pactado y explicable, hasta el primero que funciona.
+8. `salida.py` — convierte el `Plan` final en `data/output/calendario.xlsx` (rejilla trabajador ×
+   día, coloreada por tipo de turno) + `metricas_trabajadores.csv` + `informe_cobertura.csv`, más
+   un resumen por consola. `decisiones.py` vuelca en paralelo el libro de decisiones a
+   `data/output/decisiones.csv`: por cada celda, qué paso la decidió, con qué regla, y por qué los
+   huecos que quedan están justificados.
 
-`diagnostico.py` is independent of the solve path — pure read-only analysis of `Datos` (FTE
-balance, hours each pattern prescribes vs. the annual objective, legal exemptions, per-line
-coverage) used to understand *why* a dataset behaves the way it does before touching the model.
+`diagnostico.py` es independiente del camino de resolución — análisis de solo lectura sobre
+`Datos` (balance FTE, horas que prescribe cada patrón frente al objetivo anual, exenciones
+legales, cobertura por línea) para entender *por qué* un dataset se comporta como lo hace antes de
+tocar el pipeline.
 
-**The objective is lexicographic, not a weighted sum** (`MODELO.md` §6): P1 coverage (weighted
-by shift `prioridad` — 0 = wildcard filler REF CAL never a coverage target, 1 = normal patrón is
-untouchable, ≥2 = critical enough to pull a worker out of their pattern) ≫ P2 fairness of
-night/weekend/holiday load (fixed workers excluded) ≫ P3 location stability ≫ P4 correturno/
-overtime cost ≫ P5 deviation from the frozen pattern. Each level is solved and pinned
-(`obj_i ≤ best_i`) before the next is optimized — see `modelo.py`'s `PESO_COBERTURA` /
-`PESO_CRITICO` / `PESO_DEV` (and `PESO_DEV_COMODIN`, the same cost when what the rotation
-prescribes that day is a REF CAL: filler is never worth defending against real coverage)
-constants for how the three coverage tiers relate to the cost of
-breaking a pattern.
+**No hay objetivo lexicográfico ni pesos: hay una prelación de reglas escrita en el código.** Cada
+paso decide con lo que sabe en ese momento (`Legal`, el juez único del convenio, se consulta y se
+verifica tras cada paso) y el paso 5 es el único que puede deshacer una decisión anterior para
+cerrar un hueco. La cobertura crítica gana al patrón propio del cubridor porque así lo dice el paso
+2, no porque una constante de peso lo empuje en esa dirección; no existen `PESO_COBERTURA`,
+`PESO_CRITICO`, `PESO_DEV` ni `PESO_DEV_COMODIN`. La moneda del objetivo anual (1776 h) son las
+HORAS LEGALES (`Turno.horas`, la que usa `deuda.py`) — `horas_consumo` es una cifra de informe y no
+interviene en ninguna decisión del pipeline.
