@@ -109,6 +109,16 @@ def repartir(datos: Datos, plan: Plan) -> None:
     pesos = peso_semanas(datos)
     orden_sem = sorted(pesos, key=lambda s: (-pesos[s], s))
 
+    # Cuántas cesiones sueltas ha colocado ya cada día de la semana, EN TODO EL REPARTO. Existe
+    # porque `orden_sem` es el mismo orden para todo el mundo, y en un patrón de lunes a viernes el
+    # primer día prescrito de la semana es casi siempre el lunes: sin este contador, decenas de
+    # trabajadores distintos convergen en el mismo lunes de las semanas de más peso, y ese lunes se
+    # queda sin nadie disponible — un hueco que ningún movimiento de reparación puede deshacer
+    # porque no hay ya a quién mover. Medido en 2026: 277 cesiones en lunes contra 85 en martes, y
+    # cuatro lunes concretos (5-ene, 30-mar, 27-abr, 21-dic) con 39-45 de 47 elegibles cedidos ese
+    # mismo día — justo las semanas #3, #4 y #5 de mayor peso del año.
+    cesiones_por_dow: dict[int, int] = defaultdict(int)
+
     for w in sorted(datos.trabajadores):
         trab = datos.trabajadores[w]
         if trab.tipo != "patron":
@@ -137,11 +147,18 @@ def repartir(datos: Datos, plan: Plan) -> None:
                                                 f"binomio {trab.patron})")
                 pendiente -= horas
             else:
-                # Días sueltos: uno por semana como mucho, para no vaciar una semana entera.
-                f = dias[0]
-                if plan.ocupado(w, f):
+                # Días sueltos: uno por semana como mucho, para no vaciar una semana entera. Entre
+                # los días candidatos de ESA semana, el de la semana MENOS usado hasta ahora por
+                # otras cesiones — no el primero cronológico. Antes, si `dias[0]` estaba ocupado se
+                # abandonaba la semana entera sin probar otro día suyo; ahora se prueban todos.
+                candidatos = [f for f in dias if not plan.ocupado(w, f)]
+                if not candidatos:
                     continue
+                candidatos.sort(key=lambda f: (cesiones_por_dow[f.weekday()], f))
+                f = candidatos[0]
                 h = datos.turnos[turno_prescrito(datos, w, f)].horas
                 plan.ceder(w, f, PASO, f"exceso de jornada ({pendiente:.0f} h pendientes, "
-                                       f"semana {sem[1]} es de las de mas holgura)")
+                                       f"semana {sem[1]} es de las de mas holgura, dia elegido "
+                                       f"por reparto entre dias de la semana)")
+                cesiones_por_dow[f.weekday()] += 1
                 pendiente -= h

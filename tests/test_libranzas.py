@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """Paso 1: quien cede, cuanto, con que granularidad y donde cae."""
 import sys
+from collections import Counter
+from datetime import date
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from calendario import turno_prescrito
 from cargar_datos import cargar
 from libranzas import es_bloque, exceso_h, peso_semanas, repartir
 from plan import Plan
@@ -59,7 +62,39 @@ def main() -> int:
     repartir(datos, p2)
     assert [(d.trabajador, d.fecha) for d in p2.libro if d.turno is None] == cesiones
 
-    print(f"OK  libranzas · {len(cesiones)} dias cedidos · {len(bloque)} patrones de bloque")
+    # Regresion (bug del sesgo de lunes): las cesiones SUELTAS -- no las de fila entera, que
+    # arrastran toda la semana del binomio y no eligen dia -- no deben concentrarse en un dia
+    # de la semana. El bug original converge decenas de trabajadores en el lunes de las mismas
+    # semanas de mas peso (46% en lunes, 277 cesiones contra 85 en martes); el reparto corregido
+    # que reparte por dia menos usado hasta ahora deberia rondar 1/7 ~= 14% por dia.
+    sueltas = [(d.trabajador, d.fecha) for d in p.libro
+               if d.turno is None and "cesion de fila entera" not in d.regla]
+    assert sueltas, "no hay cesiones sueltas que comprobar"
+    por_dow = Counter(f.weekday() for _, f in sueltas)
+    peor_dow, peor_n = por_dow.most_common(1)[0]
+    peor_frac = peor_n / len(sueltas)
+    assert peor_frac <= 0.25, (
+        f"el dia de la semana {peor_dow} concentra {peor_n}/{len(sueltas)} "
+        f"({peor_frac:.0%}) de las cesiones sueltas -- el bug original daba 46% en lunes: "
+        f"{dict(por_dow)}")
+
+    # Regresion: el 5-ene-2026 (lunes de la semana de mas peso del ranking) ya no se queda sin
+    # nadie disponible. Antes de la correccion, 39-45 de 47 trabajadores elegibles de patron
+    # cedian justo ese mismo dia porque `dias[0]` era casi siempre el lunes para todos ellos.
+    lunes_critico = date(2026, 1, 5)
+    assert lunes_critico.weekday() == 0, "el 5-ene-2026 deberia ser lunes"
+    elegibles = [w for w, t in datos.trabajadores.items()
+                 if t.tipo == "patron"
+                 and datos.disponible(w, lunes_critico)
+                 and turno_prescrito(datos, w, lunes_critico)]
+    cedidos_ese_dia = {w for w, f in cesiones if f == lunes_critico}
+    no_cedidos = [w for w in elegibles if w not in cedidos_ese_dia]
+    assert elegibles, "no hay trabajadores de patron elegibles el 5-ene-2026 que comprobar"
+    assert no_cedidos, (
+        f"los {len(elegibles)} elegibles del 5-ene-2026 ceden todos -- sigue el sesgo de lunes")
+
+    print(f"OK  libranzas · {len(cesiones)} dias cedidos · {len(bloque)} patrones de bloque · "
+          f"{len(sueltas)} sueltas (peor dia {peor_frac:.0%})")
     return 0
 
 
