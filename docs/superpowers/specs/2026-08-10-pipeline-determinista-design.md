@@ -1,7 +1,33 @@
 # Pipeline determinista de cinco pasos: sustituir el optimizador por un procedimiento explicable
 
-Fecha: 2026-08-10 · Estado: aprobado, pendiente de plan de implementación
+Fecha: 2026-08-10 · **Estado: APARCADO (2026-08-13) — no es la solución final**
 Rama: `solver-v2` · Punto de retorno: tag `base-cesiones-noche`
+
+## Cierre (2026-08-13)
+
+Se implementaron los cinco pasos completos, con revisión independiente en cada tarea. El pipeline
+llegó a cruzar el listón del 99 % pactado (99,57 %, luego 99,51 % al corregir dos bugs de
+integridad de horas encontrados después). Pero revisando el resultado con detalle aparecieron
+defectos reales que la cobertura por sí sola no mostraba: la mayoría de la plantilla terminaba por
+encima de las 1776 h porque dos pasos (`criticos.py` y `rotacion.py`) asignaban cobertura real sin
+ningún techo de horas anuales — el freno "para en seco al llegar al objetivo" solo se había aplicado
+al relleno de REF CAL del pool, nunca a la cobertura de patrones y fijos. Parte de la cifra de
+cobertura estaba sostenida por sobrecargar gente, no por repartir mejor.
+
+Comparado con la mejor versión de CP-SAT (`d7125d6`, 99,8 % de cobertura, 27/27 ventanas
+factibles), y con la certeza de que corregir la integridad de horas iba a bajar la cobertura del
+pipeline determinista más todavía, se concluyó que el enfoque de reglas puras, tal como estaba
+diseñado, no iba a alcanzar la calidad de CP-SAT sin un mecanismo de búsqueda más potente para el
+residuo de huecos difíciles.
+
+**No se descarta el diagnóstico ni el trabajo — se aparca.** La pieza que sí se valida y se
+reutiliza: la explicabilidad celda a celda (`decisiones.csv`) es una necesidad real, no un capricho.
+La dirección que se explora después es un **híbrido**: el pipeline determinista decide todo lo
+explicable (que es la mayoría del año), y un CP-SAT pequeño y acotado —solo sobre el residuo de
+huecos que las reglas no resuelven, no sobre el año entero— hace el pulido final. Ver la rama
+`solver-v3`, que arranca de `d7125d6` en vez de sobre este trabajo.
+
+**Por ahora prevalece CP-SAT (`d7125d6`) como motor de producción.**
 
 ## Por qué se cambia
 

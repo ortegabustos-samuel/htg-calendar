@@ -1,3 +1,12 @@
+> **RAMA APARCADA (2026-08-13).** Esta rama (`solver-v2`) sustituyó el optimizador CP-SAT por un
+> pipeline determinista de 5 pasos, sin caja negra. Se implementó entero, cruzó el 99 % de
+> cobertura pactado, pero al corregir bugs de integridad de horas (gente por encima de 1776 h que
+> la cobertura ocultaba) la calidad quedó por debajo de la mejor versión de CP-SAT (99,8 %,
+> commit `d7125d6`). Se aparca, no se descarta: el diagnóstico y la pieza de explicabilidad
+> (`decisiones.csv`) se reutilizan en un enfoque híbrido en la rama `solver-v3`. Detalle completo
+> en `docs/superpowers/specs/2026-08-10-pipeline-determinista-design.md` → sección «Cierre».
+> **Por ahora, el motor de producción es CP-SAT (`d7125d6`), no lo que describe este documento.**
+
 # Resumen del Proyecto
 Se trata de un proyecto desarrollado en Python destinado al desarrollo de una herramienta automatica
 capaz de con los datos de entrada de un Plan Funcional donde se establecen las demandas de turno semanales
