@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """Paso 1: quien cede, cuanto, con que granularidad y donde cae."""
+import statistics
 import sys
-from collections import Counter
+from collections import Counter, defaultdict
 from datetime import date
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from calendario import turno_prescrito
+from calendario import semana, turno_prescrito
 from cargar_datos import cargar
 from libranzas import es_bloque, exceso_h, peso_semanas, repartir
 from plan import Plan
@@ -93,8 +94,74 @@ def main() -> int:
     assert no_cedidos, (
         f"los {len(elegibles)} elegibles del 5-ene-2026 ceden todos -- sigue el sesgo de lunes")
 
+    # Invariante (bug 1 + bug 2 juntos): ya no forzamos una cifra fija de "dias cedidos" -- con
+    # los FIJOS incluidos sube respecto a la version solo-patrones. Lo que importa es que el total
+    # de horas realmente cedidas sea del mismo orden que lo que exceso_h() dice que hay que ceder,
+    # sumado sobre TODOS los patron+fijo (antes exceso_h ignoraba a los fijos por completo).
+    horas_cedidas_por_trab: dict[str, float] = defaultdict(float)
+    for d in p.libro:
+        if d.turno is None:
+            s = turno_prescrito(datos, d.trabajador, d.fecha)
+            if s:
+                horas_cedidas_por_trab[d.trabajador] += datos.turnos[s].horas
+    suma_cedidas = sum(horas_cedidas_por_trab.values())
+    suma_exceso = sum(exceso_h(datos, w) for w, t in datos.trabajadores.items()
+                       if t.tipo in ("patron", "fijo"))
+    assert suma_exceso > 0, "no deberia haber cero exceso total a repartir"
+    ratio = suma_cedidas / suma_exceso
+    assert 0.7 <= ratio <= 1.05, (
+        f"horas cedidas ({suma_cedidas:.0f}) deberian rondar el exceso pedido "
+        f"({suma_exceso:.0f}), ratio={ratio:.2f} -- la granularidad de bloque puede hacer que "
+        f"algun trabajador se quede corto, pero no tan lejos")
+
+    # Regresion (bug 2, foto fija de semana): ninguna semana ISO debe concentrar mas de ~15% del
+    # total de cesiones del ano. El bug original metia el 94,5% de las 473 cesiones en solo 10 de
+    # las 53 semanas (63 solitas en la semana del 30 de marzo, 63/473 = 13,3%).
+    por_semana = Counter(semana(f) for _, f in cesiones)
+    total_cesiones = len(cesiones)
+    peor_sem, peor_n_sem = por_semana.most_common(1)[0]
+    peor_frac_sem = peor_n_sem / total_cesiones
+    assert peor_frac_sem <= 0.15, (
+        f"la semana {peor_sem} concentra {peor_n_sem}/{total_cesiones} ({peor_frac_sem:.0%}) "
+        f"de las cesiones del ano -- el bug original ya llegaba a un 13-15% en la peor semana")
+
+    # Y el reparto entre semanas, agregado, debe ser claramente mas plano que el de la foto fija:
+    # las 10 semanas con mas cesiones no deberian concentrar ya el 94,5% del total documentado
+    # para el bug (`repartir.__doc__` cita la cifra exacta).
+    top10_frac = sum(n for _, n in por_semana.most_common(10)) / total_cesiones
+    assert top10_frac < 0.90, (
+        f"las 10 semanas con mas cesiones concentran el {top10_frac:.0%} del total -- "
+        f"el bug original (foto fija) llegaba al 94,5%, esto deberia bajar claramente de eso")
+
+    # Y la desviacion estandar de cesiones-por-semana (sobre las 53 semanas del horizonte,
+    # contando las que se quedan a cero) no deberia disparase: con 53 semanas y un reparto sano el
+    # grueso de semanas deberia recibir un numero moderado de cesiones, no unas pocas acaparando
+    # el año entero como en el bug.
+    todas_semanas = sorted({semana(f) for f in datos.fechas})
+    conteos = [por_semana.get(s, 0) for s in todas_semanas]
+    media_sem = statistics.mean(conteos)
+    desv_sem = statistics.pstdev(conteos)
+    assert desv_sem < total_cesiones * 0.10, (
+        f"desviacion estandar de cesiones/semana ({desv_sem:.1f}) demasiado alta frente al total "
+        f"({total_cesiones}) -- sugiere que unas pocas semanas siguen acaparando el reparto")
+
+    # Regresion (bug 1, los fijos nunca cedian): al menos uno de los 6 fijos tiene una cesion en
+    # el libro con paso=="libranzas", y el caso conocido -- el fijo de VADN022, linea que opera
+    # los 7 dias de la semana -- tiene exceso_h > 0 (llegaba a 2.312h/ano, 536h de mas, sin ceder
+    # ni un dia porque exceso_h() y repartir() solo miraban tipo=="patron").
+    fijo_vadn022 = next(w for w, t in datos.trabajadores.items()
+                         if t.tipo == "fijo" and t.linea == "VADN022")
+    assert exceso_h(datos, fijo_vadn022) > 0, (
+        f"el fijo de VADN022 deberia tener exceso de horas: {exceso_h(datos, fijo_vadn022)}")
+    cesiones_fijos = [d for d in p.libro
+                       if d.turno is None and d.paso == "libranzas"
+                       and datos.trabajadores[d.trabajador].tipo == "fijo"]
+    assert cesiones_fijos, "ningun fijo cede -- vuelve a fallar el bug 1 (fijos nunca ceden)"
+
     print(f"OK  libranzas · {len(cesiones)} dias cedidos · {len(bloque)} patrones de bloque · "
-          f"{len(sueltas)} sueltas (peor dia {peor_frac:.0%})")
+          f"{len(sueltas)} sueltas (peor dia {peor_frac:.0%}) · "
+          f"peor semana {peor_frac_sem:.0%} · top10 semanas {top10_frac:.0%} · "
+          f"{len(cesiones_fijos)} cesiones de fijos")
     return 0
 
 

@@ -57,8 +57,11 @@ def es_bloque(datos: Datos, patron: str) -> bool:
     return max(por_dia) == 1
 
 
-def horas_patron(datos: Datos, w: str) -> float:
-    """Horas LEGALES que la rotación prescribe a `w` en todo el año, descontando vacaciones."""
+def horas_prescritas(datos: Datos, w: str) -> float:
+    """Horas LEGALES que la rotación —o la línea fija— prescribe a `w` en todo el año,
+    descontando vacaciones. `turno_prescrito` ya distingue patrón/fijo, así que esta función sirve
+    para los dos sin ramificar. (Se llamaba `horas_patron`; el nombre mentía desde que el paso 1
+    empezó a cubrir también a los fijos — ver `exceso_h`.)"""
     total = 0.0
     for f in datos.fechas:
         if not datos.disponible(w, f):
@@ -70,20 +73,24 @@ def horas_patron(datos: Datos, w: str) -> float:
 
 
 def exceso_h(datos: Datos, w: str) -> float:
-    """Horas que `w` debe CEDER: lo que su patrón prescribe por encima de su objetivo anual."""
+    """Horas que `w` debe CEDER: lo que su rotación o línea prescribe por encima de su objetivo.
+
+    LOS FIJOS TAMBIÉN CEDEN. `CLAUDE.md` lo dice desde el principio —"trabajadores fijos cuyo turno
+    es constante... generalmente tendrán exceso y por lo tanto cuando descansen por exceso de horas
+    su turno ha de ser cubierto"— pero la primera versión de este paso solo miraba `tipo == "patron"`
+    y dejaba a los 6 fijos sin un solo día de cesión en todo el año. Medido: el fijo de VADN022
+    —línea que opera los 7 días de la semana— llegaba a 2.312 h, 536 h por encima del objetivo."""
     trab = datos.trabajadores[w]
-    if trab.tipo != "patron":
+    if trab.tipo not in ("patron", "fijo"):
         return 0.0
     objetivo = datos.config.horas_objetivo * trab.factor_jornada
-    return max(0.0, horas_patron(datos, w) - objetivo)
+    return max(0.0, horas_prescritas(datos, w) - objetivo)
 
 
-def peso_semanas(datos: Datos) -> dict[tuple[int, int], float]:
-    """Capacidad residual de cada semana ISO: disponibles ÷ turnos demandados.
-
-    Los días NO son intercambiables. En agosto la demanda es la misma pero hay mucha menos gente,
-    así que soltar ahí una libranza abre un hueco justo donde menos capacidad hay para taparlo. Un
-    reparto uniforme lo haría; este reparto va a las semanas de mayor peso."""
+def _disp_dem_semanas(datos: Datos) -> tuple[dict[tuple[int, int], int], dict[tuple[int, int], int]]:
+    """Crudos de cada semana ISO: disponibles (día-persona) y demanda (turnos·día). Separados de
+    `peso_semanas` porque `repartir` necesita el numerador CRUDO para poder descontarlo en vivo —
+    ver la nota de `disp_restante` más abajo."""
     disp: dict[tuple[int, int], int] = defaultdict(int)
     dem: dict[tuple[int, int], int] = defaultdict(int)
     for f in datos.fechas:
@@ -91,6 +98,20 @@ def peso_semanas(datos: Datos) -> dict[tuple[int, int], float]:
         disp[sem] += sum(1 for w in datos.trabajadores if datos.disponible(w, f))
         dem[sem] += sum(t.dem for t in datos.turnos.values()
                         if t.prioridad >= 1 and datos.opera(t.id, f))
+    return dict(disp), dict(dem)
+
+
+def peso_semanas(datos: Datos) -> dict[tuple[int, int], float]:
+    """Capacidad residual de cada semana ISO: disponibles ÷ turnos demandados.
+
+    Los días NO son intercambiables. En agosto la demanda es la misma pero hay mucha menos gente,
+    así que soltar ahí una libranza abre un hueco justo donde menos capacidad hay para taparlo. Un
+    reparto uniforme lo haría; este reparto va a las semanas de mayor peso.
+
+    Esta es la foto FIJA, útil como referencia y para quien solo quiera consultarla (la usa el test
+    para comprobar que agosto pesa menos que marzo). `repartir` usa la versión CRUDA
+    (`_disp_dem_semanas`) porque necesita actualizarla en vivo — ver más abajo."""
+    disp, dem = _disp_dem_semanas(datos)
     return {sem: disp[sem] / dem[sem] if dem[sem] else 0.0 for sem in sorted(disp)}
 
 
@@ -104,29 +125,56 @@ def _dias_de_semana(datos: Datos, sem: tuple[int, int]) -> list[date]:
     return [f for f in datos.fechas if semana(f) == sem]
 
 
-def repartir(datos: Datos, plan: Plan) -> None:
-    """Marca en `plan` los días que cada trabajador de patrón cede por exceso de jornada."""
-    pesos = peso_semanas(datos)
-    orden_sem = sorted(pesos, key=lambda s: (-pesos[s], s))
+def _sustituibilidad(datos: Datos, w: str, f: date, s: str) -> int:
+    """Cuántos OTROS trabajadores podrían cubrir la línea `s` el día `f` si `w` la cede.
 
-    # Cuántas cesiones sueltas ha colocado ya cada día de la semana, EN TODO EL REPARTO. Existe
-    # porque `orden_sem` es el mismo orden para todo el mundo, y en un patrón de lunes a viernes el
-    # primer día prescrito de la semana es casi siempre el lunes: sin este contador, decenas de
-    # trabajadores distintos convergen en el mismo lunes de las semanas de más peso, y ese lunes se
-    # queda sin nadie disponible — un hueco que ningún movimiento de reparación puede deshacer
-    # porque no hay ya a quién mover. Medido en 2026: 277 cesiones en lunes contra 85 en martes, y
-    # cuatro lunes concretos (5-ene, 30-mar, 27-abr, 21-dic) con 39-45 de 47 elegibles cedidos ese
-    # mismo día — justo las semanas #3, #4 y #5 de mayor peso del año.
+    Cuantos más, más barato es ceder ahí sin dejar la línea casi huérfana. Es una foto ESTÁTICA
+    (capacidad declarada en `capacidades.csv`, no lo que el plan ya lleva decidido — al ejecutarse
+    este paso el plan todavía está casi vacío, así que no hay nada más que consultar), pero basta
+    para lo que hace falta: distinguir un día donde `w` es de los pocos que pueden hacer esa línea
+    de un día donde hay una veintena de alternativas."""
+    return sum(1 for otro in datos.trabajadores
+               if otro != w and datos.disponible(otro, f) and datos.elegible(otro, s, f)[0])
+
+
+def repartir(datos: Datos, plan: Plan) -> None:
+    """Marca en `plan` los días que cada trabajador de patrón o fijo cede por exceso de jornada.
+
+    Reparte en tres niveles, cada uno corrigiendo un defecto medido en la primera versión:
+
+    1. SEMANA — dinámica, no una foto fija. `orden_sem` se recalculaba UNA vez para todo el reparto,
+       así que cientos de trabajadores distintos consultaban la misma foto y convergían en las
+       mismas semanas «buenas» sin saber que los demás hacían lo mismo. Medido: el 94,5 % de las
+       473 cesiones caía en solo 10 de las 53 semanas del año (63 en la semana del 30 de marzo).
+       Aquí `disp_restante` se descuenta según se coloca cada cesión, y el ranking de semanas se
+       recalcula para CADA trabajador, reflejando lo que los anteriores ya se han llevado.
+    2. DÍA DE LA SEMANA — dentro de la semana elegida, el día menos usado hasta ahora
+       (`cesiones_por_dow`), no el primero cronológico. Mismo mecanismo que (1), un nivel más fino:
+       sin esto casi todo el mundo caía en lunes (277 de 602 cesiones, un patrón L-V empieza casi
+       siempre en lunes).
+    3. LÍNEA — entre los días candidatos ya filtrados por (1) y (2), el que deja más sustitutos
+       (`_sustituibilidad`). Ceder un día donde otras 20 personas podrían cubrir la línea es barato;
+       ceder el único día en que casi nadie más puede es caro, aunque la semana y el día de la
+       semana parezcan buenos en agregado."""
+    disp, dem = _disp_dem_semanas(datos)
+    disp_restante = dict(disp)     # se descuenta en vivo — ver punto 1 del docstring
     cesiones_por_dow: dict[int, int] = defaultdict(int)
 
     for w in sorted(datos.trabajadores):
         trab = datos.trabajadores[w]
-        if trab.tipo != "patron":
+        if trab.tipo not in ("patron", "fijo"):
             continue
         pendiente = exceso_h(datos, w)
         if pendiente <= 0:
             continue
-        bloque = es_bloque(datos, trab.patron)
+        bloque = es_bloque(datos, trab.patron) if trab.tipo == "patron" else False
+
+        # Ranking de semanas RECALCULADO para este trabajador, con lo que los anteriores ya se han
+        # llevado descontado de `disp_restante`. Es lo que evita que todos consulten la misma foto.
+        def peso_efectivo(sem: tuple[int, int]) -> float:
+            d = dem.get(sem, 0)
+            return disp_restante.get(sem, 0) / d if d else 0.0
+        orden_sem = sorted(dem, key=lambda s: (-peso_efectivo(s), s))
 
         for sem in orden_sem:
             if pendiente <= 0:
@@ -141,24 +189,31 @@ def repartir(datos: Datos, plan: Plan) -> None:
                 horas = sum(datos.turnos[turno_prescrito(datos, w, f)].horas for f in dias)
                 if horas > pendiente + datos.turnos[turno_prescrito(datos, w, dias[0])].horas:
                     continue           # la fila se pasa demasiado: prueba otra semana
+                cedidos = 0
                 for f in _dias_de_semana(datos, sem):
                     if datos.disponible(w, f) and not plan.ocupado(w, f):
                         plan.ceder(w, f, PASO, f"cesion de fila entera (semana {sem[1]}, "
                                                 f"binomio {trab.patron})")
+                        cedidos += 1
+                disp_restante[sem] = disp_restante.get(sem, 0) - cedidos
                 pendiente -= horas
             else:
-                # Días sueltos: uno por semana como mucho, para no vaciar una semana entera. Entre
-                # los días candidatos de ESA semana, el de la semana MENOS usado hasta ahora por
-                # otras cesiones — no el primero cronológico. Antes, si `dias[0]` estaba ocupado se
-                # abandonaba la semana entera sin probar otro día suyo; ahora se prueban todos.
+                # Días sueltos: uno por semana como mucho, para no vaciar una semana entera. Antes,
+                # si `dias[0]` estaba ocupado se abandonaba la semana entera sin probar otro día
+                # suyo; ahora se prueban todos los candidatos disponibles.
                 candidatos = [f for f in dias if not plan.ocupado(w, f)]
                 if not candidatos:
                     continue
-                candidatos.sort(key=lambda f: (cesiones_por_dow[f.weekday()], f))
+                # El día que deja MÁS SUSTITUTOS gana; a igualdad, el día de la semana MENOS usado
+                # hasta ahora; a igualdad de los dos, la fecha (determinismo).
+                candidatos.sort(key=lambda f: (
+                    -_sustituibilidad(datos, w, f, turno_prescrito(datos, w, f)),
+                    cesiones_por_dow[f.weekday()], f))
                 f = candidatos[0]
                 h = datos.turnos[turno_prescrito(datos, w, f)].horas
+                sust = _sustituibilidad(datos, w, f, turno_prescrito(datos, w, f))
                 plan.ceder(w, f, PASO, f"exceso de jornada ({pendiente:.0f} h pendientes, "
-                                       f"semana {sem[1]} es de las de mas holgura, dia elegido "
-                                       f"por reparto entre dias de la semana)")
+                                       f"semana {sem[1]}, {sust} sustitutos posibles ese dia)")
                 cesiones_por_dow[f.weekday()] += 1
+                disp_restante[sem] = disp_restante.get(sem, 0) - 1
                 pendiente -= h
