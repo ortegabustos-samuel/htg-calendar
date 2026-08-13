@@ -9,7 +9,7 @@ from cargar_datos import cargar
 from generar_anual import cobertura, construir
 from legal import Legal
 
-UMBRAL = 96.0     # se sube a 99.0 en la Task 10, cuando el paso 5 este completo
+UMBRAL = 99.0     # liston pactado en la especificacion, alcanzado tras corregir libranzas.py
 
 
 def main() -> int:
