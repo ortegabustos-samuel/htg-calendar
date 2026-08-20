@@ -32,13 +32,20 @@ Las tres validaciones de un intercambio, y ninguna es opcional:
   * JORNADA   — las dos semanas no valen lo mismo en horas; ninguno puede acabar sobre su objetivo.
   * LEGALIDAD — la semana en sí era legal para el otro, pero las FRONTERAS cambian: lo que enlaza
     con el domingo anterior y con el lunes siguiente es nuevo, y eso no lo ha pactado nadie.
+
+La legalidad no se mide contando: se mide por FORMAS. Los patrones incumplen el convenio por
+acuerdo, así que el cuadrante llega aquí con ~1.200 incumplimientos que hay que respetar. Un
+criterio de "que no aumenten" deja pasar un intercambio que quita uno pactado y mete uno inventado
+—el total no sube pero la composición empeora—, y así se colaban 26. Lo que se exige es que no
+aparezca ninguna forma (un par de turnos consecutivos, una ventana de siete días) que el ESQUELETO
+no produzca ya por su cuenta.
 """
 from __future__ import annotations
 
 from collections import Counter, defaultdict
 from datetime import date, timedelta
 
-from v3 import legal
+from v3 import esqueleto, legal
 from v3.cargar_datos import Datos
 from v3.horas import EPS, LibroHoras
 from v3.ritmo import grupo_de
@@ -99,6 +106,44 @@ def _horas_semana(datos: Datos, dias: list[tuple[date, str]]) -> float:
     return sum(datos.turnos[s].horas for _, s in dias)
 
 
+def formas_pactadas(datos: Datos, plan: Plan) -> set:
+    """Las formas de incumplimiento que el esqueleto produce por sí mismo: son las que vienen
+    pactadas con los trabajadores y las que, por tanto, se pueden mover de una persona a otra."""
+    salida: set = set()
+    for trab in {w for (w, _) in plan}:
+        salida |= set(_formas(datos, plan, trab, datos.inicio, datos.fin))
+    return salida
+
+
+def _formas(datos: Datos, plan: Plan, trab: str, desde: date, hasta: date) -> Counter:
+    """(tipo, forma) -> nº de casos de ese trabajador en el tramo. La FORMA es la secuencia de
+    turnos que provoca el incumplimiento, no la persona ni la fecha: es lo que permite decir si
+    algo ya lo produce el patrón o se lo ha inventado el pipeline."""
+    dias = {}
+    f = desde - timedelta(days=8)
+    fin = hasta + timedelta(days=8)
+    while f <= fin:
+        s = plan.get((trab, f))
+        if s is not None:
+            dias[f] = s
+        f += timedelta(days=1)
+
+    minimo = timedelta(hours=datos.config.descanso_minimo)
+    salida: Counter = Counter()
+    for f, s in dias.items():
+        g = f + timedelta(days=1)
+        if g in dias and datos.intervalo(dias[g], g)[0] - datos.intervalo(s, f)[1] < minimo:
+            salida[("C4", (s, dias[g]))] += 1
+        ventana = [dias[f + timedelta(days=i)] for i in range(7) if f + timedelta(days=i) in dias]
+        if sum(datos.turnos[x].horas for x in ventana) > datos.config.horas_max_semana:
+            salida[("C6", tuple(sorted(ventana)))] += 1
+    semanas: Counter = Counter(f - timedelta(days=f.weekday()) for f in dias)
+    for lunes, n in semanas.items():
+        if n > datos.config.dias_max_semana:
+            salida[("C5", n)] += 1
+    return salida
+
+
 def _infracciones_de(datos: Datos, plan: Plan, trab: str, desde: date, hasta: date) -> int:
     """Infracciones de ESE trabajador en ese tramo. Se cuentan antes y después del intercambio en
     vez de mirar el valor absoluto, porque los patrones ya llegan con incumplimientos pactados.
@@ -130,8 +175,18 @@ def _intercambiar(plan: Plan, uno: list[tuple[date, str]], otro: list[tuple[date
         plan[(a, f)] = s
 
 
+def _empeora(datos: Datos, plan: Plan, a: str, b: str, desde: date, hasta: date,
+             antes: Counter, pactadas: set) -> bool:
+    """¿El intercambio ya aplicado sube el número de incumplimientos o mete una forma inventada?"""
+    despues = _formas(datos, plan, a, desde, hasta) + _formas(datos, plan, b, desde, hasta)
+    if sum(despues.values()) > sum(antes.values()):
+        return True
+    return any(clave not in pactadas for clave in (despues - antes))
+
+
 def _valido(datos: Datos, plan: Plan, libro: LibroHoras, a: str, b: str, lunes: date,
-            suyas_a: list[tuple[date, str]], suyas_b: list[tuple[date, str]]) -> bool:
+            suyas_a: list[tuple[date, str]], suyas_b: list[tuple[date, str]],
+            pactadas: set) -> bool:
     if not _puede_asumir(datos, b, suyas_a) or not _puede_asumir(datos, a, suyas_b):
         return False
     ha, hb = _horas_semana(datos, suyas_a), _horas_semana(datos, suyas_b)
@@ -141,12 +196,9 @@ def _valido(datos: Datos, plan: Plan, libro: LibroHoras, a: str, b: str, lunes: 
         return False
 
     domingo = lunes + timedelta(days=6)
-    antes = _infracciones_de(datos, plan, a, lunes, domingo) + \
-        _infracciones_de(datos, plan, b, lunes, domingo)
+    antes = _formas(datos, plan, a, lunes, domingo) + _formas(datos, plan, b, lunes, domingo)
     _intercambiar(plan, suyas_a, suyas_b, a, b)
-    despues = _infracciones_de(datos, plan, a, lunes, domingo) + \
-        _infracciones_de(datos, plan, b, lunes, domingo)
-    if despues > antes:
+    if _empeora(datos, plan, a, b, lunes, domingo, antes, pactadas):
         _intercambiar(plan, suyas_b, suyas_a, a, b)         # se deshace
         return False
     return True
@@ -173,7 +225,10 @@ def _gana(cuentas: dict[str, Counter], a: str, b: str, media: dict[str, float],
     return total
 
 
-def pulir(datos: Datos, plan: Plan, libro: LibroHoras, vueltas: int = 400) -> dict:
+def pulir(datos: Datos, plan: Plan, libro: LibroHoras, vueltas: int = 400,
+          pactadas: set | None = None) -> dict:
+    if pactadas is None:
+        pactadas = formas_pactadas(datos, esqueleto.construir(datos))
     grupos: dict[str, list[str]] = defaultdict(list)
     for w in datos.trabajadores:
         grupos[grupo_de(datos, w)].append(w)
@@ -216,7 +271,7 @@ def pulir(datos: Datos, plan: Plan, libro: LibroHoras, vueltas: int = 400) -> di
 
         _, a, b, lunes = mejor
         suyas_a, suyas_b = semanas.get((a, lunes), []), semanas.get((b, lunes), [])
-        if not _valido(datos, plan, libro, a, b, lunes, suyas_a, suyas_b):
+        if not _valido(datos, plan, libro, a, b, lunes, suyas_a, suyas_b, pactadas):
             descartados.add((a, b, lunes))
             continue
         for _, s in suyas_a:                                # el plan ya lo movió `_valido`
@@ -228,7 +283,7 @@ def pulir(datos: Datos, plan: Plan, libro: LibroHoras, vueltas: int = 400) -> di
         cuentas = _cuentas(datos, plan)
         hechos += 1
 
-    dias = pulir_dias(datos, plan, libro)
+    dias = pulir_dias(datos, plan, libro, pactadas=pactadas)
     cuentas = _cuentas(datos, plan)
     final = {g: _desviacion(cuentas, ws) for g, ws in grupos.items()}
     return {"intercambios": hechos, "dias": dias, "inicial": inicial, "final": final}
@@ -245,7 +300,7 @@ def _dias_por_semana(plan: Plan) -> dict[tuple[str, date], list[date]]:
 
 
 def _valido_dia(datos: Datos, plan: Plan, libro: LibroHoras,
-                a: str, da: date, b: str, db: date) -> bool:
+                a: str, da: date, b: str, db: date, pactadas: set) -> bool:
     """`a` le pasa su día `da` a `b` y se queda con el `db` de `b`. Ambos de la misma semana."""
     sa, sb = plan[(a, da)], plan[(b, db)]
     if (b, da) in plan or (a, db) in plan:
@@ -263,12 +318,10 @@ def _valido_dia(datos: Datos, plan: Plan, libro: LibroHoras,
     # Los dos días pueden venir en cualquier orden: sin ordenarlos aquí el tramo sale invertido y
     # la comprobación no mira nada.
     desde, hasta = min(da, db), max(da, db)
-    antes = (_infracciones_de(datos, plan, a, desde, hasta)
-             + _infracciones_de(datos, plan, b, desde, hasta))
+    antes = _formas(datos, plan, a, desde, hasta) + _formas(datos, plan, b, desde, hasta)
     del plan[(a, da)], plan[(b, db)]
     plan[(b, da)], plan[(a, db)] = sa, sb
-    if (_infracciones_de(datos, plan, a, desde, hasta)
-            + _infracciones_de(datos, plan, b, desde, hasta)) > antes:
+    if _empeora(datos, plan, a, b, desde, hasta, antes, pactadas):
         del plan[(b, da)], plan[(a, db)]
         plan[(a, da)], plan[(b, db)] = sa, sb
         return False
@@ -282,7 +335,10 @@ def _clase(datos: Datos, plan: Plan, w: str, f: date) -> str | None:
     return dia if dia in CLASES else None
 
 
-def pulir_dias(datos: Datos, plan: Plan, libro: LibroHoras, vueltas: int = 600) -> int:
+def pulir_dias(datos: Datos, plan: Plan, libro: LibroHoras, vueltas: int = 600,
+               pactadas: set | None = None) -> int:
+    if pactadas is None:
+        pactadas = formas_pactadas(datos, esqueleto.construir(datos))
     """Afina lo que el intercambio de semana no puede: mueve un día de una clase concreta del que
     más tiene al que menos, dentro de la misma semana ISO."""
     grupos: dict[str, list[str]] = defaultdict(list)
@@ -324,7 +380,7 @@ def pulir_dias(datos: Datos, plan: Plan, libro: LibroHoras, vueltas: int = 600) 
                             continue                        # no cambiaría el reparto
                         if (a, da, b, db) in descartados:
                             continue
-                        if _valido_dia(datos, plan, libro, a, da, b, db):
+                        if _valido_dia(datos, plan, libro, a, da, b, db, pactadas):
                             semanal[(a, _lunes(da))].remove(da)
                             semanal[(b, _lunes(db))].remove(db)
                             semanal[(b, _lunes(da))].append(da)
