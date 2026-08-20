@@ -11,7 +11,7 @@ Revisa en cuatro niveles, de lo que impide leer a lo que solo es sospechoso:
 No corrige nada, solo informa: el arreglo va en el CSV, que es la fuente de verdad.
 Sale con código 1 si hay algún ERROR.
 
-Uso:  python3 src/validar_datos.py
+Uso:  python3 src/v3/validar_datos.py
 """
 from __future__ import annotations
 
@@ -21,15 +21,15 @@ from collections import Counter, defaultdict
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from cargar_datos import DATA, DIAS, LIBRE, _cargar_config, cargar              # noqa: E402
+from v3.cargar_datos import DATA, DIAS, LIBRE, _cargar_config, cargar          # noqa: E402
 
-# Columnas que cada fichero DEBE traer. Las opcionales (factor_jornada, grupo, linea, municipio,
-# prioridad, fila_inicial) no se exigen: el cargador les da valor por defecto.
+# Columnas que cada fichero DEBE traer. Las opcionales (factor_jornada, linea, municipio,
+# fila_inicial, dem) no se exigen: el cargador les da valor por defecto.
 OBLIGATORIAS = {
     "turnos.csv": ["id_turno", "municipio", "lv", "sabado", "domingo", "festivo",
-                   "hora_entrada", "hora_salida", "horas_computadas", "dem"],
+                   "hora_entrada", "hora_salida", "horas_computadas"],
     "trabajadores.csv": ["id_trab", "tipo", "vac1_inicio", "vac2_inicio"],
     "capacidades.csv": ["id_trab", "id_turno", "lv", "sab", "dom", "fest", "v"],
     "patrones.csv": ["patron", "fila"] + DIAS,
@@ -83,7 +83,7 @@ def _fecha(txt: str) -> date | None:
 #  1. FORMATO — lo que impide leer bien el fichero
 # --------------------------------------------------------------------------- #
 def revisar_config(inf: Informe) -> bool:
-    """`config.toml`: año y parámetros del convenio. Devuelve si se puede seguir (sin año no hay
+    """config.toml: año y parámetros del convenio. Devuelve si se puede seguir (sin año no hay
     horizonte y el nivel 4 no puede hacer nada)."""
     try:
         cfg = _cargar_config()
@@ -94,14 +94,15 @@ def revisar_config(inf: Informe) -> bool:
         inf.error(f"config.toml: anio={cfg.anio} no parece un año")
     if cfg.horas_objetivo <= 0:
         inf.error(f"config.toml: horas_objetivo={cfg.horas_objetivo}; debe ser > 0")
-    if not 0 <= cfg.rmin <= 24:
-        inf.error(f"config.toml: rmin={cfg.rmin} horas de descanso no caben en un día")
-    if not 0 < cfg.hmax7 <= 7 * 24:
-        inf.error(f"config.toml: hmax7={cfg.hmax7} horas no caben en una semana")
-    if not 1 <= cfg.cmax <= 7:
-        inf.error(f"config.toml: cmax={cfg.cmax} días está fuera de 1..7")
-    if not 1 <= cfg.cmax_pool <= cfg.cmax:
-        inf.error(f"config.toml: cmax_pool={cfg.cmax_pool} debe estar entre 1 y cmax={cfg.cmax}")
+    if not 0 <= cfg.descanso_minimo <= 24:
+        inf.error(f"config.toml: descanso_minimo={cfg.descanso_minimo} horas de descanso no caben en un día")
+    if not 0 < cfg.horas_max_semana <= 7 * 24:
+        inf.error(f"config.toml: horas_max_semana={cfg.horas_max_semana} horas no caben en una semana")
+    if not 1 <= cfg.dias_max_semana <= 7:
+        inf.error(f"config.toml: dias_max_semana={cfg.dias_max_semana} días está fuera de 1..7")
+    if not 0 < cfg.ratio_rigido <= 1:
+        inf.error(f"config.toml: ratio_rigido={cfg.ratio_rigido} está fuera de (0, 1]: es una "
+                  f"proporción de días de descanso por día de trabajo")
     return not inf.errores
 
 
@@ -149,7 +150,7 @@ def revisar_formato(inf: Informe) -> tuple[dict[str, list[dict]], list[str]]:
             if len(fila) < len(cab):
                 # Truncar la fila por la derecha es legítimo si lo que falta es opcional: DictReader
                 # lo deja a None y el cargador le da su valor por defecto (así vienen las líneas sin
-                # `prioridad`). Solo es error si se ha caído una columna que sí hace falta.
+                # `fila_inicial`). Solo es error si se ha caído una columna que sí hace falta.
                 perdidas = [c for c in cab[len(fila):] if c in obligatorias]
                 if perdidas:
                     inf.error(f"{nombre}:{n} se corta antes de {perdidas}, que son obligatorias")
@@ -269,15 +270,16 @@ def revisar_contrato(crudo: dict[str, list[dict]], inf: Informe) -> None:
                 inf.error(f"turnos: {s} computa {r['horas_computadas']} h; debe ser > 0")
         except ValueError:
             inf.error(f"turnos: {s} tiene horas_computadas='{r['horas_computadas']}', no numérico")
-        prio = (r.get("prioridad") or "1").strip() or "1"
-        if not prio.isdigit():
-            inf.error(f"turnos: {s} tiene prioridad='{prio}'; se espera un entero >= 0")
-        if not r["dem"].strip().isdigit():
-            inf.error(f"turnos: {s} tiene dem='{r['dem']}'; se espera un entero >= 0")
-        elif int(r["dem"]) == 0:
-            inf.aviso(f"turnos: {s} tiene demanda 0; nadie lo cubrirá nunca")
-        elif not any(r[c] == "1" for c in ("lv", "sabado", "domingo", "festivo")):
-            inf.aviso(f"turnos: {s} pide {r['dem']} persona(s) pero no opera ningún tipo de día")
+        # dem: columna OPCIONAL y sparse — vacía significa 1 (mismo criterio que cargar_datos._cargar_turnos).
+        crudo_dem = r["dem"].strip()
+        if crudo_dem and not crudo_dem.isdigit():
+            inf.error(f"turnos: {s} tiene dem='{crudo_dem}'; se espera un entero >= 0")
+        else:
+            dem = int(crudo_dem) if crudo_dem else 1
+            if dem == 0:
+                inf.aviso(f"turnos: {s} tiene demanda 0; nadie lo cubrirá nunca")
+            elif not any(r[c] == "1" for c in ("lv", "sabado", "domingo", "festivo")):
+                inf.aviso(f"turnos: {s} pide {dem} persona(s) pero no opera ningún tipo de día")
 
     # Nº de trabajadores == nº de filas del patrón. La rotación asigna filas[(orden + semanas) % T]:
     # con más gente que filas, dos comparten fila y hacen el mismo turno el mismo día; con menos,
@@ -398,9 +400,13 @@ def revisar_contrato(crudo: dict[str, list[dict]], inf: Informe) -> None:
 #  4. VIABILIDAD — no rompe la carga, pero anticipa un mal cuadrante
 # --------------------------------------------------------------------------- #
 def revisar_viabilidad(inf: Informe) -> None:
-    """Solo corre si el resto pasó: necesita los datos ya cargados por cargar_datos."""
-    from modelo import (_patrones_noche, _patrones_uvi,                   # noqa: PLC0415
-                        jornada_minutos, rango_fechas)
+    """Solo corre si el resto pasó: necesita los datos ya cargados por cargar_datos.
+
+    No mide profundidad de líneas críticas ni patrones dedicados (noche/UVI): esas nociones
+    vivían en `Turno.prioridad`/`Turno.tipo`, que `cargar_datos.py` ya no deriva — se está
+    replanteando cómo expresar la criticidad, así que este nivel se queda con lo que sí puede
+    medir sin inventar semántica nueva."""
+    from modelo import rango_fechas                                       # noqa: PLC0415
 
     d = cargar()
     objetivo = d.config.horas_objetivo
@@ -429,9 +435,9 @@ def revisar_viabilidad(inf: Informe) -> None:
                           f"({', '.join(sorted(ws))}); harían turnos idénticos todo el año y otra "
                           f"fila se quedaría sin recorrer. Revisa `fila_inicial`")
 
-    # Balance anual: horas que hay que cubrir contra horas que la plantilla puede dar.
-    dem = sum(t.dem * t.horas for f in fechas for s, t in d.turnos.items()
-              if t.prioridad >= 1 and d.opera(s, f))
+    # Balance anual: horas que hay que cubrir contra horas que la plantilla puede dar. Cuenta TODOS
+    # los turnos por igual: sin `prioridad` no hay forma de distinguir demanda real de relleno.
+    dem = sum(t.dem * t.horas for f in fechas for s, t in d.turnos.items() if d.opera(s, f))
     cap = sum(objetivo * t.factor_jornada for t in d.trabajadores.values())
     # Las vacaciones ya están descontadas del objetivo anual: 1776 es lo que trabaja cada uno.
     if dem > cap:
@@ -443,45 +449,14 @@ def revisar_viabilidad(inf: Informe) -> None:
                  f"{(cap - dem) / objetivo:.1f} personas de holgura, que habrá que absorber "
                  f"con refuerzos o dejar sin asignar")
 
-    # Profundidad de cobertura: una línea crítica con un solo cubridor cae en cuanto ese se va.
-    for s, t in sorted(d.turnos.items()):
+    # Profundidad de cobertura: una línea sin nadie con capacidad será hueco todo el año. (La
+    # comprobación adicional de líneas CRÍTICAS se retira junto con `prioridad` — ver docstring.)
+    for s in sorted(d.turnos):
         cub = [w for (w, ss), c in d.capacidades.items() if ss == s and c.v >= 1]
         norm = [w for (w, ss), c in d.capacidades.items()
                 if ss == s and (c.lv or c.sab or c.dom or c.fest)]
         if not norm and not cub:
             inf.error(f"la línea {s} no tiene a NADIE con capacidad; será hueco todo el año")
-        elif t.prioridad >= 2 and len(cub) + len(norm) <= t.dem:
-            inf.error(f"la línea crítica {s} pide {t.dem} y solo {len(cub) + len(norm)} persona(s) "
-                      f"pueden hacerla: sus vacaciones la dejan vacía")
-
-    # Los patrones dedicados (noche, UVI) se acoplan por bloques de 14 días y el calendario de
-    # cesiones trocea el año en ciclos de 2 filas. Con otro número de filas eso sale mal.
-    for p in sorted(_patrones_noche(d) | _patrones_uvi(d)):
-        nf = len(d.patrones.get(p, []))
-        if nf != 2:
-            inf.error(f"el patrón dedicado '{p}' tiene {nf} filas: el acoplamiento por bloques y el "
-                      f"calendario de cesiones asumen 2 (ciclo de 14 días)")
-
-    # Cuánto prescribe cada patrón frente al objetivo: ceder tiempo es la mecánica normal aquí, pero
-    # conviene saber de antemano cuánto hay que ceder (o cuánto falta por rellenar).
-    for p, filas in sorted(d.patrones.items()):
-        if not any(t.patron == p for t in d.trabajadores.values()):
-            continue
-        T = len(filas)
-        # En JORNADA, no en horas legales: si no, un patrón de localizado (8 h computadas por turno
-        # pero la plaza ocupa la semana) parecería quedarse un 25% corto y avisaría de un problema
-        # que no existe. Ver modelo.jornada_minutos.
-        prescrito = {(f"·{p}", f): s
-                     for f in fechas
-                     for s in [filas[((f - ini).days // 7) % T][DIAS[f.weekday()]]]
-                     if s and s != LIBRE and s in d.turnos and d.opera(s, f)}
-        h = jornada_minutos(d, prescrito, fechas).get(f"·{p}", 0) / 60
-        desv = h / objetivo - 1
-        gap = "por encima: habrá que ceder bloques" if desv > 0 else "por debajo: harán falta refuerzos"
-        inf.nota(f"el patrón '{p}' prescribe ~{h:,.0f} h/año, un {abs(100 * desv):.0f}% {gap}")
-        if abs(desv) > 0.25:
-            inf.aviso(f"'{p}' se desvía un {abs(100 * desv):.0f}% del objetivo anual; ajustar tantas "
-                      f"horas sin romper la rotación puede no ser posible")
 
 
 # --------------------------------------------------------------------------- #

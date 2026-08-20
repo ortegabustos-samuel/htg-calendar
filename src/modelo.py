@@ -10,12 +10,12 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass
 from datetime import date, timedelta, datetime
 
-from cargar_datos import DIAS, LIBRE, Datos, Turno
+from v3.cargar_datos import DIAS, LIBRE, Datos, Turno
 
 from ortools.sat.python import cp_model
 
 # Los parámetros LEGALES y el AÑO no viven aquí: son de la instancia, no del problema. Están en
-# `<datos>/config.toml` y llegan por `datos.config` (ver cargar_datos.Config):
+# `<datos>/config.toml` y llegan por `datos.config` (ver v3.cargar_datos.Config):
 #   config.horas_objetivo — jornada anual objetivo (h). Techo de TODO lo que no sea cubrir: la
 #       equidad apunta ahí, las cesiones de bloque aterrizan por debajo y el relleno de refuerzos
 #       (rellenar_refuerzos) para en seco al llegar. (Antes el tope era 1826 y por eso media
@@ -692,7 +692,7 @@ class Modelo:
         (incluye LIBRE). La rotación avanza una fila por semana desde el ANCLA GLOBAL (lunes fijo,
         igual para todas las ventanas); cada trabajador del grupo arranca en la fila que le fija
         `datos.offsets` (declarada en trabajadores.csv, o el orden del grupo si no se declara — ver
-        cargar_datos.offsets_patron). Fuente ÚNICA para el warm-start (_warm_start_patron) y la
+        v3.cargar_datos.offsets_patron). Fuente ÚNICA para el warm-start (_warm_start_patron) y la
         fijación (_fijacion_patron)."""
         base = self.ancla_patron
         ancla = base - timedelta(days=base.weekday())        # lunes de la semana ancla

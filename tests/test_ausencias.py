@@ -6,7 +6,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from cargar_datos import cargar
+from v3.cargar_datos import cargar
 from modelo import ausencias_criticas, calendario_cesiones
 
 

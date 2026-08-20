@@ -33,7 +33,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from cargar_datos import Datos                                            # noqa: E402
+from v3.cargar_datos import Datos                                         # noqa: E402
 from modelo import (JORNADA_LOCALIZADO_SEMANA, jornada_minutos,           # noqa: E402
                     lineas_localizadas, semana)
 
@@ -133,7 +133,7 @@ def _tope_dias(datos: Datos, w: str) -> int:
     filas = datos.patrones.get(t.patron or "") if t.tipo == "patron" else None
     if not filas:
         return datos.config.cmax_pool
-    from cargar_datos import DIAS, LIBRE
+    from v3.cargar_datos import DIAS, LIBRE
     propio = max(sum(1 for dia in DIAS if fila.get(dia) and fila.get(dia) != LIBRE
                      and fila.get(dia) in datos.turnos) for fila in filas)
     return min(datos.config.cmax, max(datos.config.cmax_pool, propio))
@@ -159,7 +159,7 @@ def _descanso_ok(datos: Datos, plan: dict, w: str, f: date, s: str, pares_ok: se
 
 def _pares_pactados(datos: Datos) -> set[tuple[str, str]]:
     """Encadenamientos que alguna rotación contiene y por tanto pueden saltarse C4 (localizados)."""
-    from cargar_datos import DIAS, LIBRE
+    from v3.cargar_datos import DIAS, LIBRE
     pares = set()
     ok = lambda s: bool(s) and s != LIBRE and s in datos.turnos          # noqa: E731
     for filas in datos.patrones.values():

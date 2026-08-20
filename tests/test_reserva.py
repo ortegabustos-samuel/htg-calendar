@@ -5,7 +5,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from cargar_datos import cargar
+from v3.cargar_datos import cargar
 from modelo import calendario_cesiones, reserva_cubridores
 
 # Valores con el calendario de cesiones DETERMINISTA (semilla fija, un hilo). Antes de fijarlo,

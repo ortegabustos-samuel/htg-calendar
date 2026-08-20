@@ -19,63 +19,11 @@ from pathlib import Path
 import csv
 import tomllib
 
-RAIZ = Path(__file__).resolve().parents[1]
+RAIZ = Path(__file__).resolve().parents[2]
 DATA = RAIZ / "data" / "input"
 
 DIAS = ["lun", "mar", "mie", "jue", "vie", "sab", "dom"]   # patrones.csv; índice = weekday()
 LIBRE = "LIBRE"
-# Consumo de capacidad de un turno LOCALIZADO 24h para la EQUIDAD (no lo legal): una quincena de
-# localizado son 7 turnos (2 días una semana + 5 la otra) y equivale a una quincena normal de
-# 80 h (8h·5días·2sem) → cada turno localizado "consume" 80/7 h. (Calibrar con el patrón real.)
-CONSUMO_LOCALIZADO = 80 / 7
-# --------------------------------------------------------------------------- #
-#  Derivaciones horarias
-# --------------------------------------------------------------------------- #
-
-def duracion_turno(entrada: time, salida: time) -> float:
-    """
-    Metodo devuelve duracion turno con entrada y salida
-
-    Args:
-        entrada (time): Objeto time que representa la hora de entrada del turno
-        salida (time): Objeto time que representa la hora de salida del turno
-
-    Returns:
-        float: Tiempo en horas entre entrada y salida turno 
-    """
-    fecha_base = date(2000, 1, 1)
-
-    dt_entrada = datetime.combine(fecha_base, entrada)
-    dt_salida = datetime.combine(fecha_base, salida)
-
-    if dt_salida <= dt_entrada:
-        dt_salida += timedelta(days=1)
-
-    return (dt_salida - dt_entrada).total_seconds() / 3600
-
-
-def tipo_turno(entrada: time, salida: time) -> str:
-    """
-    Metodo que en base a hora entrada y salida devuelve el tipo de turno
-
-    Args:
-        entrada (time): Objeto time que representa la hora de entrada del turno
-        salida (time): Objeto time que representa la hora de salida del turno
-    
-    Returns:
-        str: tipo de turno [24h, 12h, noche, tarde, mañana]
-    """
-    dur = duracion_turno(entrada,salida)
-    if dur >= 22:
-        return "24h"
-    elif dur >=12:
-        return "12h"
-    elif entrada>salida:
-        return "noche"
-    elif salida>time(17):
-        return "tarde"
-    else:
-        return "mañana"
 
 # --------------------------------------------------------------------------- #
 #  Estructuras del dominio
@@ -91,18 +39,7 @@ class Turno:
     hora_entrada: time  #Hora de entrada del turno
     hora_salida: time   #Hora de salida del turno
     dem: int            #Demanda del turno
-    partido: int        #Flag que indica si es turno partido 0/1
     horas: float        # horas COMPUTADAS (jornada legal; partido y 24h -> 8)
-    tipo: str           #Tipo de turno (24h, partido, tarde, mañana, noche)
-    prioridad: int = 1  # rango de cobertura (entero >=0; mayor = más crítico). El coste real de dejarlo
-                        # SIN cubrir lo calcula modelo.peso_cobertura() como (prioridad+1), NO prioridad
-                        # a secas, para que 0 no sea nunca coste cero: 0 = turno COMODÍN (p.ej. REF CAL,
-                        # herramienta para asignar horas de ayuda, no cobertura real) — el escalón más
-                        # bajo, SIEMPRE dominado por cualquier turno de prioridad>=1, pero se sigue
-                        # cubriendo si sobra margen (que es su función).
-    horas_consumo: float = 0.0  # horas que CONSUME de la capacidad anual (para la EQUIDAD, no lo legal).
-                                # Localizado 24h -> CONSUMO_LOCALIZADO (Suponiendo dos semanas equivalente a 80 horas);
-                                # normal -> = horas computadas. Lo deriva el cargador.
 
 
 @dataclass
@@ -115,8 +52,6 @@ class Trabajador:
                                     # igual que el patrón: es lo que define su trabajo. Su capacidad
                                     # se deriva sola (ver _anadir_capacidad_fijo), no va en capacidades.csv.
     factor_jornada: float = 1.0     # reducción de jornada: escala el objetivo anual. 1.0 = jornada completa
-    grupo: str | None = None        # grupo de EQUIDAD: mismos grupo se equiparan entre sí (findes/festivos).
-                                    # Lo asigna la empresa; None = sin grupo (no entra en equidad de grupo)
     fila_inicial: int | None = None  # solo tipo=patron: fila de `patrones.csv` que hace en la PRIMERA
                                     # semana del horizonte. Es lo que da continuidad entre años —ver
                                     # `offsets_patron`—. None = no declarada (se deduce del orden).
@@ -124,23 +59,17 @@ class Trabajador:
 
 @dataclass(frozen=True)
 class Config:
-    """Parámetros de la INSTANCIA (`config.toml`): qué año se resuelve y bajo qué convenio.
-
-    Están aquí y no en el código porque cambian de un año al siguiente y de una provincia a otra:
-    1776 es la jornada de ESTE convenio y ESTE año, no una constante del problema. Antes vivían
-    repartidos entre `modelo.py` y `diagnostico.py`, duplicados — con el efecto de que el
-    diagnóstico podía juzgar viable un dataset usando un objetivo distinto del que luego aplicaba
-    el modelo. Los valores por defecto son los que el código tenía escritos, así que un directorio
-    de datos sin `config.toml` se comporta igual que antes de existir esto.
-
-    `anio` es obligatorio en config.toml: el horizonte lo declaran los datos, no se deduce."""
-    anio: int | None = None      # None solo para poder construir los defaults; _cargar_config lo exige
+    """
+    Parámetros de la INSTANCIA (`config.toml`): qué año se resuelve y bajo qué convenio.
+    `anio` es obligatorio en config.toml: el horizonte lo declaran los datos, no se deduce.
+    """
+    anio: int                    # Anio sobre el que estamos haciendo el calendario
     horas_objetivo: int = 1776   # jornada anual objetivo (h): techo de todo lo que no sea cubrir
-    rmin: int = 12               # descanso mínimo entre jornadas (h)              — C4
-    hmax7: int = 48              # máx. trabajo efectivo por semana ISO (h)        — C6
-    cmax: int = 6                # máx. días trabajados por semana ISO             — C5
-    cmax_pool: int = 5           # el mismo tope, para la plantilla FLEXIBLE (correturnos y mixtos)
-
+    descanso_minimo: int = 12               # descanso mínimo entre jornadas (h)              — C4
+    horas_max_semana: int = 48              # máx. horas en cualquier ventana de 7 días       — C6
+    dias_max_semana: int = 6                # máx. días trabajados por semana ISO             — C5
+    ratio_rigido: float = 0.6               # a partir de qué descanso/trabajo una plaza no se
+                                            # fracciona al ceder horas (ver v3/ritmo.py)
 
 @dataclass
 class Capacidad:
@@ -150,7 +79,7 @@ class Capacidad:
     fest: int                       #Trabaja los festivos flag 0/1
     v: int                          # Cobertura excepcional, con ORDEN de preferencia:
                                     #   0 = no es cubridor de esta línea (capacidad normal)
-                                    #   1 = cubridor PRINCIPAL — el que el gestor prefiere para ella
+                                    #   1 = cubridor PRINCIPAL 
                                     #   2, 3… = suplentes, por orden: solo entran si el principal no
                                     #           puede (vacaciones, ya ocupado, descanso obligado).
                                     # El orden es una preferencia BLANDA (ver _preferencia_cubridor):
@@ -205,6 +134,38 @@ class Datos:
         wd = f.weekday()
         return (t.lv if wd < 5 else t.sab if wd == 5 else t.dom) == 1
 
+    def intervalo(self, turno_id: str, f: date) -> tuple[datetime, datetime]:
+        """Momento real de entrada y de salida del turno ese día. Si la salida no es posterior a
+        la entrada, el turno cruza medianoche y termina al día siguiente — de ahí sale que un
+        nocturno bloquee el turno de mañana del día siguiente (descanso mínimo entre jornadas)."""
+        t = self.turnos[turno_id]
+        inicio = datetime.combine(f, t.hora_entrada)
+        fin = datetime.combine(f, t.hora_salida)
+        if fin <= inicio:
+            fin += timedelta(days=1)
+        return inicio, fin
+
+    def franja(self, turno_id: str) -> str:
+        """Tramo del día en que se trabaja: mañana | tarde | noche.
+
+        Sale del reloj y los cortes no son arbitrarios: en estos datos ninguna línea entra entre
+        las 11:30 y las 13:30 ni entre las 16:00 y las 21:30, así que 13:00 y 21:00 caen en huecos
+        reales de la distribución. Es lo que se le fija a un correturno para toda la semana — la
+        franja es lo que de verdad organiza la vida de quien la hace.
+        """
+        t = self.turnos[turno_id]
+        if t.hora_salida <= t.hora_entrada:              # cruza medianoche
+            return "noche"
+        if t.hora_entrada.hour < 13:
+            return "mañana"
+        return "tarde" if t.hora_entrada.hour < 21 else "noche"
+
+    def duracion(self, turno_id: str) -> float:
+        """Horas REALES que dura el turno de reloj a reloj. No es lo mismo que `Turno.horas`, que
+        son las computadas por convenio (el partido y el de 24 h computan 8)."""
+        inicio, fin = self.intervalo(turno_id, date(2000, 1, 1))
+        return (fin - inicio).total_seconds() / 3600
+
     def disponible(self, trab_id: str, f: date) -> bool:
         """Devuelve si el trabajador esta disponible en esa fecha en base a sus vacaciones"""
         return not any(ini <= f <= fin for ini, fin in self.trabajadores[trab_id].vacaciones)
@@ -239,17 +200,12 @@ def _cargar_turnos() -> dict[str, Turno]:
         for fila in lector:
             hora_entrada = datetime.strptime(fila["hora_entrada"].strip(),"%H:%M").time()
             hora_salida = datetime.strptime(fila["hora_salida"].strip(),"%H:%M").time()
-            partido = int(fila.get("partido",0))
             horas = float(fila["horas_computadas"].strip())
-            tipo = tipo_turno(hora_entrada, hora_salida) if partido==0 else "partido"
-            # Consumo para la EQUIDAD: un localizado 24h consume más capacidad que sus 8 h computadas
-            consumo = CONSUMO_LOCALIZADO if tipo == "24h" else horas
-            # prioridad: entero >=0 (columna opcional, vacío -> 1). 0 = turno COMODÍN (ver
-            # modelo.peso_cobertura: nunca coste cero); mayor = más crítico de cubrir.
-            crudo_prio = (fila.get("prioridad") or "").strip()
-            prioridad = int(crudo_prio) if crudo_prio else 1
-            if prioridad < 0:
-                raise ValueError(f"prioridad de {fila['id_turno']} negativa ({prioridad}); debe ser >=0")
+            # dem: columna OPCIONAL (sparse) — solo se rellena cuando la demanda es >1; vacía -> 1.
+            # OJO: `fila.get("dem", 1)` NO vale para esto: en una fila más corta que la cabecera,
+            # DictReader mete la clave igualmente con valor None (no la deja ausente), así que el
+            # default de `.get()` nunca se dispara y `int(None)` revienta.
+            crudo_dem = (fila.get("dem") or "").strip()
             turnos[fila["id_turno"]] = Turno(
                 id=fila["id_turno"],
                 municipio=fila["municipio"],
@@ -259,12 +215,8 @@ def _cargar_turnos() -> dict[str, Turno]:
                 fes=int(fila["festivo"]),
                 hora_entrada=hora_entrada,
                 hora_salida=hora_salida,
-                dem=int(fila.get("dem",1)),
-                partido=partido,
+                dem=int(crudo_dem) if crudo_dem else 1,
                 horas=horas,
-                tipo=tipo,
-                prioridad=prioridad,
-                horas_consumo=consumo,
             )
     return turnos
 
@@ -309,7 +261,6 @@ def _cargar_trabajadores() -> dict[str, Trabajador]:
                 linea=(fila.get("linea") or "").strip() or None,   # columna OPCIONAL, solo para fijos
                 vacaciones = [(vac1, vac1 + timedelta(days=14)),(vac2, vac2 + timedelta(days=14))],
                 factor_jornada=factor,
-                grupo=(fila.get("grupo") or "").strip() or None,   # columna OPCIONAL de grupo de equidad
                 fila_inicial=fila_inicial,
             )
     return trabajadores
@@ -367,21 +318,19 @@ def _cargar_config() -> Config:
     valores: dict[str, object] = {}
     if ruta.is_file():
         with open(ruta, "rb") as archivo:              # tomllib exige binario
-            crudo = tomllib.load(archivo)
+            datos = tomllib.load(archivo)
         campos = {f.name for f in fields(Config)}
-        for seccion, cuerpo in crudo.items():
-            if not isinstance(cuerpo, dict):
+        for seccion, variable in datos.items():
+            if not isinstance(variable, dict):
                 raise ValueError(f"config.toml: '{seccion}' está suelto; todo va dentro de una "
                                  f"sección ([horizonte], [jornada], [convenio])")
-            for clave, valor in cuerpo.items():
+            for clave, valor in variable.items():
                 if clave not in campos:
                     raise ValueError(f"config.toml: '{clave}' (en [{seccion}]) no es un parámetro; "
                                      f"los que hay son {sorted(campos)}")
-                if not isinstance(valor, int) or isinstance(valor, bool):
-                    raise ValueError(f"config.toml: {clave}={valor!r} debería ser un entero")
+                if valor is None:
+                    raise ValueError(f"config.toml: {clave}={valor!r} debería ser un valor")
                 valores[clave] = valor
-    if valores.get("anio") is None:
-        raise ValueError(f"{ruta}: falta 'anio' en [horizonte]; el año lo declaran los datos")
     return Config(**valores)                            # type: ignore[arg-type]
 
 
@@ -434,13 +383,7 @@ def _anadir_capacidad_fijo(
     capacidades: dict[tuple[str, str], Capacidad],
 ) -> int:
     """Deriva la capacidad de los FIJOS a partir de su `linea` (declarada en trabajadores.csv), igual
-    que las de patrón se derivan de patrones.csv.
-
-    Un fijo trabaja su plaza de LUNES A VIERNES: eso es lo que significa ser fijo, así que la regla
-    vive AQUÍ y no en los datos. Importa que sea así y no deducirla de los días en que opera la línea:
-    VADN022 opera sábados, domingos y festivos, pero su fijo solo la cubre L-V (el finde lo hace otro).
-    Si un fijo tuviera además días atípicos, basta una fila explícita en capacidades.csv: esta
-    derivación respeta lo que ya venga del CSV. Devuelve el nº de capacidades añadidas."""
+    que las de patrón se derivan de patrones.csv."""
     anadidas = 0
     for w, t in trabajadores.items():
         if t.tipo != "fijo":
@@ -465,24 +408,7 @@ def _anadir_capacidades_correturno(
 ) -> int:
     """Un CORRETURNO puede hacer cualquier línea: esa es su función. En vez de enumerarle 67 filas
     una a una, se derivan todas, y en `capacidades.csv` solo se declaran sus EXCEPCIONES.
-
-    La distinción entre "cualquier línea" y las líneas que exigen estar designado sale de los
-    propios datos, sin columna nueva: **una línea que tiene cubridores designados (v>=1) es una
-    línea donde hay que estar designado**, y ahí el correturno NO entra. Encaja con el dato real —
-    las que ningún correturno tenía declaradas son exactamente H, VADN051, VADN052, VADP003 y
-    VADU47127, que son las cinco con cubridor designado.
-
-    Se probó a darles esas líneas como "último recurso" (orden peor que el de los designados) y
-    salió MAL, por la estructura del objetivo y no por los datos: dejar una noche sin cubrir cuesta
-    300 en el nivel de cobertura y sacar a su cubridor designado del patrón cuesta PESO_DEV=100 en
-    ese mismo nivel, mientras que el orden de preferencia vive en el nivel bajo. Frente a W1 ese
-    coste es cero, así que el solver tiraba SIEMPRE del correturno para ahorrarse mover al
-    designado: 160 días de líneas críticas absorbidos por correturnos, que llegaban al verano con
-    +23 h sobre su ritmo y sin presupuesto para las líneas que sí son suyas (la cobertura del año
-    caía del 98.9% al 97.5%). Subir el peso al nivel de cobertura tampoco vale: para que el
-    designado gane haría falta ~120, y entonces en una línea de prioridad 1 como H —que vale 10—
-    el solver preferiría dejarla vacía antes que usar un correturno.
-
+    
     Las filas explícitas MANDAN sobre lo derivado, por si hiciera falta declarar una excepción.
     Devuelve el nº de capacidades añadidas."""
     # Orden más alto ya declarado en cada línea (0 = nadie designado para ella)
@@ -505,45 +431,15 @@ def _anadir_capacidades_correturno(
     return anadidas
 
 
-def _derivar_grupos_equidad(trabajadores: dict[str, Trabajador]) -> int:
-    """Grupo de equidad de findes/festivos: cada PATRÓN es un grupo CERRADO propio — sus miembros se
-    equiparan solo entre sí (el patrón ya codifica una rotación equilibrada; la equidad se mide DENTRO
-    del grupo, no contra el resto de la plantilla, que hace otro tipo de trabajo). Mixtos y correturnos
-    quedan en el pool general (grupo=None). No pisa un grupo fijado a mano en trabajadores.csv. Devuelve
-    nº de grupos asignados. (El patrón grande de Valladolid, que en la práctica admite reajustes para
-    una equidad global, es una peculiaridad local; se revisa aparte según cómo queden los findes.)"""
-    asignados = 0
-    for w, t in trabajadores.items():
-        if t.tipo == "patron" and t.patron and t.grupo is None:
-            t.grupo = t.patron
-            asignados += 1
-    return asignados
-
-
 def offsets_patron(
     trabajadores: dict[str, Trabajador],
     patrones: dict[str, list[dict[str, str]]],
 ) -> dict[str, int]:
     """Fila de la rotación en que arranca cada trabajador de patrón: {id_trab -> offset}.
-
-    La rotación de un trabajador es `filas[(offset + semanas_desde_el_ancla) % T]`, y el ancla es el
-    lunes de la primera semana del horizonte. El offset es, por tanto, LA FILA QUE HACE ESA PRIMERA
-    SEMANA — y es lo único que da continuidad de un año al siguiente: sin él, cada 1 de enero la
-    rotación vuelve a empezar y quien tenga la fila mala del patrón la repite año tras año.
-
-    Fuente ÚNICA para los cuatro sitios que prescriben la rotación (`Modelo._prescripcion_patron`,
-    `_prescripcion_por_ciclo`, `reserva_cubridores` y `diagnostico`), que antes lo deducían cada uno
-    por su cuenta y podían discrepar.
-
-    Dos orígenes, en este orden:
-      · `fila_inicial` en trabajadores.csv — lo declarado MANDA. Es el caso normal: la empresa sabe
-        quién va en qué fila, y al empezar un año nuevo se actualiza la columna con el punto en que
-        quedó la rotación.
-      · si no viene, el ORDEN ALFABÉTICO dentro del grupo (comportamiento anterior a la columna, para
-        que los datos que ya existen sigan funcionando sin tocarlos).
-    Se puede mezclar: los que declaren fila la usan, los demás caen al orden. El validador avisa si
-    dos del mismo grupo acaban en la misma fila (harían turnos idénticos y otra fila quedaría sin
-    recorrer)."""
+    Cada anio tenemos que los trabajadores de patron deben adaptarse al fin de la semana que hizo en 
+    el cuadrante anterior, esto puede venir implicito en los datos o bien que se asigne automaticamente por 
+    orden alfabetico, aunque por defecto suele ser indicarlo
+    """
     grupos: dict[str, list[str]] = {}
     for w, t in trabajadores.items():
         if t.tipo == "patron" and t.patron:
@@ -574,7 +470,6 @@ def cargar() -> Datos:
     # designado entran como último recurso. Va DESPUÉS para ver los órdenes ya declarados.
     _anadir_capacidades_correturno(trabajadores, turnos, capacidades)
     # Grupo de equidad: cada patrón, su propio grupo cerrado; mixtos/correturnos en el pool general.
-    _derivar_grupos_equidad(trabajadores)
     return Datos(
         turnos=turnos,
         trabajadores=trabajadores,

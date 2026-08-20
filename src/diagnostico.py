@@ -24,7 +24,7 @@ from __future__ import annotations
 from collections import defaultdict
 from datetime import date, datetime, timedelta
 
-from cargar_datos import DIAS, LIBRE, Datos, cargar
+from v3.cargar_datos import DIAS, LIBRE, Datos, cargar
 from modelo import jornada_minutos
 
 

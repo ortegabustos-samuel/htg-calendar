@@ -25,8 +25,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import salida                                                   # noqa: E402
-import validar_datos                                            # noqa: E402
-from cargar_datos import cargar                                 # noqa: E402
+import v3.validar_datos as validar_datos                        # noqa: E402
+from v3.cargar_datos import cargar                              # noqa: E402
 import pulido                                                    # noqa: E402
 from modelo import resolver_anual                                # noqa: E402
 
