@@ -368,32 +368,50 @@ def _volcar(datos: Datos, plan: Plan, libro: LibroHoras, x: dict, y: dict, z: di
 #  Relleno de horas con REF CAL
 # --------------------------------------------------------------------------- #
 def rellenar_refuerzos(datos: Datos, plan: Plan, libro: LibroHoras) -> int:
-    """Acerca a cada correturno a su jornada anual con las líneas de refuerzo.
+    """Acerca a cada correturno a su jornada anual con las líneas de refuerzo, REPARTIDAS.
 
     REF CAL no es cobertura: declara demanda 0, así que nunca es un hueco y nadie la echa de menos.
     Es una herramienta para asignar horas de apoyo a quien, después de repartir todo lo que había
     que cubrir, se queda por debajo de su jornada. Por eso va al final y fuera del modelo.
+
+    El reparto por el año no es cosmético. Recorriendo las fechas en orden, todo el relleno caía en
+    enero y febrero —254 días entre los dos— y el pool llegaba a octubre sin presupuesto: 211 días
+    libres en diciembre frente a 71 en enero. Las horas son las mismas, pero repartidas dejan una
+    carga pareja todo el año, que es como se entrega un cuadrante.
     """
     refuerzos = sorted(s for s, t in datos.turnos.items() if t.dem == 0)
     if not refuerzos:
         return 0
+
     puestas = 0
     for w in forma.pool_de(datos):
-        for f in datos.fechas:
-            if libro.exceso(w) >= 0:
+        # Se reparte solo entre los días en que un refuerzo EXISTE: REF CAL opera de lunes a
+        # viernes, así que repartir sobre todos los días libres tiraba la mitad de las elecciones
+        # a fines de semana y el resto acababa completándose desde enero en orden de fecha.
+        while libro.exceso(w) < 0:
+            libres = [f for f in datos.fechas
+                      if (w, f) not in plan and datos.disponible(w, f)
+                      and any(datos.elegible(w, s, f)[0] for s in refuerzos)]
+            if not libres:
                 break
-            if (w, f) in plan or not datos.disponible(w, f):
-                continue
-            for s in refuerzos:
-                # `legal.permite` es obligatorio aquí: esto NO hereda ningún patrón, se inventa un
-                # día de trabajo donde antes no había nada, así que la secuencia que crea con lo de
-                # alrededor hay que comprobarla entera.
-                if (datos.elegible(w, s, f)[0] and libro.cabe(w, s)
-                        and legal.permite(datos, plan, w, f, s)):
-                    plan[(w, f)] = s
-                    libro.apunta(w, s)
-                    puestas += 1
+            faltan = int(-libro.exceso(w) // min(datos.turnos[s].horas for s in refuerzos)) + 1
+            colocado = False
+            for f in esqueleto._uniformes(libres, min(faltan, len(libres))):
+                if libro.exceso(w) >= 0:
                     break
+                for s in refuerzos:
+                    # `legal.permite` es obligatorio: esto NO hereda ningún patrón, se inventa un
+                    # día de trabajo donde no había nada, así que la secuencia que crea con lo de
+                    # alrededor hay que comprobarla entera.
+                    if (datos.elegible(w, s, f)[0] and libro.cabe(w, s)
+                            and legal.permite(datos, plan, w, f, s)):
+                        plan[(w, f)] = s
+                        libro.apunta(w, s)
+                        puestas += 1
+                        colocado = True
+                        break
+            if not colocado:
+                break                                   # ninguno de los repartidos cabe: se deja
     return puestas
 
 
