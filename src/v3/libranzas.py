@@ -169,7 +169,7 @@ def candidatas(datos: Datos, plan: Plan, rit: Ritmo, trab: str, exceso: float,
 #  FASE 1 — plazas con cubridor designado
 # --------------------------------------------------------------------------- #
 def _rompe_costura(datos: Datos, plan: Plan, cubridor: str, dias: list[date],
-                   dentro: set[date], turnos: dict[date, str]) -> date | None:
+                   dentro: set[date], turnos: dict[date, str]) -> tuple[date, date] | None:
     """Primer día asumido cuya COSTURA con el horario propio del cubridor incumple el descanso.
 
     Solo se mira la costura, nunca el interior: los días de dentro de la ventana son el ciclo que
@@ -179,6 +179,8 @@ def _rompe_costura(datos: Datos, plan: Plan, cubridor: str, dias: list[date],
     noches que acaban a las 08:30 pegadas a un turno propio que empieza a las 07:00.
 
     El localizado no cuenta: es disponibilidad, no presencia, así que no ocupa el día contiguo.
+
+    Devuelve (día asumido, día vecino que estorba) para que quien llama pueda elegir qué ceder.
     """
     minimo = timedelta(hours=datos.config.descanso_minimo)
     for f in dias:
@@ -193,7 +195,7 @@ def _rompe_costura(datos: Datos, plan: Plan, cubridor: str, dias: list[date],
             dia = min(vecino, f)
             if (datos.intervalo(despues, dia + timedelta(days=1))[0]
                     - datos.intervalo(antes, dia)[1]) < minimo:
-                return f
+                return f, vecino
     return None
 
 
@@ -216,16 +218,25 @@ def _recortar(datos: Datos, plan: Plan, cubridor: str, unidad: Unidad,
     """
     dias = [f for f in unidad.dias if datos.disponible(cubridor, f)]
     descanso = [f for f in unidad.descanso if datos.disponible(cubridor, f)]
-    while dias:                                     # se quitan los días que rompen la costura
-        # `dentro` se recalcula en cada vuelta, y es imprescindible: al quitar un día deja de
-        # traspasarse, así que el cubridor CONSERVA su turno propio de ese día y pasa a ser un
-        # vecino que hay que mirar. Con un `dentro` fijo se quedaba marcado como interior y la
-        # costura que abría no se veía.
+    for _ in range(len(unidad.ventana) + 4):        # se resuelve la costura, con tope de vueltas
+        # `dentro` se recalcula en cada vuelta, y es imprescindible: un día que sale de la ventana
+        # deja de traspasarse, así que el cubridor CONSERVA su turno propio de ese día y pasa a ser
+        # un vecino que hay que mirar.
         dentro = set(dias) | set(descanso)
         malo = _rompe_costura(datos, plan, cubridor, dias, dentro, turnos)
         if malo is None:
             break
-        dias.remove(malo)
+        f, vecino = malo
+        if vecino not in dentro and datos.disponible(cubridor, vecino):
+            # Se estira la ventana para que LIBRE ese día suyo, en vez de renunciar a la plaza. Es
+            # lo natural: quien asume un ciclo hereda también su descanso, así que el turno propio
+            # que choca con él es precisamente el que sobra. Además deja ese turno como hueco, que
+            # el pool puede cubrir en lugar de hacer un refuerzo sin demanda.
+            descanso.append(vecino)
+        else:
+            dias.remove(f)
+        if not dias:
+            break
     if not dias:
         return None
     if len(dias) == len(unidad.dias) and len(descanso) == len(unidad.descanso):
