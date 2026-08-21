@@ -25,12 +25,17 @@ previo ya está dentro de ella, así que el solver empieza con un incumbente vá
 buscarlo.
 
   1. COBERTURA      — cuántas plazas quedan sin cubrir. Manda sobre todo lo demás.
-  2. EQUIDAD        — sábados, domingos y festivos de cada correturno contra la referencia del
+  2. LOCALIZADOS    — cuántas veces se aprovecha que una guardia de localización no ocupa el día
+                      siguiente. Es legal (no es presencia, es disponibilidad) pero el descanso
+                      debe respetarse salvo que sea la única manera de cubrir algo que si no
+                      quedaría vacío. Por eso va como COSTE justo debajo de la cobertura: entre dos
+                      soluciones que cubren lo mismo, siempre gana la que respeta el descanso.
+  3. EQUIDAD        — sábados, domingos y festivos de cada correturno contra la referencia del
                       grupo grande de su municipio (la misma que se les aplicó a los mixtos), MÁS
                       el rango dentro del pool. Sin el rango la métrica es ciega al reparto del
                       exceso —le da igual dos personas con 19 domingos que cuatro con 12— y además
                       deja al nivel 3 reordenar libremente dentro del empate.
-  3. FORMA SEMANAL  — el precio de sacar a alguien de la franja y zona que le fijó el paso C. Es
+  4. FORMA SEMANAL  — el precio de sacar a alguien de la franja y zona que le fijó el paso C. Es
                       preferencia, no restricción: si con ello se tapa un hueco que si no quedaría
                       vacío, el nivel 1 ya se lo ha llevado.
 
@@ -71,18 +76,22 @@ def _decimas(h: float) -> int:
     return int(round(h * DECIMAS))
 
 
-def _pares_incompatibles(datos: Datos, lineas: list[str]) -> set[tuple[str, str]]:
-    """Pares (línea de hoy, línea de mañana) que no respetan el descanso mínimo. Se calculan una
-    vez: son los mismos todos los días, porque dependen solo del reloj de cada turno."""
+def _pares_incompatibles(datos: Datos, lineas: list[str]) -> tuple[set, set]:
+    """Pares (línea de hoy, línea de mañana) que no respetan el descanso mínimo, separados en los
+    que se prohíben y los que solo se PENALIZAN por haber un localizado de por medio. Se calculan
+    una vez: dependen solo del reloj de cada turno, así que son los mismos todos los días."""
     minimo = timedelta(hours=datos.config.descanso_minimo)
     base = date(2001, 1, 1)
-    malos = set()
+    duros, exentos = set(), set()
     for a in lineas:
         fin = datos.intervalo(a, base)[1]
         for b in lineas:
             if datos.intervalo(b, base + timedelta(days=1))[0] - fin < minimo:
-                malos.add((a, b))
-    return malos
+                if datos.localizado(a) or datos.localizado(b):
+                    exentos.add((a, b))
+                else:
+                    duros.add((a, b))
+    return duros, exentos
 
 
 def resolver(datos: Datos, plan: Plan, libro: LibroHoras, rep: forma.Reparto,
@@ -129,13 +138,16 @@ def resolver(datos: Datos, plan: Plan, libro: LibroHoras, rep: forma.Reparto,
     lineas_dia: dict[date, list[str]] = defaultdict(list)
     for (s, f) in faltan:
         lineas_dia[f].append(s)
+    laxas: list = []                                              # solo posibles por la exención
     y: dict[tuple[str, date, str], cp_model.IntVar] = {}
     refuerzos_en_plan = {(w, f): s for (w, f), s in plan.items() if datos.turnos[s].dem == 0}
     for (w, f), previo in refuerzos_en_plan.items():
         plan.pop((w, f))                                          # se evalúa el día ya libre
         for s in lineas_dia.get(f, ()):
-            if datos.elegible(w, s, f)[0] and legal.permite(datos, plan, w, f, s):
+            if datos.elegible(w, s, f)[0] and legal.permite(datos, plan, w, f, s, True):
                 y[(w, f, s)] = modelo.NewBoolVar(f"y_{w}_{f:%m%d}_{s}")
+                if not legal.permite(datos, plan, w, f, s):
+                    laxas.append((w, f, s, "y"))
         plan[(w, f)] = previo
 
     # El mixto vuelve a coger todos sus días de la semana flexible menos uno.
@@ -146,9 +158,11 @@ def resolver(datos: Datos, plan: Plan, libro: LibroHoras, rep: forma.Reparto,
         # pegado a un finde de cuota de la semana anterior — un par que nadie había mirado.
         suyas = []
         for g, s in candidatos:
-            if not legal.permite(datos, plan, trab, g, s):
+            if not legal.permite(datos, plan, trab, g, s, True):
                 continue
             z[(trab, g, s)] = modelo.NewBoolVar(f"z_{trab}_{g:%m%d}")
+            if not legal.permite(datos, plan, trab, g, s):
+                laxas.append((trab, g, s, "z"))
             suyas.append(z[(trab, g, s)])
         if suyas:
             modelo.Add(sum(suyas) == min(cuantos, len(suyas)))
@@ -156,7 +170,7 @@ def resolver(datos: Datos, plan: Plan, libro: LibroHoras, rep: forma.Reparto,
         for g, a in candidatos:
             for k, b in candidatos:
                 if ((k - g).days == 1 and (trab, g, a) in z and (trab, k, b) in z
-                        and (a, b) in _pares_incompatibles(datos, [a, b])):
+                        and (a, b) in _pares_incompatibles(datos, [a, b])[0]):
                     modelo.AddAtMostOne([z[(trab, g, a)], z[(trab, k, b)]])
 
     por_dia: dict[tuple[str, date], list] = defaultdict(list)
@@ -220,10 +234,11 @@ def resolver(datos: Datos, plan: Plan, libro: LibroHoras, rep: forma.Reparto,
         # refuerzo del vecino, que puede haber cambiado también.
         for f, a in dias:
             for g, b in dias:
-                if (g - f).days == 1 and (a, b) in _pares_incompatibles(datos, [a, b]):
+                if (g - f).days == 1 and (a, b) in _pares_incompatibles(datos, [a, b])[0]:
                     modelo.AddAtMostOne([y[(w, f, a)], y[(w, g, b)]])
 
-    malos = _pares_incompatibles(datos, lineas)
+    duros, exentos = _pares_incompatibles(datos, lineas)
+    exenciones: list = []                                         # se cuentan en el nivel 2
     for w in pool:                                                # C4 — descanso entre jornadas
         suyos: dict[date, list[str]] = defaultdict(list)
         for f, s in por_trab[w]:
@@ -231,8 +246,15 @@ def resolver(datos: Datos, plan: Plan, libro: LibroHoras, rep: forma.Reparto,
         for f in sorted(suyos):
             for a in suyos[f]:
                 for b in suyos.get(f + timedelta(days=1), ()):
-                    if (a, b) in malos:
-                        modelo.AddAtMostOne([x[(w, f, a)], x[(w, f + timedelta(days=1), b)]])
+                    va, vb = x[(w, f, a)], x[(w, f + timedelta(days=1), b)]
+                    if (a, b) in duros:
+                        modelo.AddAtMostOne([va, vb])
+                    elif (a, b) in exentos:
+                        # Permitido, pero contado: `e` se activa si se usan los dos, y el nivel 2
+                        # lo minimiza. No hace falta forzar e=0 cuando no: se está minimizando.
+                        e = modelo.NewBoolVar(f"loc_{w}_{f:%m%d}")
+                        modelo.Add(va + vb - 1 <= e)
+                        exenciones.append(e)
 
     for w in pool:
         # C9 — jornada anual. Los correturnos llegan a cero, así que su presupuesto es entero.
@@ -263,7 +285,18 @@ def resolver(datos: Datos, plan: Plan, libro: LibroHoras, rep: forma.Reparto,
         return {}
     modelo.Add(cubiertas >= mejor)
 
-    # -- Nivel 2: equidad de sábados, domingos y festivos --------------------- #
+    # -- Nivel 2: apoyarse lo menos posible en el localizado -------------------- #
+    exenciones += [v for (w, f, s, cual) in laxas for v in [(y if cual == "y" else z)[(w, f, s)]]]
+    if exenciones:
+        total_loc = sum(exenciones)
+        _sembrar(modelo, {**x, **y, **z}, solucion)
+        mejor_loc, sl = _optimizar(modelo, total_loc, False, segundos, hilos, log,
+                                   "2 apoyos en localizado")
+        if mejor_loc is not None:
+            modelo.Add(total_loc <= mejor_loc)
+            solucion = sl
+
+    # -- Nivel 3: equidad de sábados, domingos y festivos --------------------- #
     refs = esqueleto.referencia_finde(datos, plan)
     desvios = []
     for clase in esqueleto.FINDE:
@@ -293,17 +326,17 @@ def resolver(datos: Datos, plan: Plan, libro: LibroHoras, rep: forma.Reparto,
         total_desvio = sum(desvios)
         _sembrar(modelo, {**x, **y, **z}, solucion)
         mejor2, s2 = _optimizar(modelo, total_desvio, False, segundos, hilos, log,
-                                "2 equidad de findes")
+                                "3 equidad de findes")
         if mejor2 is not None:
             modelo.Add(total_desvio <= mejor2)
             solucion = s2
 
-    # -- Nivel 3: respetar la forma semanal ----------------------------------- #
+    # -- Nivel 4: respetar la forma semanal ----------------------------------- #
     fuera = [x[(w, f, s)] for (w, f, s) in x
              if rep.forma.get((w, forma.lunes_de(f))) != forma.bloque_de(datos, rep.zonas, s)]
     if fuera:
         _sembrar(modelo, {**x, **y, **z}, solucion)
-        _, s3 = _optimizar(modelo, sum(fuera), False, segundos, hilos, log, "3 forma semanal")
+        _, s3 = _optimizar(modelo, sum(fuera), False, segundos, hilos, log, "4 forma semanal")
         if s3 is not None:
             solucion = s3
 

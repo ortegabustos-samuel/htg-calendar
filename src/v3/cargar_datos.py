@@ -160,6 +160,17 @@ class Datos:
             return "mañana"
         return "tarde" if t.hora_entrada.hour < 21 else "noche"
 
+    def localizado(self, turno_id: str) -> bool:
+        """Guardia de LOCALIZACIÓN: 24 h de reloj (entrada = salida) que computan 8. No es
+        presencia física sino disponibilidad, así que no ocupa el día siguiente — por eso los
+        patrones la encadenan con otros turnos sin contradicción.
+
+        Ojo con confundirla con el turno PARTIDO, que también dura más de lo que computa (10 h de
+        reloj con 2 h de interrupción) pero sí ocupa: la marca es la duración de 24 h, no que
+        duración > horas.
+        """
+        return self.duracion(turno_id) >= 24
+
     def duracion(self, turno_id: str) -> float:
         """Horas REALES que dura el turno de reloj a reloj. No es lo mismo que `Turno.horas`, que
         son las computadas por convenio (el partido y el de 24 h computan 8)."""

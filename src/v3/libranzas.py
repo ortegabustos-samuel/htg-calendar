@@ -34,7 +34,7 @@ from dataclasses import dataclass, field
 from datetime import date, timedelta
 from pathlib import Path
 
-from v3 import esqueleto, ritmo as ritmo_mod
+from v3 import esqueleto, legal, ritmo as ritmo_mod
 from v3.cargar_datos import Datos
 from v3.horas import EPS, LibroHoras
 from v3.ritmo import Ritmo
@@ -168,7 +168,36 @@ def candidatas(datos: Datos, plan: Plan, rit: Ritmo, trab: str, exceso: float,
 # --------------------------------------------------------------------------- #
 #  FASE 1 — plazas con cubridor designado
 # --------------------------------------------------------------------------- #
-def _recortar(datos: Datos, cubridor: str, unidad: Unidad,
+def _rompe_costura(datos: Datos, plan: Plan, cubridor: str, dias: list[date],
+                   dentro: set[date], turnos: dict[date, str]) -> date | None:
+    """Primer día asumido cuya COSTURA con el horario propio del cubridor incumple el descanso.
+
+    Solo se mira la costura, nunca el interior: los días de dentro de la ventana son el ciclo que
+    la plaza prescribe y van exentos por decisión —si era válido para el titular lo es para quien lo
+    hereda—. Pero el empalme con lo que el cubridor tenía justo antes o justo después de la ventana
+    no lo hereda de nadie: se lo inventa el pipeline al juntar dos horarios, y ahí es donde salían
+    noches que acaban a las 08:30 pegadas a un turno propio que empieza a las 07:00.
+
+    El localizado no cuenta: es disponibilidad, no presencia, así que no ocupa el día contiguo.
+    """
+    minimo = timedelta(hours=datos.config.descanso_minimo)
+    for f in dias:
+        s = turnos[f]
+        for vecino in (f - timedelta(days=1), f + timedelta(days=1)):
+            if vecino in dentro:
+                continue
+            otro = plan.get((cubridor, vecino))
+            if otro is None or datos.localizado(otro) or datos.localizado(s):
+                continue
+            antes, despues = ((otro, s) if vecino < f else (s, otro))
+            dia = min(vecino, f)
+            if (datos.intervalo(despues, dia + timedelta(days=1))[0]
+                    - datos.intervalo(antes, dia)[1]) < minimo:
+                return f
+    return None
+
+
+def _recortar(datos: Datos, plan: Plan, cubridor: str, unidad: Unidad,
               turnos: dict[date, str]) -> Unidad | None:
     """La misma unidad sin los días en que el cubridor no está. Devuelve None si no le queda ninguno.
 
@@ -186,12 +215,22 @@ def _recortar(datos: Datos, cubridor: str, unidad: Unidad,
     precisamente una forma de bajarlas — la fase 2 le ajusta lo que quede.
     """
     dias = [f for f in unidad.dias if datos.disponible(cubridor, f)]
+    descanso = [f for f in unidad.descanso if datos.disponible(cubridor, f)]
+    while dias:                                     # se quitan los días que rompen la costura
+        # `dentro` se recalcula en cada vuelta, y es imprescindible: al quitar un día deja de
+        # traspasarse, así que el cubridor CONSERVA su turno propio de ese día y pasa a ser un
+        # vecino que hay que mirar. Con un `dentro` fijo se quedaba marcado como interior y la
+        # costura que abría no se veía.
+        dentro = set(dias) | set(descanso)
+        malo = _rompe_costura(datos, plan, cubridor, dias, dentro, turnos)
+        if malo is None:
+            break
+        dias.remove(malo)
     if not dias:
         return None
-    if len(dias) == len(unidad.dias):
+    if len(dias) == len(unidad.dias) and len(descanso) == len(unidad.descanso):
         return unidad
-    return Unidad(dias=dias,
-                  descanso=[f for f in unidad.descanso if datos.disponible(cubridor, f)],
+    return Unidad(dias=dias, descanso=descanso,
                   horas=sum(datos.turnos[turnos[f]].horas for f in dias))
 
 
@@ -231,7 +270,7 @@ def _mejor_cubridor(datos: Datos, plan: Plan, libro: LibroHoras, reg: Registro, 
     for cubridor in cubridores:
         if cubridor == titular or _solapa(reg, cubridor, unidad):
             continue
-        suya = _recortar(datos, cubridor, unidad, turnos)
+        suya = _recortar(datos, plan, cubridor, unidad, turnos)
         if suya is None:
             continue
         coste = _coste_fase1(datos, plan, libro, reg, titular, cubridor, suya,

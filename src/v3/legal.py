@@ -30,21 +30,31 @@ from v3.cargar_datos import Datos
 Plan = dict[tuple[str, date], str]
 
 
-def descanso_ok(datos: Datos, plan: Plan, trab: str, f: date, turno: str) -> bool:
+def descanso_ok(datos: Datos, plan: Plan, trab: str, f: date, turno: str,
+                exento_localizado: bool = False) -> bool:
     """C4 — entre el fin de un turno y el inicio del siguiente median al menos
     `descanso_minimo` horas. Basta mirar el día anterior y el siguiente: ningún turno dura más de
-    24 h, así que no puede chocar con nada más lejano."""
+    24 h, así que no puede chocar con nada más lejano.
+
+    `exento_localizado` levanta la regla cuando uno de los dos es una guardia de localización: no
+    es presencia, así que ni exige descanso después ni lo consume antes. Va en FALSO por defecto a
+    propósito — el descanso debe respetarse salvo que sea la única forma de cubrir una demanda que
+    de otro modo quedaría vacía, y esa excepción se paga en el objetivo del paso D, no aquí.
+    """
     minimo = timedelta(hours=datos.config.descanso_minimo)
+    exento = exento_localizado and datos.localizado(turno)
     inicio, fin = datos.intervalo(turno, f)
 
     ayer = f - timedelta(days=1)
     previo = plan.get((trab, ayer))
-    if previo is not None and inicio - datos.intervalo(previo, ayer)[1] < minimo:
+    if (previo is not None and not (exento or (exento_localizado and datos.localizado(previo)))
+            and inicio - datos.intervalo(previo, ayer)[1] < minimo):
         return False
 
     manana = f + timedelta(days=1)
     posterior = plan.get((trab, manana))
-    if posterior is not None and datos.intervalo(posterior, manana)[0] - fin < minimo:
+    if (posterior is not None and not (exento or (exento_localizado and datos.localizado(posterior)))
+            and datos.intervalo(posterior, manana)[0] - fin < minimo):
         return False
     return True
 
@@ -69,11 +79,12 @@ def horas_7dias_ok(datos: Datos, plan: Plan, trab: str, f: date, turno: str) -> 
     return True
 
 
-def permite(datos: Datos, plan: Plan, trab: str, f: date, turno: str) -> bool:
+def permite(datos: Datos, plan: Plan, trab: str, f: date, turno: str,
+            exento_localizado: bool = False) -> bool:
     """¿Es legal añadir este turno a este trabajador este día, sobre el plan tal y como está?"""
     if (trab, f) in plan:                                       # C2
         return False
-    return (descanso_ok(datos, plan, trab, f, turno)
+    return (descanso_ok(datos, plan, trab, f, turno, exento_localizado)
             and dias_semana_ok(datos, plan, trab, f)
             and horas_7dias_ok(datos, plan, trab, f, turno))
 
@@ -96,7 +107,12 @@ def infracciones(datos: Datos, plan: Plan) -> list[str]:
             if (w, sig) in plan:
                 hueco = datos.intervalo(plan[(w, sig)], sig)[0] - datos.intervalo(plan[(w, f)], f)[1]
                 if hueco < minimo:
-                    fallos.append(f"C4 {w} {f:%d/%m}->{sig:%d/%m}: "
+                    # Se etiqueta aparte cuando hay una guardia de LOCALIZACIÓN de por medio: no es
+                    # presencia sino disponibilidad, así que ni exige descanso después ni lo
+                    # consume antes. Sigue apareciendo en el informe —el descanso debe respetarse
+                    # salvo que sea la única forma de cubrir— pero no es el mismo incumplimiento.
+                    loc = (datos.localizado(plan[(w, f)]) or datos.localizado(plan[(w, sig)]))
+                    fallos.append(f"{'C4-loc' if loc else 'C4'} {w} {f:%d/%m}->{sig:%d/%m}: "
                                   f"{hueco.total_seconds() / 3600:.1f} h de descanso")
 
         semanas: dict[date, int] = {}                           # C5
