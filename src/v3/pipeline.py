@@ -98,8 +98,12 @@ def main() -> int:
     # entren en el reparto: si no, lo único que se puede gastar son los refuerzos que prescriben los
     # patrones, que son precisamente los que hay que conservar.
     n = residuo.rellenar_refuerzos(datos, plan, libro)
-    canjes = residuo.canjear_refuerzos(datos, plan, libro)
-    print(f"  huecos cerrados soltando un refuerzo: {canjes}")
+    # El canje EN CADENA va primero: gasta el relleno de los correturnos, así que deja intacta la
+    # rotación del patrón. El simple va después, como último recurso, porque paga con el refuerzo
+    # que `patrones.csv` le prescribe al propio candidato.
+    cadena = residuo.canjear_en_cadena(datos, plan, libro)
+    simple = residuo.canjear_refuerzos(datos, plan, libro)
+    print(f"  huecos cerrados canjeando un refuerzo: {cadena} en cadena, {simple} directos")
     print(f"  refuerzos de calendario para completar jornada: {n}")
     residuo.resumen(datos, plan, libro)
 

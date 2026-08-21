@@ -66,7 +66,7 @@ from ortools.sat.python import cp_model
 
 from v3 import esqueleto, forma, legal
 from v3.cargar_datos import Datos
-from v3.horas import LibroHoras
+from v3.horas import EPS, LibroHoras
 
 Plan = dict[tuple[str, date], str]
 DECIMAS = 10                    # las horas son floats; el modelo trabaja en décimas de hora
@@ -460,6 +460,81 @@ def canjear_refuerzos(datos: Datos, plan: Plan, libro: LibroHoras) -> int:
             cerrados += 1
             break
     return cerrados
+
+
+def canjear_en_cadena(datos: Datos, plan: Plan, libro: LibroHoras) -> int:
+    """Cierra huecos con un canje A TRES BANDAS, sin gastar el refuerzo del propio candidato.
+
+    El escalón simple funciona, pero paga con el REF CAL del candidato — y cuando el candidato es un
+    trabajador de patrón, ese refuerzo se lo prescribe `patrones.csv` y forma parte de su rotación.
+    Medido: los correturnos, aun yendo primeros, no gastan ni uno, porque no pueden cubrir esos
+    huecos ni por capacidad ni por legalidad. La única forma de que pague el relleno del correturno
+    es encadenar:
+
+        hueco el día F, línea S      ->  lo cubre W, que no tiene horas
+        W trabaja S' el día G        ->  lo asume C, un correturno que ese día estaba de relleno
+        C suelta su REF CAL del G    ->  con eso W tiene las horas para el día F
+
+    La cobertura del día G no cambia (sale W, entra C), la del día F sube en uno, y desaparece un
+    refuerzo sin demanda. Las horas de W y de C quedan dentro de su objetivo, y la rotación del
+    patrón se conserva intacta.
+    """
+    refcal_dia: dict[date, list[str]] = defaultdict(list)
+    for (w, f), s in plan.items():
+        if datos.turnos[s].dem == 0 and datos.trabajadores[w].tipo == "correturno":
+            refcal_dia[f].append(w)
+    if not refcal_dia:
+        return 0
+    dias_de: dict[str, list[date]] = defaultdict(list)
+    for (w, f) in plan:
+        dias_de[w].append(f)
+
+    cerrados = 0
+    for (s, f) in forma.huecos(datos, plan):
+        if _cadena(datos, plan, libro, refcal_dia, dias_de, s, f):
+            cerrados += 1
+    return cerrados
+
+
+def _cadena(datos: Datos, plan: Plan, libro: LibroHoras, refcal_dia: dict, dias_de: dict,
+            s: str, f: date) -> bool:
+    for w in datos.trabajadores:
+        if (w, f) in plan or not datos.elegible(w, s, f)[0]:
+            continue
+        falta = datos.turnos[s].horas - (libro.objetivo(w) - libro.horas(w))
+        if falta <= 0 or not legal.permite(datos, plan, w, f, s):
+            continue
+        for g in dias_de.get(w, ()):
+            if g == f or not refcal_dia.get(g):
+                continue
+            propio = plan[(w, g)]
+            # Un REF CAL suyo no vale aquí: de eso se encarga el escalón simple, y además no
+            # libera a nadie de nada.
+            if datos.turnos[propio].dem == 0 or datos.turnos[propio].horas < falta:
+                continue
+            for c in list(refcal_dia[g]):
+                if c == w or not datos.elegible(c, propio, g)[0]:
+                    continue
+                relleno = datos.turnos[plan[(c, g)]].horas
+                if libro.horas(c) - relleno + datos.turnos[propio].horas > libro.objetivo(c) + EPS:
+                    continue
+                # Se vacía el día G de los dos para juzgar la secuencia que le queda a C.
+                ref_c, turno_w = plan.pop((c, g)), plan.pop((w, g))
+                if not legal.permite(datos, plan, c, g, propio):
+                    plan[(c, g)], plan[(w, g)] = ref_c, turno_w
+                    continue
+                libro.borra(c, ref_c)
+                plan[(c, g)] = propio
+                libro.apunta(c, propio)
+                libro.borra(w, turno_w)
+                plan[(w, f)] = s
+                libro.apunta(w, s)
+                refcal_dia[g].remove(c)
+                dias_de[w].remove(g)
+                dias_de[w].append(f)
+                dias_de[c].append(g) if g not in dias_de[c] else None
+                return True
+    return False
 
 
 # --------------------------------------------------------------------------- #
