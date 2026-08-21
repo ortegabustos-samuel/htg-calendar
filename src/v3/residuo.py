@@ -398,6 +398,71 @@ def _volcar(datos: Datos, plan: Plan, libro: LibroHoras, x: dict, y: dict, z: di
 
 
 # --------------------------------------------------------------------------- #
+#  Canje de refuerzos por cobertura real
+# --------------------------------------------------------------------------- #
+def canjear_refuerzos(datos: Datos, plan: Plan, libro: LibroHoras) -> int:
+    """Cierra huecos soltando un REF CAL del propio candidato en OTRA fecha del año.
+
+    El caso típico: el 1 de enero falta `VADN006` y hay 31 personas libres, capacitadas y legales
+    para hacerlo — pero todas están en 1776 h y se pasarían de jornada. No es un problema de
+    plantilla ni de legalidad, es de presupuesto. Y una de ellas tiene, en marzo, un REF CAL: un
+    turno de apoyo con demanda 0 que no cubre nada y que nadie echa de menos. Se le quita ese, y con
+    esas horas cubre el turno real de enero.
+
+    Sale gratis en todos los frentes: sus horas quedan igual, la cobertura sube en uno, y hay un
+    refuerzo menos. Hace falta una pasada aparte porque el CP-SAT del paso D no puede verlo — solo
+    tiene variables para los correturnos, y estos candidatos son trabajadores de patrón — y porque
+    el REF CAL entra después del modelo, así que el intercambio "menos relleno por más cobertura"
+    nunca llega a plantearse dentro.
+
+    Corre DESPUÉS del relleno, y no es indiferente: no todos los refuerzos valen lo mismo. Los de un
+    correturno los hemos puesto nosotros para completarle la jornada, mientras que los de un
+    trabajador de patrón se los prescribe `patrones.csv` y forman parte de su rotación. Se prefiere
+    gastar los primeros, así que los correturnos van delante en la lista de candidatos.
+    """
+    refuerzos_de: dict[str, list[date]] = defaultdict(list)
+    for (w, f), s in plan.items():
+        if datos.turnos[s].dem == 0:
+            refuerzos_de[w].append(f)
+    if not refuerzos_de:
+        return 0
+
+    # Los correturnos primero: su refuerzo es relleno nuestro, el del patrón es rotación suya.
+    candidatos = sorted(datos.trabajadores,
+                        key=lambda w: (datos.trabajadores[w].tipo != "correturno", w))
+    cerrados = 0
+    for (s, f) in forma.huecos(datos, plan):
+        for w in candidatos:
+            if (w, f) in plan or not datos.elegible(w, s, f)[0]:
+                continue
+            falta = datos.turnos[s].horas - (libro.objetivo(w) - libro.horas(w))
+            if falta > 0:
+                # Se sueltan refuerzos suyos, empezando por los más lejanos del hueco para no
+                # remover la misma semana. Solo hacen falta los justos para que quepa el turno.
+                sueltos = sorted(refuerzos_de.get(w, []), key=lambda g: -abs((g - f).days))
+                usados: list[date] = []
+                for g in sueltos:
+                    if falta <= 0:
+                        break
+                    falta -= datos.turnos[plan[(w, g)]].horas
+                    usados.append(g)
+                if falta > 0:
+                    continue                              # no le llega ni soltándolos todos
+            else:
+                usados = []
+            if not legal.permite(datos, plan, w, f, s):
+                continue
+            for g in usados:
+                libro.borra(w, plan.pop((w, g)))
+                refuerzos_de[w].remove(g)
+            plan[(w, f)] = s
+            libro.apunta(w, s)
+            cerrados += 1
+            break
+    return cerrados
+
+
+# --------------------------------------------------------------------------- #
 #  Relleno de horas con REF CAL
 # --------------------------------------------------------------------------- #
 def rellenar_refuerzos(datos: Datos, plan: Plan, libro: LibroHoras) -> int:

@@ -90,7 +90,12 @@ def main() -> int:
     residuo.resolver(datos, plan, libro, rep, flexibles,
                      segundos=a.segundos, hilos=a.hilos, log=a.log,
                      nivel2=not a.sin_nivel2)
+    # El canje va DESPUÉS del relleno para que los refuerzos de los correturnos estén ya puestos y
+    # entren en el reparto: si no, lo único que se puede gastar son los refuerzos que prescriben los
+    # patrones, que son precisamente los que hay que conservar.
     n = residuo.rellenar_refuerzos(datos, plan, libro)
+    canjes = residuo.canjear_refuerzos(datos, plan, libro)
+    print(f"  huecos cerrados soltando un refuerzo: {canjes}")
     print(f"  refuerzos de calendario para completar jornada: {n}")
     residuo.resumen(datos, plan, libro)
 
