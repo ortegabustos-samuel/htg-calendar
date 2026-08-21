@@ -180,6 +180,12 @@ def _rompe_costura(datos: Datos, plan: Plan, cubridor: str, dias: list[date],
 
     El localizado no cuenta: es disponibilidad, no presencia, así que no ocupa el día contiguo.
 
+    Se mira también el tope de HORAS por ventana de 7 días, y ahí hay que hilar fino: el bloque de
+    noche por sí solo son 77 h contra un tope de 48, así que exigir C6 a secas haría fallar cualquier
+    ventana que lo contenga y el recorte se comería el traspaso entero. Lo que se busca es otra cosa:
+    una ventana que se pase Y que ademas mezcle turnos PROPIOS del cubridor. Esos son los que
+    sobran — el ciclo que hereda le da derecho a descansar esos días.
+
     Devuelve (día asumido, día vecino que estorba) para que quien llama pueda elegir qué ceder.
     """
     minimo = timedelta(hours=datos.config.descanso_minimo)
@@ -196,6 +202,21 @@ def _rompe_costura(datos: Datos, plan: Plan, cubridor: str, dias: list[date],
             if (datos.intervalo(despues, dia + timedelta(days=1))[0]
                     - datos.intervalo(antes, dia)[1]) < minimo:
                 return f, vecino
+
+    asumidos = set(dias)
+    for ancla in dias:
+        for arranque in range(-6, 1):
+            inicio = ancla + timedelta(days=arranque)
+            ventana = [inicio + timedelta(days=i) for i in range(7)]
+            if not (asumidos & set(ventana)):
+                continue
+            propios = [g for g in ventana if g not in dentro and (cubridor, g) in plan]
+            if not propios:
+                continue                        # solo el bloque heredado: eso va pactado
+            total = (sum(datos.turnos[turnos[g]].horas for g in ventana if g in asumidos)
+                     + sum(datos.turnos[plan[(cubridor, g)]].horas for g in propios))
+            if total > datos.config.horas_max_semana:
+                return ancla, max(propios, key=lambda g: datos.turnos[plan[(cubridor, g)]].horas)
     return None
 
 
