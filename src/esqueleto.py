@@ -1,5 +1,5 @@
 """
-esqueleto.py — Paso A del pipeline v3: el cuadrante base, sin ninguna decisión libre.
+esqueleto.py — Paso A del pipeline: el cuadrante base, sin ninguna decisión libre.
 
 Pinta lo que los datos YA prescriben, y nada más:
 
@@ -32,8 +32,8 @@ from __future__ import annotations
 from collections import Counter, defaultdict
 from datetime import date, timedelta
 
-from v3 import legal
-from v3.cargar_datos import DIAS, LIBRE, Datos
+import legal
+from cargar_datos import DIAS, LIBRE, Datos
 
 
 def ancla(datos: Datos) -> date:

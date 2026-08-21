@@ -34,10 +34,10 @@ from dataclasses import dataclass, field
 from datetime import date, timedelta
 from pathlib import Path
 
-from v3 import esqueleto, legal, ritmo as ritmo_mod
-from v3.cargar_datos import Datos
-from v3.horas import EPS, LibroHoras
-from v3.ritmo import Ritmo
+import esqueleto, legal, ritmo as ritmo_mod
+from cargar_datos import Datos
+from horas import EPS, LibroHoras
+from ritmo import Ritmo
 
 Plan = dict[tuple[str, date], str]
 

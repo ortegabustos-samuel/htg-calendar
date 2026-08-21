@@ -26,7 +26,7 @@ from __future__ import annotations
 from collections import Counter
 from datetime import date, timedelta
 
-from v3.cargar_datos import Datos
+from cargar_datos import Datos
 
 Plan = dict[tuple[str, date], str]
 

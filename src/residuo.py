@@ -64,9 +64,9 @@ from datetime import date, timedelta
 
 from ortools.sat.python import cp_model
 
-from v3 import esqueleto, forma, legal
-from v3.cargar_datos import Datos
-from v3.horas import EPS, LibroHoras
+import esqueleto, forma, legal
+from cargar_datos import Datos
+from horas import EPS, LibroHoras
 
 Plan = dict[tuple[str, date], str]
 DECIMAS = 10                    # las horas son floats; el modelo trabaja en décimas de hora

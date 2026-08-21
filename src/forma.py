@@ -31,7 +31,7 @@ from dataclasses import dataclass
 from datetime import date, timedelta
 from pathlib import Path
 
-from v3.cargar_datos import Datos
+from cargar_datos import Datos
 
 Plan = dict[tuple[str, date], str]
 Bloque = tuple[str, str]                # (franja, zona)

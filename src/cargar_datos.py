@@ -1,15 +1,15 @@
 """
 cargar_datos.py — Capa de carga de datos del generador de cuadrantes.
 
-Lee config.toml y los 6 CSV de data/input/, deriva lo que el modelo necesita (duración,
-tipo, operatividad) y expone consultas:
+Lee config.toml y los 6 CSV de data/input/, deriva lo que el generador necesita (duración,
+intervalo real, franja, localizado, operatividad) y expone consultas:
   * opera(turno, fecha)          — ¿la línea opera ese día? (festivo manda sobre día de semana)
   * disponible(trab, fecha)      — ¿no está de vacaciones?
   * tipo_dia(fecha, municipio)   — LV / SAB / DOM / FEST
   * elegible(trab, turno, fecha) — (elegible?, es_refuerzo?)  a partir de capacidades
 
-Base sobre la que se apoyan modelo.py / validar_datos.py. Ejecutado como script imprime
-un resumen y comprobaciones de la instancia cargada.
+Base sobre la que se apoya todo el generador. Ejecutado como script imprime un resumen y
+comprobaciones de la instancia cargada.
 """
 from __future__ import annotations
 
@@ -19,7 +19,7 @@ from pathlib import Path
 import csv
 import tomllib
 
-RAIZ = Path(__file__).resolve().parents[2]
+RAIZ = Path(__file__).resolve().parents[1]
 DATA = RAIZ / "data" / "input"
 
 DIAS = ["lun", "mar", "mie", "jue", "vie", "sab", "dom"]   # patrones.csv; índice = weekday()
@@ -69,7 +69,7 @@ class Config:
     horas_max_semana: int = 48              # máx. horas en cualquier ventana de 7 días       — C6
     dias_max_semana: int = 6                # máx. días trabajados por semana ISO             — C5
     ratio_rigido: float = 0.6               # a partir de qué descanso/trabajo una plaza no se
-                                            # fracciona al ceder horas (ver v3/ritmo.py)
+                                            # fracciona al ceder horas (ver ritmo.py)
 
 @dataclass
 class Capacidad:
@@ -491,7 +491,7 @@ def cargar() -> Datos:
         # Fila de arranque de cada trabajador de patrón: `fila_inicial` si la declara, orden
         # alfabético si no. Única fuente para todo lo que prescribe la rotación.
         offsets=offsets_patron(trabajadores, patrones),
-        # Año y parámetros del convenio (config.toml). Única fuente: el modelo, el pulido, la
-        # salida, el diagnóstico y el validador leen todos de aquí.
+        # Año y parámetros del convenio (config.toml). Única fuente: todas las etapas, la salida
+        # y el validador leen de aquí.
         config=_cargar_config(),
     )

@@ -27,7 +27,7 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass
 from datetime import date
 
-from v3.cargar_datos import Datos
+from cargar_datos import Datos
 
 Plan = dict[tuple[str, date], str]
 

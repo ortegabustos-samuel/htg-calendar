@@ -1,112 +1,125 @@
 # Resumen del Proyecto
-Se trata de un proyecto desarrollado en Python destinado al desarrollo de una herramienta automatica
-capaz de con los datos de entrada de un Plan Funcional donde se establecen las demandas de turno semanales
-y que se van a extender a lo largo del año, una Plantilla de trabajadores y unas fechas de festivos elaborar 
-de forma óptima o lo más cercano a la optimalidad un calendario provisional donde se establecen los turnos asignados
-a cada trabajador para cada día del año.
 
-Stack tecnologíco
-- Python 
-- OR-TOOLS y su librería en python
-- Otras posibles librerías
+Herramienta en Python que, a partir de un Plan Funcional (demandas de turno semanales extendidas a
+todo el año), una plantilla de trabajadores y un calendario de festivos, elabora un cuadrante anual
+provisional con el turno asignado a cada trabajador para cada día.
 
-Meta principal:
-Obtener un calendario anual que maximice la cobertura de turnos, busque la equidad de reparto entre trabajadores y respete
-la legalidad y acuerdos preconcedidos
+**Meta**: maximizar la cobertura de turnos, repartir con equidad entre trabajadores y respetar la
+legalidad y los acuerdos preconcedidos.
 
+Stack: Python · OR-Tools (CP-SAT) · openpyxl.
 
-# Arquitectura
-./
-   data/
-      input/
-      output/
-   src/
+## Arquitectura
 
-El programa principal esta en src
-Los ficheros de entrada estan en input y contamos con diferentes fuentes (trabajadores,turnos,festivos..)
-El calendario de salida debe aparecer en xlsx en output
+```
+data/input/     config.toml + los 6 CSV (turnos, trabajadores, festivos,
+                calendarios_municipio, capacidades, patrones)
+data/output/    calendario.xlsx · horas.csv · cesiones.csv · forma_pool.csv
+src/            el generador completo
+```
 
-## Environment
+Punto de entrada único: **`python3 src/pipeline.py`** (~4 minutos). Con `--sin-validar` se salta la
+validación de entrada; `--segundos` fija el tiempo de solver por nivel del paso D.
 
-Python env is the conda env `ortools_env`
+Entorno conda: **`ortools_env`**.
 
+## El dominio
 
-## Desarrollo
+Las **vacaciones** vienen en `trabajadores.csv`, son inamovibles y no se pintan como turno: son
+ausencia (`Datos.disponible`).
 
-Para la generación del cuadrante se siguen una serie de pasos secuenciales para reducir al optimizador el número de variables
-libres y de esa manera reducir el tamaño del problema. Por un lado iniciamos superponiendo las vacaciones de todos los trabajadores
-estas aparecen en el fichero `trabajadores.csv`, estas son inamovibles y deben ser respetadas y marcadas como días de vacaciones.
-Por construcción los trabajadores cuentan con más horas que las que marca el convenio (actualmente 1776 pueden aumentar o reducir).
-Estos excesos deben generar días libres a lo largo de todo el año en nuestros trabajadores, debemos buscar la manera de repartirlos de 
-forma que minimicen la degradación del cuadrante, es decir, que su vacio no genere coberturas que a su vez generen huecos y demás.
-En la plantilla contamos con una serie de trabajadores fijos cuyo turno es constante de lunes a viernes, estos generalmente tendrán exceso
-y por lo tanto cuando descansen por exceso de horas su turno ha de ser cubierto
-Otro tipo de trabajadores son los de patron que siguen una estructura de patrones semanales definida en `patrones.csv` que van rotando con sus compañeros dentro del patrón, en su mayoría estos patrones puede que generen o no exceso, en ese caso deberán ser cubiertos, ten en cuenta que algunos de estos patrones cuentan con un descanso que debe ser traspasado a su cubridor no únicamente el turno.
-Por otro lado existen mixtos que tienen determinados una serie de turnos que pueden hacer como aparecen en `capacidades.csv`, pueden trabajar cualquier día de la semana pero deben respetar el número maximo de horas, descanso semanal etc..
-Finalmente los correturnos encargados principalmente de cubrir el resto de turnos sobrantes, cubrir vacaciones, sus turnos son más aleatorios aunque en la medida de lo posible deberíamos garantizarles una semana con un horario similar (mañana, tarde) y cierta estabilidad
-en localizacion.
+Por construcción **casi todo el mundo tiene más horas de las que marca el convenio** (1776, en
+`config.toml`). Ese exceso hay que devolverlo en días libres repartidos por el año, y cada día que
+se libera abre un hueco que alguien tiene que cubrir. **Ceder tiempo es la mecánica central del
+problema**, no un caso raro.
 
-Por otro lado los objetivos de nuestro programa deben ser sobre todo garantizar la cobertura de turnos anuales, además de ello debemos respetar las medidas legales marcadas mediante restricciones en base al convenio, sin embargo pueden existir concesiones, si los patrones 
-rompen alguna de estas medidas, es indiferente puesto que estarán acordadas con los trabajadores.
+Cuatro naturalezas de trabajador, y confundirlas cuesta caro:
 
-Otro objetivo secundario es garantizar la equidad en horas trabajadas, todos tienen ahora mismo un valor máximo de 1776, puede ser alterado año a año, pero todos los trabajadores deben buscar estar en esas 1776 horas y minimizar las discrepancias entre ellos. Además de aquellos que hagan sabados entran tambien en el grupo de repartición de sabados, lo mismo ocurre con domingos y festivos, deben estar medianamente repartidos entre los grupos de la plantilla, lógicamente por construccion existen patrones que generan más o menos por ello se realiza esa separación en grupos.
-Los correturnos entran en las equidades de Valladolid en este caso y veremos como generalizar la herramienta, además estos ya que absorben los turnos sobrantes, existirá epocas del año donde su carga de trabajo sea menor y no garanticen llegar a las 1776 horas, para ello debemos de asignarles Refuerzos de Calendario tanto de mañana como de tarde que vienen definido en `turnos.csv`
+- **fijo** — una línea constante de lunes a viernes (`linea` en `trabajadores.csv`).
+- **patrón** — sigue una matriz de rotación semanal (`patrones.csv`): una fila por semana, avanza
+  una fila cada semana desde el lunes ancla, y cada uno arranca en la fila que declara
+  `fila_inicial`. Esa columna es lo que da continuidad entre años. Todos los del grupo recorren las
+  mismas filas por ciclo, así que la carga es **casi** equitativa por construcción — pero solo
+  casi: con 38 filas y 52 semanas el año no es múltiplo del ciclo.
+- **mixto** — **no es pool**: es un cuasi-fijo. Sus capacidades ya declaran dos naturalezas, unas
+  líneas con `lv=1` de las que es titular de hecho y otras con `sab/dom/fest=1` a las que sale
+  puntualmente. Sus fines de semana son **cuota de equidad**, no holgura.
+- **correturno** — el único pool rodante. Absorbe lo que sobra. Se le garantiza una semana coherente
+  (misma franja y zona) y, cuando tras cubrir todo lo real le sobran horas, se le completan con
+  **refuerzos de calendario** (`REF CAL`, líneas con `dem=0`: horas de apoyo sin cobertura detrás).
 
-**Two-layer design.** A worker of type `patron` has a weekly rotation matrix (`patrones.csv`):
-row = one week, the worker advances one row per week from a Monday anchor, and everyone in the
-group starts on a different row — the one their `fila_inicial` declares in `trabajadores.csv`
-(`cargar_datos.offsets_patron` resolves it, falling back to alphabetical order within the group
-when the column is absent). That column is what carries the rotation across year boundaries. This *pattern* is the frozen, fair-by-construction skeleton
-(everyone in a group cycles through the same rows over a cycle → identical load). The optimizer
-only decides *perturbations* from that skeleton (vacation gaps, coverage holes, night-shift
-handovers) — see C10 in `MODELO.md`. This is why the problem is tractable at annual scale: only
-the (worker, day) pairs actually touched by something get freed as CP-SAT variables; everything
-else is pinned to the pattern.
+**Los patrones se dan por válidos como están.** Incumplen el convenio por acuerdo con los
+trabajadores —la semana del binomio de noche son 77 h en 7 días contra un tope de 48— y eso no se
+discute. Al heredar un bloque de patrón no se comprueba nada: si era válido para el titular lo es
+para quien lo hereda.
 
-**Pipeline** (`generar_anual.py` orchestrates all of it):
+## El pipeline
 
-1. `validar_datos.py` — five-level check (config → format → references → contract → feasibility)
-   over `config.toml` + the 6 CSVs; `generar_anual.py` refuses to start on any ERROR.
-2. `cargar_datos.py` (`cargar()`) — loads `config.toml` (year + convenio limits: `horas_objetivo`,
-   `rmin`, `hmax7`, `cmax`, `cmax_pool` — reachable everywhere as `datos.config`, the single source;
-   `anio` is mandatory and never inferred) and the 6 CSVs into `Datos`, derives everything not
-   explicit in the CSVs: shift duration/type/night-hours from entrada/salida, per-worker
-   capacities from patterns and fixed lines (`_anadir_capacidades_patron`,
-   `_anadir_capacidad_fijo`, `_anadir_capacidades_correturno`), and equity groups
-   (`_derivar_grupos_equidad`).
-3. `modelo.py` (`resolver_anual()`) — the rolling horizon: solves consecutive 14-day windows
-   with a 28-day frozen "tail" for continuity, stitched by (a) a 12h-rest boundary condition
-   between windows and (b) accumulated equity/hours "books" (`offset`, `offset_horas`) so
-   fairness is computed *across* the whole year even though it's solved in pieces. Also builds
-   `calendario_cesiones` (Nivel 0: a precomputed calendar spreading night-binomial free blocks
-   across the year) and `reserva_cubridores` before
-   rolling, and `rellenar_refuerzos` after, to fill REF CAL (priority-0 "wildcard"/filler) slack
-   with real demand.
-4. `pulido.py` — post-solve passes, in this order: turn leftover REF CAL filler into real coverage,
-   same day (`aprovechar`) and then against the whole year (`canjear` — drops REF CAL from *any*
-   month to free annual-hours budget so a covered-nowhere shift fits, since a priority-0 filler is
-   always worth less than a real shift); then equity, swapping whole *weeks* between compatible
-   workers to equalize weekends/holidays (`pulir`, which also absorbs the days the two coverage
-   passes moved around); then schedule coherence (`coherencia`). Runs strictly after the model
-   because it can treat "coverage and legality invariant" as a hard constraint instead of a price —
-   trades the model's objective is structurally forbidden from making (patrón workers are nearly
-   free to move in the model's low-priority equity term, since PESO_DEV dominates it), and because
-   the rolling horizon can never see a January filler and an August hole in the same window.
-5. `salida.py` — turns the final `plan` dict into `data/output/calendario.xlsx` (worker × day
-   grid, colored by shift type) + `metricas_trabajadores.csv` + `informe_cobertura.csv`, plus a
-   console summary.
+Cada paso deja el cuadrante ejecutable de punta a punta y verificable abriendo el Excel. **No hay
+tests**: la verificación es la salida, y el pipeline se audita solo en cada ejecución.
 
-`diagnostico.py` is independent of the solve path — pure read-only analysis of `Datos` (FTE
-balance, hours each pattern prescribes vs. the annual objective, legal exemptions, per-line
-coverage) used to understand *why* a dataset behaves the way it does before touching the model.
+**A · `esqueleto.py`** — patrones rotados, fijos y vacaciones. Sin ninguna decisión libre.
 
-**The objective is lexicographic, not a weighted sum** (`MODELO.md` §6): P1 coverage (weighted
-by shift `prioridad` — 0 = wildcard filler REF CAL never a coverage target, 1 = normal patrón is
-untouchable, ≥2 = critical enough to pull a worker out of their pattern) ≫ P2 fairness of
-night/weekend/holiday load (fixed workers excluded) ≫ P3 location stability ≫ P4 correturno/
-overtime cost ≫ P5 deviation from the frozen pattern. Each level is solved and pinned
-(`obj_i ≤ best_i`) before the next is optimized — see `modelo.py`'s `PESO_COBERTURA` /
-`PESO_CRITICO` / `PESO_DEV` (and `PESO_DEV_COMODIN`, the same cost when what the rotation
-prescribes that day is a REF CAL: filler is never worth defending against real coverage)
-constants for how the three coverage tiers relate to the cost of
-breaking a pattern.
+**A2 · `esqueleto.colocar_mixtos`** — los mixtos ocupan su línea L-V con prioridad sobre los
+correturnos y sacan su cuota de fines de semana, derivada del grupo de patrón más numeroso de su
+municipio. Al darles un día de finde se les suelta uno entre semana, que es literalmente lo que hace
+el planificador a mano.
+
+**B · `libranzas.py`** — ceder el exceso de horas. La unidad se **deriva** del ritmo de cada patrón
+(`ritmo.py`): el ratio descanso/trabajo. Ratio alto (noches y UVI dan 1,00) → la plaza no se
+fracciona y se cede el ciclo entero; ratio bajo → **días sueltos**, nunca semanas, porque cinco días
+seguidos de una línea no los tapa nadie. Las plazas con cubridor designado (`v>=1`) no se dejan
+solas: se **traspasan**, tanto por ausencia del titular como por cesión. El cubridor hereda el ciclo
+completo, turnos y descanso, y lo que él tuviera esos días queda como hueco.
+
+**C · `forma.py`** — franja y zona semanal de los correturnos, derivadas de la demanda real de esa
+semana. No asigna turnos: acota el dominio del paso D.
+
+**D · `residuo.py`** — un solo **CP-SAT anual** (~24.000 booleanas) sobre lo que queda. Objetivo
+**lexicográfico**, cada nivel clavado antes del siguiente y **sembrado con la solución del
+anterior** — sin ese sembrado el nivel de equidad no resuelve ni en 600 s:
+
+1. cobertura · 2. apoyos en localizado · 3. equidad de findes · 4. forma semanal
+
+Después, fuera del modelo: relleno con REF CAL repartido por el año, y el **canje de refuerzos**
+—un refuerzo no cubre nada, así que se suelta para que su dueño cubra un turno real, directamente o
+encadenando con un correturno que ese día estaba de relleno—.
+
+**E · `equidad.py`** — iguala findes dentro de cada grupo intercambiando semanas ISO y días sueltos,
+con la cobertura como invariante.
+
+## Restricciones
+
+Solo las básicas, en `legal.py` y definidas una vez: **C4** descanso mínimo entre turnos, **C5** máx.
+días por **semana ISO** (permite rachas >6 a caballo de dos semanas, a sabiendas), **C6** máx. horas
+en cualquier ventana **deslizante** de 7 días. C2 (un turno/día) y C3 (cualificación) salen gratis
+por cómo están construidos el plan y `Datos.elegible`.
+
+**`legal` se aplica donde el pipeline INVENTA una secuencia, y solo ahí** — nunca sobre un ciclo de
+patrón heredado.
+
+**Localizado**: las guardias de 24 h (entrada = salida, computan 8) son de localización, no de
+presencia. No ocupan el día siguiente. Ojo: no vale "dura más de lo que computa", que también coge
+los turnos **partidos** (10 h de reloj con 2 h de interrupción), que sí ocupan. La exención de C4 va
+en falso por defecto y se paga como nivel del objetivo: solo tiene sentido para cubrir demanda que
+de otro modo quedaría vacía.
+
+## La auditoría
+
+`legal.auditar` corre en cada ejecución. **La legalidad no se mide contando: se mide por FORMAS** —el
+par de turnos consecutivos, la ventana de 7 días—. El cuadrante nace con ~1.100 incumplimientos
+pactados por los propios patrones; lo que importa es cuántos tienen una forma que el **esqueleto no
+produce por su cuenta**, porque esos se los ha inventado el pipeline. Se comprueba también la
+**integridad**: nadie asignado en vacaciones, ni en un día que su línea no opera, ni sin capacidad,
+ni por encima de la demanda.
+
+## Preguntas abiertas con la empresa
+
+- Los huecos que quedan son de plantilla, no de algoritmo: el **UVI tiene ~1.760 h sin usar** (su
+  norma es que solo cubre sustituyendo su propio turno) y ampliar `capacidades.csv` es la otra
+  palanca.
+- **H tiene un único cubridor designado** y libra el día que su titular entra de vacaciones.
+- El mixto **09303176K** declara una sola línea de fin de semana y ninguna con domingo, así que no
+  puede equipararse con sus compañeros.
+- **Cuadrante de Navidad (Art. 28)**: es la única regla del convenio que no es estructural de los
+  patrones y que nadie comprueba.

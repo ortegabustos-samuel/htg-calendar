@@ -45,10 +45,10 @@ from __future__ import annotations
 from collections import Counter, defaultdict
 from datetime import date, timedelta
 
-from v3 import esqueleto, legal
-from v3.cargar_datos import Datos
-from v3.horas import EPS, LibroHoras
-from v3.ritmo import grupo_de
+import esqueleto, legal
+from cargar_datos import Datos
+from horas import EPS, LibroHoras
+from ritmo import grupo_de
 
 Plan = dict[tuple[str, date], str]
 CLASES = ("SAB", "DOM", "FEST")

@@ -11,7 +11,7 @@ Revisa en cuatro niveles, de lo que impide leer a lo que solo es sospechoso:
 No corrige nada, solo informa: el arreglo va en el CSV, que es la fuente de verdad.
 Sale con código 1 si hay algún ERROR.
 
-Uso:  python3 src/v3/validar_datos.py
+Uso:  python3 src/validar_datos.py
 """
 from __future__ import annotations
 
@@ -23,7 +23,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from v3.cargar_datos import DATA, DIAS, LIBRE, _cargar_config, cargar          # noqa: E402
+from cargar_datos import DATA, DIAS, LIBRE, _cargar_config, cargar          # noqa: E402
 
 # Columnas que cada fichero DEBE traer. Las opcionales (factor_jornada, linea, municipio,
 # fila_inicial, dem) no se exigen: el cargador les da valor por defecto.
@@ -276,8 +276,12 @@ def revisar_contrato(crudo: dict[str, list[dict]], inf: Informe) -> None:
             inf.error(f"turnos: {s} tiene dem='{crudo_dem}'; se espera un entero >= 0")
         else:
             dem = int(crudo_dem) if crudo_dem else 1
-            if dem == 0:
-                inf.aviso(f"turnos: {s} tiene demanda 0; nadie lo cubrirá nunca")
+            if dem == 0 and not s.upper().startswith("REF"):
+                # Demanda 0 es la marca de un REFUERZO: horas de apoyo sin cobertura detrás, con
+                # las que se completa la jornada de quien se queda corto. En esas líneas es lo
+                # esperado y no hay nada que avisar; en cualquier otra, sí.
+                inf.aviso(f"turnos: {s} tiene demanda 0, así que no es una plaza a cubrir sino un "
+                          f"refuerzo de horas; si no era la intención, revísalo")
             elif not any(r[c] == "1" for c in ("lv", "sabado", "domingo", "festivo")):
                 inf.aviso(f"turnos: {s} pide {dem} persona(s) pero no opera ningún tipo de día")
 
@@ -406,13 +410,10 @@ def revisar_viabilidad(inf: Informe) -> None:
     vivían en `Turno.prioridad`/`Turno.tipo`, que `cargar_datos.py` ya no deriva — se está
     replanteando cómo expresar la criticidad, así que este nivel se queda con lo que sí puede
     medir sin inventar semántica nueva."""
-    from modelo import rango_fechas                                       # noqa: PLC0415
-
     d = cargar()
     objetivo = d.config.horas_objetivo
     anio = d.config.anio
-    ini = date(anio, 1, 1) - timedelta(days=date(anio, 1, 1).weekday())
-    fechas = rango_fechas(ini, date(anio, 12, 31))
+    fechas = d.fechas
     inf.nota(f"horizonte: año {anio} (config.toml), objetivo {objetivo} h")
 
     # Los festivos tienen que ser del año que se resuelve; si no, el cuadrante sale con los

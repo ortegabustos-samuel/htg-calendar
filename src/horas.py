@@ -1,5 +1,5 @@
 """
-horas.py — El libro de horas del pipeline v3.
+horas.py — El libro de horas del generador.
 
 Contador ÚNICO de horas trabajadas por persona, que consultan y actualizan todas las etapas: las
 reglas antes de asignar, y el CP-SAT como cota superior. Nace de una lección concreta del intento
@@ -22,7 +22,7 @@ from collections import defaultdict
 from datetime import date
 from pathlib import Path
 
-from v3.cargar_datos import Datos
+from cargar_datos import Datos
 
 EPS = 1e-9          # las horas son floats leídos del CSV: comparar con holgura, no con ==
 
@@ -90,6 +90,27 @@ def escribir_csv(datos: Datos, plan: dict[tuple[str, date], str], libro: LibroHo
             escritor.writerow([w, datos.trabajadores[w].tipo, _grupo(datos, w), dias[w],
                                f"{libro.horas(w):.1f}", f"{libro.objetivo(w):.0f}",
                                f"{libro.exceso(w):+.1f}"])
+
+
+def balance(datos: Datos) -> None:
+    """¿Cuadra la aritmética gruesa antes de resolver nada?
+
+    Horas que EXIGE la demanda del año frente a las que APORTA la plantilla a su jornada objetivo.
+    Si el balance sale negativo, el cuadrante es imposible sin huecos o sin pasarse del objetivo: es
+    un problema de PLANTILLA, no de solver, y conviene saberlo antes de gastar cuatro minutos de
+    cómputo. Las líneas de demanda 0 (los refuerzos) no cuentan: no son demanda, son relleno.
+    """
+    objetivo = datos.config.horas_objetivo
+    exige = sum(sum(1 for f in datos.fechas if datos.opera(s, f)) * t.dem * t.horas
+                for s, t in datos.turnos.items() if t.dem > 0)
+    capacidad = sum(objetivo * w.factor_jornada for w in datos.trabajadores.values())
+    n = len(datos.trabajadores)
+    print(f"\nBALANCE ANUAL — demanda {exige:,.0f} h frente a {capacidad:,.0f} h de plantilla "
+          f"({n} trabajadores a {objetivo} h)")
+    print(f"  holgura {capacidad - exige:+,.0f} h ({(capacidad - exige) / objetivo:+.1f} FTE) · "
+          f"media exigida {exige / n:,.0f} h por trabajador")
+    if capacidad < exige:
+        print("  *** DÉFICIT: no hay horas para la demanda. Habrá huecos o exceso de jornada ***")
 
 
 def resumen(datos: Datos, libro: LibroHoras, titulo: str) -> None:

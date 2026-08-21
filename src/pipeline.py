@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-pipeline.py — Punto de entrada del generador v3 (híbrido: reglas + CP-SAT sobre el residuo).
+pipeline.py — Punto de entrada del generador (híbrido: reglas + CP-SAT sobre el residuo).
 
 Se construye por pasos, y CADA paso deja el pipeline ejecutable de punta a punta y produce el
 Excel y el CSV de horas. Lo que todavía no está decidido se ve como hueco: la verificación de un
@@ -15,8 +15,8 @@ paso es abrir la salida y mirarla, no un test.
   E. equidad    — iguala findes y festivos dentro de cada grupo               [hecho]
 
 Tarda ~3 minutos el año entero. Uso:
-    python3 src/v3/pipeline.py
-    python3 src/v3/pipeline.py --sin-validar --segundos 300
+    python3 src/pipeline.py
+    python3 src/pipeline.py --sin-validar --segundos 300
 """
 from __future__ import annotations
 
@@ -24,19 +24,19 @@ import argparse
 import sys
 from pathlib import Path
 
-RAIZ = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(RAIZ / "src"))
+RAIZ = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import salida                                            # noqa: E402
-import v3.validar_datos as validar_datos                 # noqa: E402
-from v3 import equidad, esqueleto, forma, horas, legal, libranzas, residuo  # noqa: E402
-from v3.cargar_datos import cargar                       # noqa: E402
+import validar_datos                                     # noqa: E402
+import equidad, esqueleto, forma, horas, legal, libranzas, residuo   # noqa: E402
+from cargar_datos import cargar                       # noqa: E402
 
 SALIDA = RAIZ / "data" / "output"
 
 
 def main() -> int:
-    p = argparse.ArgumentParser(description="Genera el cuadrante anual (pipeline v3)")
+    p = argparse.ArgumentParser(description="Genera el cuadrante anual")
     p.add_argument("--sin-validar", action="store_true",
                    help="salta la validación de los CSV de entrada")
     p.add_argument("--segundos", type=int, default=300,
@@ -66,6 +66,8 @@ def main() -> int:
           f"objetivo {datos.config.horas_objetivo} h/año")
     print(f"Rotación anclada al lunes {esqueleto.ancla(datos):%d/%m/%Y}")
 
+    horas.balance(datos)
+
     # -- Paso A ------------------------------------------------------------- #
     plan = esqueleto.construir(datos)
     libro = horas.LibroHoras.desde_plan(datos, plan)
@@ -82,13 +84,13 @@ def main() -> int:
     # -- Paso B ------------------------------------------------------------- #
     reg = libranzas.ceder(datos, plan, libro, protegidos)
     libranzas.comprobar(datos, plan, libro, reg)
-    libranzas.escribir_csv(reg, SALIDA / "cesiones_v3.csv")
+    libranzas.escribir_csv(reg, SALIDA / "cesiones.csv")
     horas.resumen(datos, libro, "PASO B — horas tras ceder el exceso")
 
     # -- Paso C ------------------------------------------------------------- #
     rep = forma.repartir(datos, plan)
     forma.resumen(datos, rep)
-    forma.escribir_csv(datos, rep, SALIDA / "forma_pool_v3.csv")
+    forma.escribir_csv(datos, rep, SALIDA / "forma_pool.csv")
 
     # -- Paso D ------------------------------------------------------------- #
     residuo.resolver(datos, plan, libro, rep, flexibles,
@@ -113,9 +115,9 @@ def main() -> int:
     horas.resumen(datos, libro, "PASO E — horas finales")
     legal.auditar(datos, plan, pactadas)
 
-    horas.escribir_csv(datos, plan, libro, SALIDA / "horas_v3.csv")
-    salida.escribir_excel_v3(datos, plan)
-    print(f"Horas por trabajador: {(SALIDA / 'horas_v3.csv').relative_to(RAIZ)}")
+    horas.escribir_csv(datos, plan, libro, SALIDA / "horas.csv")
+    salida.escribir_excel(datos, plan)
+    print(f"Horas por trabajador: {(SALIDA / 'horas.csv').relative_to(RAIZ)}")
     return 0
 
 
