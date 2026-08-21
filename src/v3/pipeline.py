@@ -29,7 +29,7 @@ sys.path.insert(0, str(RAIZ / "src"))
 
 import salida                                            # noqa: E402
 import v3.validar_datos as validar_datos                 # noqa: E402
-from v3 import equidad, esqueleto, forma, horas, libranzas, residuo   # noqa: E402
+from v3 import equidad, esqueleto, forma, horas, legal, libranzas, residuo  # noqa: E402
 from v3.cargar_datos import cargar                       # noqa: E402
 
 SALIDA = RAIZ / "data" / "output"
@@ -70,6 +70,10 @@ def main() -> int:
     plan = esqueleto.construir(datos)
     libro = horas.LibroHoras.desde_plan(datos, plan)
     horas.resumen(datos, libro, "PASO A — horas que prescribe el esqueleto")
+    # Las formas de incumplimiento que el propio patrón produce. Son las pactadas con los
+    # trabajadores, y hay que capturarlas ANTES de tocar nada: la auditoría del final compara
+    # contra ellas para separar lo heredado de lo que se inventa el pipeline.
+    pactadas = legal.pactadas(datos, plan)
 
     # -- Paso A2 ------------------------------------------------------------ #
     protegidos, flexibles = esqueleto.colocar_mixtos(datos, plan, libro)
@@ -103,6 +107,7 @@ def main() -> int:
     info = equidad.pulir(datos, plan, libro)
     equidad.resumen(datos, plan, info)
     horas.resumen(datos, libro, "PASO E — horas finales")
+    legal.auditar(datos, plan, pactadas)
 
     horas.escribir_csv(datos, plan, libro, SALIDA / "horas_v3.csv")
     salida.escribir_excel_v3(datos, plan)

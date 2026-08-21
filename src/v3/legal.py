@@ -23,6 +23,7 @@ pregunta a `Datos`, que es donde viven las derivaciones.
 """
 from __future__ import annotations
 
+from collections import Counter
 from datetime import date, timedelta
 
 from v3.cargar_datos import Datos
@@ -89,6 +90,47 @@ def permite(datos: Datos, plan: Plan, trab: str, f: date, turno: str,
             and horas_7dias_ok(datos, plan, trab, f, turno))
 
 
+def pactadas(datos: Datos, plan: Plan) -> set:
+    """Las formas de incumplimiento que el esqueleto produce por sí mismo: son las que vienen
+    pactadas con los trabajadores y las que, por tanto, se pueden mover de una persona a otra."""
+    salida: set = set()
+    for trab in {w for (w, _) in plan}:
+        salida |= set(formas(datos, plan, trab, datos.inicio, datos.fin))
+    return salida
+
+
+def formas(datos: Datos, plan: Plan, trab: str, desde: date, hasta: date) -> Counter:
+    """(tipo, forma) -> nº de casos de ese trabajador en el tramo. La FORMA es la secuencia de
+    turnos que provoca el incumplimiento, no la persona ni la fecha: es lo que permite decir si
+    algo ya lo produce el patrón o se lo ha inventado el pipeline."""
+    dias = {}
+    f = desde - timedelta(days=8)
+    fin = hasta + timedelta(days=8)
+    while f <= fin:
+        s = plan.get((trab, f))
+        if s is not None:
+            dias[f] = s
+        f += timedelta(days=1)
+
+    minimo = timedelta(hours=datos.config.descanso_minimo)
+    salida: Counter = Counter()
+    for f, s in dias.items():
+        g = f + timedelta(days=1)
+        if g in dias and datos.intervalo(dias[g], g)[0] - datos.intervalo(s, f)[1] < minimo:
+            # Igual que en `infracciones`: se separa cuando hay una guardia de LOCALIZACIÓN de por
+            # medio, que es disponibilidad y no presencia. Sigue contándose, pero no es lo mismo.
+            loc = datos.localizado(s) or datos.localizado(dias[g])
+            salida[("C4-loc" if loc else "C4", (s, dias[g]))] += 1
+        ventana = [dias[f + timedelta(days=i)] for i in range(7) if f + timedelta(days=i) in dias]
+        if sum(datos.turnos[x].horas for x in ventana) > datos.config.horas_max_semana:
+            salida[("C6", tuple(sorted(ventana)))] += 1
+    semanas: Counter = Counter(f - timedelta(days=f.weekday()) for f in dias)
+    for lunes, n in semanas.items():
+        if n > datos.config.dias_max_semana:
+            salida[("C5", n)] += 1
+    return salida
+
+
 def infracciones(datos: Datos, plan: Plan) -> list[str]:
     """Lo que incumple un plan ya terminado. No decide nada: es la comprobación que se imprime al
     cerrar cada paso, para no dar por bueno un cuadrante ilegal porque la cobertura salga bien."""
@@ -128,3 +170,48 @@ def infracciones(datos: Datos, plan: Plan) -> list[str]:
             if ventana > datos.config.horas_max_semana:
                 fallos.append(f"C6 {w} 7 días desde {f:%d/%m}: {ventana:.0f} h")
     return fallos
+
+
+def integridad(datos: Datos, plan: Plan) -> list[str]:
+    """Lo que haría el cuadrante inejecutable, al margen del convenio: alguien asignado estando de
+    vacaciones, un turno en un día en que su línea no opera, alguien sin capacidad para la línea que
+    hace, o más gente asignada que demanda tiene la plaza. Aquí nunca debería haber nada."""
+    cuenta: dict[tuple[str, date], int] = {}
+    fallos: list[str] = []
+    for (w, f), s in plan.items():
+        cuenta[(s, f)] = cuenta.get((s, f), 0) + 1
+        if not datos.disponible(w, f):
+            fallos.append(f"{w} asignado a {s} el {f:%d/%m} estando de vacaciones")
+        elif not datos.opera(s, f):
+            fallos.append(f"{w} hace {s} el {f:%d/%m}, día en que esa línea no opera")
+        elif not datos.elegible(w, s, f)[0]:
+            fallos.append(f"{w} hace {s} el {f:%d/%m} sin capacidad declarada")
+    for (s, f), n in cuenta.items():
+        if datos.turnos[s].dem and n > datos.turnos[s].dem:
+            fallos.append(f"{s} el {f:%d/%m}: {n} asignados para {datos.turnos[s].dem} de demanda")
+    return fallos
+
+
+def auditar(datos: Datos, plan: Plan, pactadas_esqueleto: set) -> None:
+    """El repaso legal que se imprime al cerrar cada ejecución.
+
+    La legalidad NO se mide contando: se mide por FORMAS. Los patrones incumplen el convenio por
+    acuerdo con los trabajadores, así que el cuadrante nace con más de mil incumplimientos que hay
+    que respetar. Lo que importa no es el total, sino cuántos tienen una forma —un par de turnos
+    seguidos, una ventana de siete días— que el esqueleto NO produce por su cuenta: esos se los ha
+    inventado el pipeline, y son los únicos que hay que mirar.
+    """
+    rotos = integridad(datos, plan)
+    print(f"\nAUDITORÍA — integridad: "
+          + ("correcta" if not rotos else f"*** {len(rotos)} FALLOS: {rotos[0]} ***"))
+
+    total: Counter = Counter()
+    for trab in {w for (w, _) in plan}:
+        total += formas(datos, plan, trab, datos.inicio, datos.fin)
+    inventadas = Counter({k: n for k, n in total.items() if k not in pactadas_esqueleto})
+    casos = sum(total.values())
+    print(f"  incumplimientos: {casos} en total · {casos - sum(inventadas.values())} pactados "
+          f"(los produce el propio patrón) · {sum(inventadas.values())} introducidos por el pipeline")
+    if inventadas:
+        print("    por tipo: " + " · ".join(
+            f"{t}: {n}" for t, n in sorted(Counter(k[0] for k in inventadas.elements()).items())))
