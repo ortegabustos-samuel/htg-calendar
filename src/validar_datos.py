@@ -87,7 +87,7 @@ def revisar_config(inf: Informe) -> bool:
     horizonte y el nivel 4 no puede hacer nada)."""
     try:
         cfg = _cargar_config()
-    except Exception as e:                                  # noqa: BLE001 — el mensaje ya es claro
+    except Exception as e:
         inf.error(f"config.toml: {e}")
         return False
     if not 1900 < cfg.anio < 2200:
@@ -209,10 +209,10 @@ def revisar_referencias(crudo: dict[str, list[dict]], inf: Informe) -> None:
     for r in crudo["turnos.csv"]:
         if r["municipio"] not in municipios:
             inf.aviso(f"turnos: {r['id_turno']} opera en '{r['municipio']}', sin calendario "
-                      f"asignado — solo verá los festivos de ámbito 'Comun'")
+                      f"asignado — solo verá los festivos de ámbito 'Nacional'")
 
-    for a in sorted({r["ambito"].strip() for r in crudo["festivos.csv"]} - calendarios - {"Comun"}):
-        inf.aviso(f"festivos: el ámbito '{a}' no es 'Comun' ni el calendario de ningún municipio, "
+    for a in sorted({r["ambito"].strip() for r in crudo["festivos.csv"]} - calendarios - {"Nacional"}):
+        inf.aviso(f"festivos: el ámbito '{a}' no es 'Nacional' ni el calendario de ningún municipio, "
                   f"así que esas fechas no son festivo para nadie")
     for r in crudo["festivos.csv"]:
         if _fecha(r["fecha"]) is None:

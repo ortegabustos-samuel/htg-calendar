@@ -64,7 +64,7 @@ from datetime import date, timedelta
 
 from ortools.sat.python import cp_model
 
-import esqueleto, forma, legal
+import base, forma, legal
 from cargar_datos import Datos
 from horas import EPS, LibroHoras
 
@@ -297,9 +297,9 @@ def resolver(datos: Datos, plan: Plan, libro: LibroHoras, rep: forma.Reparto,
             solucion = sl
 
     # -- Nivel 3: equidad de sábados, domingos y festivos --------------------- #
-    refs = esqueleto.referencia_finde(datos, plan)
+    refs = base.referencia_finde(datos, plan)
     desvios = []
-    for clase in esqueleto.FINDE:
+    for clase in base.FINDE:
         cuentas = []
         for w in pool:
             muni = Counter(datos.turnos[s].municipio for _, s in por_trab[w]).most_common(1)
@@ -569,7 +569,7 @@ def rellenar_refuerzos(datos: Datos, plan: Plan, libro: LibroHoras) -> int:
                 break
             faltan = int(-libro.exceso(w) // min(datos.turnos[s].horas for s in refuerzos)) + 1
             colocado = False
-            for f in esqueleto._uniformes(libres, min(faltan, len(libres))):
+            for f in base._uniformes(libres, min(faltan, len(libres))):
                 if libro.exceso(w) >= 0:
                     break
                 for s in refuerzos:

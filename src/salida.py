@@ -59,7 +59,7 @@ def _categoria(datos: Datos, d: date, municipio: str | None = None) -> str:
     """Categoría de un día PARA UN MUNICIPIO concreto: festivo, finde o laborable. Si no se pasa
     municipio se mira solo el calendario común (para la cabecera, que es de toda la plantilla)."""
     if municipio is None:
-        if d in datos.festivos.get("Comun", set()):
+        if d in datos.festivos.get("Nacional", set()):
             return "festivo"
     elif datos.es_festivo(d, municipio):
         return "festivo"
@@ -94,7 +94,7 @@ def _ajustar_anchos(ws, desde_fila: int = 1, saltar: set[int] | None = None,
 def _calendarios_festivos(datos: Datos) -> dict[str, set[date]]:
     """calendario -> fechas festivas EFECTIVAS (las comunes más las suyas). Es lo que mira
     `Datos.es_festivo`, resuelto de una vez para poder volcarlo como banderas por día."""
-    comun = datos.festivos.get("Comun", set())
+    comun = datos.festivos.get("Nacional", set())
     cals = {datos.calendario_municipio.get(t.municipio, t.municipio) for t in datos.turnos.values()}
     return {c: comun | datos.festivos.get(c, set()) for c in sorted(cals)}
 

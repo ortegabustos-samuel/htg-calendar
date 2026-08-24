@@ -34,7 +34,7 @@ from dataclasses import dataclass, field
 from datetime import date, timedelta
 from pathlib import Path
 
-import esqueleto, legal, ritmo as ritmo_mod
+import base, legal, ritmo as ritmo_mod
 from cargar_datos import Datos
 from horas import EPS, LibroHoras
 from ritmo import Ritmo
@@ -346,13 +346,13 @@ def _ausencias(datos: Datos, titular: str, designadas: dict[str, list[str]]) -> 
     for inicio, fin in datos.trabajadores[titular].vacaciones:
         ventana = [inicio + timedelta(days=i) for i in range((fin - inicio).days + 1)
                    if datos.inicio <= inicio + timedelta(days=i) <= datos.fin]
-        dias = [f for f in ventana if esqueleto.prescrito(datos, titular, f) in designadas]
+        dias = [f for f in ventana if base.prescrito(datos, titular, f) in designadas]
         if not dias:
             continue
         unidades.append(Unidad(
             dias=dias,
             descanso=[f for f in ventana if f not in set(dias)],
-            horas=sum(datos.turnos[esqueleto.prescrito(datos, titular, f)].horas for f in dias)))
+            horas=sum(datos.turnos[base.prescrito(datos, titular, f)].horas for f in dias)))
     return unidades
 
 
@@ -372,7 +372,7 @@ def fase1(datos: Datos, plan: Plan, libro: LibroHoras, ritmos: dict[str, Ritmo],
 
     for titular in sorted(titulares):                   # 1) ausencias
         for unidad in _ausencias(datos, titular, cubridores):
-            turnos = {f: esqueleto.prescrito(datos, titular, f) for f in unidad.dias}
+            turnos = {f: base.prescrito(datos, titular, f) for f in unidad.dias}
             linea = turnos[unidad.dias[0]]
             # Lo que un cubridor no pueda asumir (porque libre él también) se le ofrece al
             # siguiente: una quincena puede repartirse entre el principal y el suplente.

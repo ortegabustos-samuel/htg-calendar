@@ -1,5 +1,5 @@
 """
-esqueleto.py — Paso A del pipeline: el cuadrante base, sin ninguna decisión libre.
+base.py — Paso A del pipeline: el cuadrante base, sin ninguna decisión libre.
 
 Pinta lo que los datos YA prescriben, y nada más:
 
@@ -18,11 +18,7 @@ Pinta lo que los datos YA prescriben, y nada más:
                  qué dejan sin cubrir los patrones.
   * CORRETURNO — nada. Es el único pool rodante de verdad, y su semana la decide el paso C.
 
-Dos cosas que NO se pintan, a propósito:
-  * Las vacaciones son ausencia, no asignación: viven en `datos.disponible`, y la vista de Excel
-    las dibuja aparte. Meterlas en el plan las convertiría en un turno más.
-  * Un día que la rotación prescribe pero la línea no opera (festivo local, fin de semana) queda
-    vacío: esa plaza no existe ese día, así que no hay nada que asignar ni que cubrir.
+Importante mencionar que dias como vacaciones o festivos ni siquiera se contemplan como disponibles  
 
 Salida: el `plan` — dict {(id_trab, fecha) -> id_turno} — que es el objeto que se pasan entre sí
 todas las etapas y el que consume la vista de Excel.
@@ -35,39 +31,20 @@ from datetime import date, timedelta
 import legal
 from cargar_datos import DIAS, LIBRE, Datos
 
-
-def ancla(datos: Datos) -> date:
-    """Lunes desde el que se cuentan las semanas de la rotación.
-
-    Es el lunes de la semana en que cae el 1 de enero (no el 1 de enero), para que la semana de
-    patrón sea siempre una semana completa L-D. Debe ser el MISMO para todo el horizonte: si se
-    recalculara por tramos, la rotación se desplazaría en cada corte.
-    """
-    return datos.inicio - timedelta(days=datos.inicio.weekday())
-
-
-def fila_patron(datos: Datos, trab: str, f: date) -> dict[str, str] | None:
-    """Fila de `patrones.csv` que ejecuta `trab` la semana de `f`, o None si no es de patrón."""
-    t = datos.trabajadores[trab]
-    if t.tipo != "patron" or not t.patron:
-        return None
-    filas = datos.patrones.get(t.patron)
-    if not filas:
-        return None
-    offset = datos.offsets.get(trab, 0)
-    semanas = (f - ancla(datos)).days // 7
-    return filas[(offset + semanas) % len(filas)]
-
-
-def turno_patron(datos: Datos, trab: str, f: date) -> str | None:
-    """Celda que la rotación prescribe a `trab` el día `f`: un id de turno, `LIBRE`, o None si no
-    es un trabajador de patrón. Ojo: prescribir un turno no significa que se trabaje — la línea
+def turno_patron(datos: Datos, trabajador_id: str, fecha: date) -> str:
+    """Celda que la rotación prescribe al trabajador el día fecha: un id de turno, `LIBRE`
+    Ojo: prescribir un turno no significa que se trabaje la línea
     puede no operar ese día y el trabajador puede estar de vacaciones."""
-    fila = fila_patron(datos, trab, f)
-    return fila[DIAS[f.weekday()]] if fila else None
+
+    trabajador = datos.trabajadores[trabajador_id]
+    filas = datos.patrones.get(trabajador.patron)
+    offset = datos.offsets.get(trabajador_id, 0)
+    semanas = (fecha - datos.primer_lunes).days // 7
+    fila = filas[(offset + semanas) % len(filas)]
+    return fila[DIAS[fecha.weekday()]]
 
 
-def prescrito(datos: Datos, trab: str, f: date) -> str | None:
+def prescrito(datos: Datos, trabajador_id: str, fecha: date) -> str | None:
     """Plaza que le toca a este trabajador ese día, IGNORANDO si está disponible.
 
     Es lo que le corresponde por rotación o por su línea fija, siempre que la plaza exista ese día
@@ -75,18 +52,16 @@ def prescrito(datos: Datos, trab: str, f: date) -> str | None:
     le tocaba, y por eso esto y `disponible` son preguntas separadas: juntas dicen qué plazas se
     quedan solas, que es lo que el paso B traspasa a un cubridor.
     """
-    t = datos.trabajadores[trab]
-    if t.tipo == "patron":
-        s = turno_patron(datos, trab, f)
-        return s if (s and s != LIBRE and s in datos.turnos and datos.opera(s, f)) else None
-    if t.tipo == "fijo" and t.linea:
-        cap = datos.capacidades.get((trab, t.linea))
-        if cap is None or not datos.opera(t.linea, f):
+    trabajador = datos.trabajadores[trabajador_id]
+    if trabajador.tipo == "patron":
+        turno_id = turno_patron(datos, trabajador_id, fecha)
+        return turno_id if (turno_id != LIBRE and turno_id in datos.turnos and datos.opera(turno_id, fecha)) else None
+    if trabajador.tipo == "fijo":
+        cap = datos.capacidades.get((trabajador_id, trabajador.linea))
+        if not datos.opera(trabajador.linea, fecha):
             return None
-        dia = datos.tipo_dia(f, datos.turnos[t.linea].municipio)
-        # Solo por capacidad NORMAL: un fijo ocupa su plaza; cubrir la de otro es `v>=1` y es cosa
-        # de pasos posteriores.
-        return t.linea if {"LV": cap.lv, "SAB": cap.sab,
+        dia = datos.tipo_dia(fecha, datos.turnos[trabajador.linea].municipio)       #En un principio esto es redundante suponiendo 
+        return trabajador.linea if {"LV": cap.lv, "SAB": cap.sab,                   # a fijos solo hacer Lunes-Viernes
                            "DOM": cap.dom, "FEST": cap.fest}[dia] == 1 else None
     return None
 
@@ -94,13 +69,13 @@ def prescrito(datos: Datos, trab: str, f: date) -> str | None:
 def construir(datos: Datos) -> dict[tuple[str, date], str]:
     """Plan base del año: {(id_trab, fecha) -> id_turno}."""
     plan: dict[tuple[str, date], str] = {}
-    for f in datos.fechas:
-        for w in datos.trabajadores:
-            if not datos.disponible(w, f):
+    for dia in datos.fechas:
+        for trabajador_id in datos.trabajadores:
+            if not datos.disponible(trabajador_id, dia):
                 continue                                  # vacaciones: ausencia, no asignación
-            s = prescrito(datos, w, f)
-            if s is not None:
-                plan[(w, f)] = s
+            turno_id = prescrito(datos, trabajador_id, dia)
+            if turno_id is not None:
+                plan[(trabajador_id, dia)] = turno_id
     return plan
 
 
@@ -110,15 +85,15 @@ def construir(datos: Datos) -> dict[tuple[str, date], str]:
 FINDE = ("SAB", "DOM", "FEST")
 
 
-def lineas_de(datos: Datos, trab: str, clase: str) -> list[str]:
+def lineas_de(datos: Datos, trabajador_id: str, clase: str) -> list[str]:
     """Líneas del trabajador de una clase: 'lv' o 'finde'. Sale de los flags de capacidades.csv,
     que es donde el planificador ya separó las dos naturalezas del mixto."""
     salida = []
-    for (w, s), cap in datos.capacidades.items():
-        if w != trab or s not in datos.turnos:
+    for (trabajador_id_cap, turno_id), cap in datos.capacidades.items():
+        if trabajador_id != trabajador_id_cap or turno_id not in datos.turnos:
             continue
         if (cap.lv == 1) if clase == "lv" else bool(cap.sab or cap.dom or cap.fest):
-            salida.append(s)
+            salida.append(turno_id)
     return sorted(salida)
 
 
@@ -166,12 +141,12 @@ def cuota_finde(datos: Datos, trab: str, refs: dict[str, Counter]) -> Counter:
     return refs.get(muni, Counter())
 
 
-def _libre(datos: Datos, cubiertas: Counter, turno: str, f: date) -> bool:
-    return cubiertas[(turno, f)] < datos.turnos[turno].dem
+def _libre(datos: Datos, cubiertas: Counter, turno_id: str, fecha: date) -> bool:
+    return cubiertas[(turno_id, fecha)] < datos.turnos[turno_id].dem
 
 
 def _elegir_linea(datos: Datos, plan: dict[tuple[str, date], str], cubiertas: Counter, trab: str,
-                  f: date, lineas: list[str], clases: tuple[str, ...],
+                  fecha: date, lineas: list[str], clases: tuple[str, ...],
                   anterior: str | None) -> str | None:
     """De sus líneas descubiertas ese día: la que hacía ayer (continuidad); si no, la que menos
     gente más puede hacer, que es la más difícil de tapar por otro.
@@ -185,11 +160,11 @@ def _elegir_linea(datos: Datos, plan: dict[tuple[str, date], str], cubiertas: Co
     `sab=1`, así que sin este filtro la pasada de lunes a viernes se llevaba también los sábados
     de esa línea, sin tope, y reventaba tanto la cuota de equidad como la jornada anual.
     """
-    posibles = [s for s in lineas
-                if datos.tipo_dia(f, datos.turnos[s].municipio) in clases
-                and datos.elegible(trab, s, f) == (True, False)
-                and _libre(datos, cubiertas, s, f)
-                and legal.permite(datos, plan, trab, f, s)]
+    posibles = [turno_id for turno_id in lineas
+                if datos.tipo_dia(fecha, datos.turnos[turno_id].municipio) in clases
+                and datos.elegible(trab, turno_id, fecha) == (True, False)
+                and _libre(datos, cubiertas, turno_id, fecha)
+                and legal.permite(datos, plan, trab, fecha, turno_id)]
     if not posibles:
         return None
     if anterior in posibles:
@@ -234,7 +209,7 @@ def _soltar_dia_lv(datos: Datos, plan: dict[tuple[str, date], str], libro,
 
 
 def colocar_mixtos(datos: Datos, plan: dict[tuple[str, date], str], libro):
-    """Segunda pasada del esqueleto: coloca a los mixtos sobre lo que los patrones dejan libre.
+    """Segunda pasada del base: coloca a los mixtos sobre lo que los patrones dejan libre.
 
     Devuelve dos cosas:
       * `protegidos` — los días de fin de semana que son CUOTA. El paso B no debe cederlos: no son
@@ -243,50 +218,53 @@ def colocar_mixtos(datos: Datos, plan: dict[tuple[str, date], str], libro):
         entre semana para hacer el finde. Cuál se suelta lo reabre el paso D.
     """
     cubiertas: Counter = Counter()
-    for (_, f), s in plan.items():
-        cubiertas[(s, f)] += 1
+    for (_, fecha), turno_id in plan.items():
+        cubiertas[(turno_id, fecha)] += 1
     refs = referencia_finde(datos, plan)
     protegidos: dict[str, set[date]] = defaultdict(set)
     flexibles: list[tuple[str, date, date, str]] = []
 
-    mixtos = [w for w, t in datos.trabajadores.items() if t.tipo == "mixto"]
+    mixtos = [trabajador_id for trabajador_id, trabajador in datos.trabajadores.items() if trabajador.tipo == "mixto"]
     # Los más atados primero: quien solo puede hacer una línea no tiene con qué negociar.
-    mixtos.sort(key=lambda w: (len(lineas_de(datos, w, "lv")), w))
+    mixtos.sort(key=lambda trabajador_id: (len(lineas_de(datos, trabajador_id, "lv")), trabajador_id))
 
-    for trab in mixtos:
-        lv = lineas_de(datos, trab, "lv")
+    for trabajador_id in mixtos:
+        lv = lineas_de(datos, trabajador_id, "lv")
         anterior: str | None = None
-        for f in datos.fechas:                          # 1) ocupa su línea de lunes a viernes
-            if not datos.disponible(trab, f) or (trab, f) in plan:
+        for fecha in datos.fechas:                          # 1) ocupa su línea de lunes a viernes
+            if not datos.disponible(trabajador_id, fecha) or (trabajador_id, fecha) in plan:
                 continue
-            s = _elegir_linea(datos, plan, cubiertas, trab, f, lv, ("LV",), anterior)
-            anterior = s
-            if s is None:
+            turno_id = _elegir_linea(datos, plan, cubiertas, trabajador_id, fecha, lv, ("LV",), anterior)
+            anterior = turno_id
+            if turno_id is None:
                 continue
-            plan[(trab, f)] = s
-            libro.apunta(trab, s)
-            cubiertas[(s, f)] += 1
+            plan[(trabajador_id, fecha)] = turno_id
+            libro.apunta(trabajador_id, turno_id)
+            cubiertas[(turno_id, fecha)] += 1
 
-        findes = lineas_de(datos, trab, "finde")        # 2) su cuota, repartida por el año
-        cuota = cuota_finde(datos, trab, refs)
+        findes = lineas_de(datos, trabajador_id, "finde")   # 2) su cuota, repartida por el año
+        cuota = cuota_finde(datos, trabajador_id, refs)
         for clase in FINDE:
-            candidatos = [f for f in datos.fechas
-                          if datos.disponible(trab, f) and (trab, f) not in plan
-                          and any(datos.tipo_dia(f, datos.turnos[s].municipio) == clase
-                                  and datos.elegible(trab, s, f) == (True, False)
-                                  and _libre(datos, cubiertas, s, f) for s in findes)]
-            for f in _uniformes(candidatos, cuota.get(clase, 0)):
-                s = _elegir_linea(datos, plan, cubiertas, trab, f, findes, (clase,), None)
-                if s is None:
+            candidatos = [fecha for fecha in datos.fechas
+                          if datos.disponible(trabajador_id, fecha)
+                          and (trabajador_id, fecha) not in plan
+                          and any(datos.tipo_dia(fecha, datos.turnos[s].municipio) == clase
+                                  and datos.elegible(trabajador_id, s, fecha) == (True, False)
+                                  and _libre(datos, cubiertas, s, fecha) for s in findes)]
+            for fecha in _uniformes(candidatos, cuota.get(clase, 0)):
+                turno_id = _elegir_linea(datos, plan, cubiertas, trabajador_id, fecha, findes,
+                                         (clase,), None)
+                if turno_id is None:
                     continue
-                soltado = _soltar_dia_lv(datos, plan, libro, cubiertas, trab, f)
+                soltado = _soltar_dia_lv(datos, plan, libro, cubiertas, trabajador_id, fecha)
                 if soltado is None:
                     continue
-                plan[(trab, f)] = s
-                libro.apunta(trab, s)
-                cubiertas[(s, f)] += 1
-                protegidos[trab].add(f)
-                flexibles.append((trab, f - timedelta(days=f.weekday()), soltado[0], soltado[1]))
+                plan[(trabajador_id, fecha)] = turno_id
+                libro.apunta(trabajador_id, turno_id)
+                cubiertas[(turno_id, fecha)] += 1
+                protegidos[trabajador_id].add(fecha)
+                flexibles.append((trabajador_id, fecha - timedelta(days=fecha.weekday()),
+                                  soltado[0], soltado[1]))
     return protegidos, flexibles
 
 

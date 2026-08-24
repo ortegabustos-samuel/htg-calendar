@@ -11,7 +11,7 @@ Qué hay que igualar, medido sobre Valladolid 2026:
   * Lo que rompe el propio pipeline. Los domingos de PAT_GRANDE_VALL pasan de un rango de 3 en el
     esqueleto a 11 al final: los tres cubridores designados heredan ciclos de UVI y de noche, que
     trabajan todos los domingos, mientras a otros las libranzas se los quitan.
-  * Lo que ya viene torcido del esqueleto. El patrón NO reparte por igual: PAT_GRANDE_VALL llega
+  * Lo que ya viene torcido del base. El patrón NO reparte por igual: PAT_GRANDE_VALL llega
     con un rango de 5 sábados y 6 festivos antes de que nadie lo toque, porque el ciclo tiene 38
     filas y el año 52 semanas, y los festivos caen donde caen.
 
@@ -45,7 +45,7 @@ from __future__ import annotations
 from collections import Counter, defaultdict
 from datetime import date, timedelta
 
-import esqueleto, legal
+import base, legal
 from cargar_datos import Datos
 from horas import EPS, LibroHoras
 from ritmo import grupo_de
@@ -190,7 +190,7 @@ def _gana(cuentas: dict[str, Counter], a: str, b: str, media: dict[str, float],
 def pulir(datos: Datos, plan: Plan, libro: LibroHoras, vueltas: int = 400,
           pactadas: set | None = None) -> dict:
     if pactadas is None:
-        pactadas = legal.pactadas(datos, esqueleto.construir(datos))
+        pactadas = legal.pactadas(datos, base.construir(datos))
     grupos: dict[str, list[str]] = defaultdict(list)
     for w in datos.trabajadores:
         grupos[grupo_de(datos, w)].append(w)
@@ -300,7 +300,7 @@ def _clase(datos: Datos, plan: Plan, w: str, f: date) -> str | None:
 def pulir_dias(datos: Datos, plan: Plan, libro: LibroHoras, vueltas: int = 600,
                pactadas: set | None = None) -> int:
     if pactadas is None:
-        pactadas = legal.pactadas(datos, esqueleto.construir(datos))
+        pactadas = legal.pactadas(datos, base.construir(datos))
     """Afina lo que el intercambio de semana no puede: mueve un día de una clase concreta del que
     más tiene al que menos, dentro de la misma semana ISO."""
     grupos: dict[str, list[str]] = defaultdict(list)

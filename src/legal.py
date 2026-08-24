@@ -1,25 +1,16 @@
 """
-legal.py — Las restricciones básicas del convenio, definidas UNA sola vez.
+Las restricciones básicas del convenio, definidas UNA sola vez.
 
 Las consumen los dos lados del pipeline: las reglas, como test ("¿puedo darle este turno a esta
 persona este día?"), y el CP-SAT del paso D, como restricción del modelo. De momento solo existe
 la primera forma — la segunda se añadirá sobre estas mismas definiciones, no sobre una copia.
 
-No es el catálogo completo de MODELO.md, y eso es deliberado: solo las tres que se decidieron
+No es el catálogo completo y eso es deliberado: solo las tres que se decidieron
 básicas, más las dos estructurales que salen gratis.
 
-  C2  un turno por día    — gratis: el plan es un dict indexado por (trabajador, fecha)
-  C3  cualificación       — gratis: `datos.elegible` ya cruza capacidades con operatividad
   C4  descanso mínimo entre turnos de días consecutivos    (config.descanso_minimo, 12 h)
   C5  máx. días trabajados por SEMANA ISO                  (config.dias_max_semana, 6)
   C6  máx. horas en cualquier ventana de 7 días            (config.horas_max_semana, 48)
-
-C5 se mide por semana ISO (lunes a domingo) y no en ventana deslizante. Es una decisión tomada a
-sabiendas: permite encadenar más de 6 días trabajados a caballo de dos semanas. C6 sí es
-deslizante, así que es lo que acota esas rachas por el lado de las horas.
-
-Este módulo no deriva nada de los datos por su cuenta: cuándo empieza y acaba un turno se lo
-pregunta a `Datos`, que es donde viven las derivaciones.
 """
 from __future__ import annotations
 
@@ -30,8 +21,7 @@ from cargar_datos import Datos
 
 Plan = dict[tuple[str, date], str]
 
-
-def descanso_ok(datos: Datos, plan: Plan, trab: str, f: date, turno: str,
+def descanso_ok(datos: Datos, plan: Plan, trabajador_id: str, fecha: date, turno_id: str,
                 exento_localizado: bool = False) -> bool:
     """C4 — entre el fin de un turno y el inicio del siguiente median al menos
     `descanso_minimo` horas. Basta mirar el día anterior y el siguiente: ningún turno dura más de
@@ -43,17 +33,17 @@ def descanso_ok(datos: Datos, plan: Plan, trab: str, f: date, turno: str,
     de otro modo quedaría vacía, y esa excepción se paga en el objetivo del paso D, no aquí.
     """
     minimo = timedelta(hours=datos.config.descanso_minimo)
-    exento = exento_localizado and datos.localizado(turno)
-    inicio, fin = datos.intervalo(turno, f)
+    exento = exento_localizado and datos.localizado(turno_id)
+    inicio, fin = datos.intervalo(turno_id, fecha)
 
-    ayer = f - timedelta(days=1)
-    previo = plan.get((trab, ayer))
+    ayer = fecha - timedelta(days=1)
+    previo = plan.get((trabajador_id, ayer))
     if (previo is not None and not (exento or (exento_localizado and datos.localizado(previo)))
             and inicio - datos.intervalo(previo, ayer)[1] < minimo):
         return False
 
-    manana = f + timedelta(days=1)
-    posterior = plan.get((trab, manana))
+    manana = fecha + timedelta(days=1)
+    posterior = plan.get((trabajador_id, manana))
     if (posterior is not None and not (exento or (exento_localizado and datos.localizado(posterior)))
             and datos.intervalo(posterior, manana)[0] - fin < minimo):
         return False
@@ -80,21 +70,21 @@ def horas_7dias_ok(datos: Datos, plan: Plan, trab: str, f: date, turno: str) -> 
     return True
 
 
-def permite(datos: Datos, plan: Plan, trab: str, f: date, turno: str,
+def permite(datos: Datos, plan: Plan, trabjador_id: str, fecha: date, turno_id: str,
             exento_localizado: bool = False) -> bool:
     """¿Es legal añadir este turno a este trabajador este día, sobre el plan tal y como está?"""
-    if (trab, f) in plan:                                       # C2
+    if (trabjador_id, fecha) in plan:                                       # C2
         return False
-    return (descanso_ok(datos, plan, trab, f, turno, exento_localizado)
-            and dias_semana_ok(datos, plan, trab, f)
-            and horas_7dias_ok(datos, plan, trab, f, turno))
+    return (descanso_ok(datos, plan, trabjador_id, fecha, turno_id, exento_localizado)
+            and dias_semana_ok(datos, plan, trabjador_id, fecha)
+            and horas_7dias_ok(datos, plan, trabjador_id, fecha, turno_id))
 
 
 def pactadas(datos: Datos, plan: Plan) -> set:
-    """Las formas de incumplimiento que el esqueleto produce por sí mismo: son las que vienen
+    """Las formas de incumplimiento que el base produce por sí mismo: son las que vienen
     pactadas con los trabajadores y las que, por tanto, se pueden mover de una persona a otra."""
     salida: set = set()
-    for trab in {w for (w, _) in plan}:
+    for trab in {trabajador_id for (trabajador_id, _) in plan}:
         salida |= set(formas(datos, plan, trab, datos.inicio, datos.fin))
     return salida
 

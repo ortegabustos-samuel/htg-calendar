@@ -1,20 +1,16 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
-pipeline.py — Punto de entrada del generador (híbrido: reglas + CP-SAT sobre el residuo).
+pipeline.py — Punto de entrada del generador.
 
-Se construye por pasos, y CADA paso deja el pipeline ejecutable de punta a punta y produce el
-Excel y el CSV de horas. Lo que todavía no está decidido se ve como hueco: la verificación de un
-paso es abrir la salida y mirarla, no un test.
+Pasos.
 
-  A. esqueleto  — patrones rotados, fijos y vacaciones                              [hecho]
-  A2. mixtos    — cuasi-fijos: su línea L-V más su cuota de fines de semana         [hecho]
-  B. libranzas  — ceder el exceso de horas, traspasando las plazas con cubridor      [hecho]
-  C. forma      — franja y zona de cada semana del pool: acota el dominio del paso D  [hecho]
-  D. residuo    — un solo CP-SAT anual reparte los huecos entre los correturnos  [hecho]
-  E. equidad    — iguala findes y festivos dentro de cada grupo               [hecho]
+  1. Base  — patrones rotados, fijos y vacaciones                              
+  2. Mixtos    — cuasi-fijos: su línea L-V más su cuota de fines de semana         
+  3. Exceso de horas  — ceder el exceso de horas, traspasando las plazas con cubridor      
+  4. Busqueda estabilidad — franja y zona de cada semana del pool: acota el dominio del paso D  
+  5. Optimizador  — un solo CP-SAT anual reparte los huecos entre los correturnos mas acotado 
+  6. Igualdad    — iguala findes y festivos dentro de cada grupo               
 
-Tarda ~3 minutos el año entero. Uso:
+Uso:
     python3 src/pipeline.py
     python3 src/pipeline.py --sin-validar --segundos 300
 """
@@ -22,64 +18,42 @@ from __future__ import annotations
 
 import argparse
 import sys
+import salida                                            
+import base, equidad, forma, horas, legal, libranzas, residuo
+from cargar_datos import cargar                       
 from pathlib import Path
 
 RAIZ = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-
-import salida                                            # noqa: E402
-import validar_datos                                     # noqa: E402
-import equidad, esqueleto, forma, horas, legal, libranzas, residuo   # noqa: E402
-from cargar_datos import cargar                       # noqa: E402
-
 SALIDA = RAIZ / "data" / "output"
 
 
 def main() -> int:
     p = argparse.ArgumentParser(description="Genera el cuadrante anual")
-    p.add_argument("--sin-validar", action="store_true",
-                   help="salta la validación de los CSV de entrada")
     p.add_argument("--segundos", type=int, default=300,
                    help="tiempo de solver por NIVEL del paso D. Con los niveles sembrados ninguno "
                         "pasa de ~115 s, así que este límite no llega a tocarse")
     p.add_argument("--hilos", type=int, default=8, help="hilos del solver")
     p.add_argument("--log", action="store_true", help="log detallado del solver")
-    p.add_argument("--sin-nivel2", action="store_true",
-                   help="salta el nivel 2 (equidad) del paso D y deja esa tarea entera al paso E")
     a = p.parse_args()
-
-    # Validar primero: un CSV con un espacio de más no da un fallo ruidoso, da un cuadrante que
-    # parece bueno y no lo es.
-    if not a.sin_validar:
-        inf = validar_datos.validar()
-        for m in inf.errores:
-            print(f"  ERROR  {m}")
-        for m in inf.avisos:
-            print(f"  aviso  {m}")
-        if inf.errores:
-            print(f"\n{len(inf.errores)} errores en los datos de entrada. Arréglalos y relanza.")
-            return 1
 
     datos = cargar()
     print(f"\nCuadrante {datos.inicio:%d/%m/%Y} – {datos.fin:%d/%m/%Y} · "
           f"{len(datos.trabajadores)} trabajadores · {len(datos.turnos)} líneas · "
           f"objetivo {datos.config.horas_objetivo} h/año")
-    print(f"Rotación anclada al lunes {esqueleto.ancla(datos):%d/%m/%Y}")
+    print(f"Rotación anclada al lunes {datos.primer_lunes:%d/%m/%Y}")
 
     horas.balance(datos)
 
-    # -- Paso A ------------------------------------------------------------- #
-    plan = esqueleto.construir(datos)
+    # -- Paso Base ------------------------------------------------------------- #
+    plan = base.construir(datos)
     libro = horas.LibroHoras.desde_plan(datos, plan)
-    horas.resumen(datos, libro, "PASO A — horas que prescribe el esqueleto")
-    # Las formas de incumplimiento que el propio patrón produce. Son las pactadas con los
-    # trabajadores, y hay que capturarlas ANTES de tocar nada: la auditoría del final compara
-    # contra ellas para separar lo heredado de lo que se inventa el pipeline.
-    pactadas = legal.pactadas(datos, plan)
+    horas.resumen(datos, libro, "PASO A — horas que prescribe el paso base")
+    pactadas = legal.pactadas(datos, plan) #REVISION
 
     # -- Paso A2 ------------------------------------------------------------ #
-    protegidos, flexibles = esqueleto.colocar_mixtos(datos, plan, libro)
-    esqueleto.resumen_mixtos(datos, plan, libro)
+    protegidos, flexibles = base.colocar_mixtos(datos, plan, libro)
+    base.resumen_mixtos(datos, plan, libro)
 
     # -- Paso B ------------------------------------------------------------- #
     reg = libranzas.ceder(datos, plan, libro, protegidos)
@@ -94,8 +68,7 @@ def main() -> int:
 
     # -- Paso D ------------------------------------------------------------- #
     residuo.resolver(datos, plan, libro, rep, flexibles,
-                     segundos=a.segundos, hilos=a.hilos, log=a.log,
-                     nivel2=not a.sin_nivel2)
+                     segundos=a.segundos, hilos=a.hilos, log=a.log)
     # El canje va DESPUÉS del relleno para que los refuerzos de los correturnos estén ya puestos y
     # entren en el reparto: si no, lo único que se puede gastar son los refuerzos que prescriben los
     # patrones, que son precisamente los que hay que conservar.

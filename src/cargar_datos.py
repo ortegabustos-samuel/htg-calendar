@@ -39,7 +39,7 @@ class Turno:
     hora_entrada: time  #Hora de entrada del turno
     hora_salida: time   #Hora de salida del turno
     dem: int            #Demanda del turno
-    horas: float        # horas COMPUTADAS (jornada legal; partido y 24h -> 8)
+    horas: float        # horas de computo
 
 
 @dataclass
@@ -48,16 +48,14 @@ class Trabajador:
     tipo: str                       # fijo | patron | correturno | mixto
     patron: str | None              # id del patrón (solo tipo=patron)
     vacaciones: list[tuple[date, date]] #Lista con tupla (inicio_vacaciones,fin_vacaciones)
-    linea: str | None = None        # id del turno que cubre un FIJO (solo tipo=fijo). Se declara aquí
-                                    # igual que el patrón: es lo que define su trabajo. Su capacidad
-                                    # se deriva sola (ver _anadir_capacidad_fijo), no va en capacidades.csv.
+    linea: str | None = None        # id del turno que cubre un FIJO (solo tipo=fijo)
     factor_jornada: float = 1.0     # reducción de jornada: escala el objetivo anual. 1.0 = jornada completa
     fila_inicial: int | None = None  # solo tipo=patron: fila de `patrones.csv` que hace en la PRIMERA
-                                    # semana del horizonte. Es lo que da continuidad entre años —ver
-                                    # `offsets_patron`—. None = no declarada (se deduce del orden).
+                                    # semana del horizonte.
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True)             #El uso de forzen impide que se modifique el propio objeto Config (logico la configuracion
+                                    # no deberia modificarse)
 class Config:
     """
     Parámetros de la INSTANCIA (`config.toml`): qué año se resuelve y bajo qué convenio.
@@ -65,11 +63,11 @@ class Config:
     """
     anio: int                    # Anio sobre el que estamos haciendo el calendario
     horas_objetivo: int = 1776   # jornada anual objetivo (h): techo de todo lo que no sea cubrir
-    descanso_minimo: int = 12               # descanso mínimo entre jornadas (h)              — C4
-    horas_max_semana: int = 48              # máx. horas en cualquier ventana de 7 días       — C6
-    dias_max_semana: int = 6                # máx. días trabajados por semana ISO             — C5
-    ratio_rigido: float = 0.6               # a partir de qué descanso/trabajo una plaza no se
-                                            # fracciona al ceder horas (ver ritmo.py)
+    descanso_minimo: int = 12               # descanso mínimo entre jornadas (h)              -> C4
+    horas_max_semana: int = 48              # máx. horas en cualquier ventana de 7 días       -> C6
+    dias_max_semana: int = 6                # máx. días trabajados por semana ISO             -> C5
+    ratio_rigido: float = 0.6               # Parametro a priori que permite saber como gestionar algunos patrones 
+                                            # como el caso de UVI y Noches (replantear si añadir a patron como param)
 
 @dataclass
 class Capacidad:
@@ -88,8 +86,8 @@ class Capacidad:
 
 @dataclass
 class Datos:
-    turnos: dict[str, Turno]
-    trabajadores: dict[str, Trabajador]
+    turnos: dict[str, Turno]                       # Lista con nombre de turno y su objeto turno correspondiente
+    trabajadores: dict[str, Trabajador]            # Lista con nif del trabajador y su objeto trabajador
     calendario_municipio: dict[str, str]           # municipio -> calendario de festivos
     festivos: dict[str, set[date]]                 # ambito(calendario) -> fechas
     capacidades: dict[tuple[str, str], Capacidad]  # (id_trab, id_turno) -> flags
@@ -113,85 +111,80 @@ class Datos:
         """Días del año, del 1 de enero al 31 de diciembre."""
         return [self.inicio + timedelta(days=i) for i in range((self.fin - self.inicio).days + 1)]
 
+    @property
+    def primer_lunes(self) -> date:
+        """Lunes desde el que se cuentan las semanas de la rotación"""
+        return self.inicio - timedelta(days=self.inicio.weekday())    
+
     # -- Consultas derivadas ------------------------------------------------- #
-    def es_festivo(self, f: date, municipio: str) -> bool:
+    def es_festivo(self, fecha: date, municipio: str) -> bool:
         """Retorna true si esa fecha es festivo en ese municipio"""
         calendario = self.calendario_municipio.get(municipio, municipio)
-        return f in self.festivos.get("Comun", set()) or f in self.festivos.get(calendario, set())
+        return fecha in self.festivos.get("Nacional", set()) or fecha in self.festivos.get(calendario, set())
 
-    def tipo_dia(self, f: date, municipio: str) -> str:
+    def tipo_dia(self, fecha: date, municipio: str) -> str:
         """Devuelve el tipo de dia en LV | SAB | DOM | FEST """
-        if self.es_festivo(f, municipio):
+        if self.es_festivo(fecha, municipio):
             return "FEST"
-        wd = f.weekday()
-        return "LV" if wd < 5 else "SAB" if wd == 5 else "DOM"
+        dia_semana = fecha.weekday()
+        return "LV" if dia_semana < 5 else "SAB" if dia_semana == 5 else "DOM"
 
-    def opera(self, turno_id: str, f: date) -> bool:
+    def opera(self, turno_id: str, fecha: date) -> bool:
         """Devuelve si opera el turno en esa fecha teniendo en cuenta municipio y dias semana"""
-        t = self.turnos[turno_id]
-        if self.es_festivo(f, t.municipio):
-            return t.fes == 1
-        wd = f.weekday()
-        return (t.lv if wd < 5 else t.sab if wd == 5 else t.dom) == 1
+        turno = self.turnos[turno_id]
+        if self.es_festivo(fecha, turno.municipio):
+            return turno.fes == 1
+        dia_semana = fecha.weekday()
+        return (turno.lv if dia_semana < 5 else turno.sab if dia_semana == 5 else turno.dom) == 1
 
-    def intervalo(self, turno_id: str, f: date) -> tuple[datetime, datetime]:
-        """Momento real de entrada y de salida del turno ese día. Si la salida no es posterior a
-        la entrada, el turno cruza medianoche y termina al día siguiente — de ahí sale que un
-        nocturno bloquee el turno de mañana del día siguiente (descanso mínimo entre jornadas)."""
-        t = self.turnos[turno_id]
-        inicio = datetime.combine(f, t.hora_entrada)
-        fin = datetime.combine(f, t.hora_salida)
+    def intervalo(self, turno_id: str, fecha: date) -> tuple[datetime, datetime]:
+        """ Metodo que retorna el objeto datetime de inicio y datetime de fin, su finalidad es detectar aquellos turnos
+        que trascurren pasada las 0:00 con el objetivo de medir correctamente descansos"""
+        turno = self.turnos[turno_id]
+        inicio = datetime.combine(fecha, turno.hora_entrada)
+        fin = datetime.combine(fecha, turno.hora_salida)
         if fin <= inicio:
             fin += timedelta(days=1)
         return inicio, fin
 
     def franja(self, turno_id: str) -> str:
-        """Tramo del día en que se trabaja: mañana | tarde | noche.
-
-        Sale del reloj y los cortes no son arbitrarios: en estos datos ninguna línea entra entre
-        las 11:30 y las 13:30 ni entre las 16:00 y las 21:30, así que 13:00 y 21:00 caen en huecos
-        reales de la distribución. Es lo que se le fija a un correturno para toda la semana — la
-        franja es lo que de verdad organiza la vida de quien la hace.
+        """Tramo del día en que se trabaja: mañana | tarde | noche
         """
-        t = self.turnos[turno_id]
-        if t.hora_salida <= t.hora_entrada:              # cruza medianoche
+        turno = self.turnos[turno_id]
+        if turno.hora_salida <= turno.hora_entrada:              # cruza medianoche
             return "noche"
-        if t.hora_entrada.hour < 13:
+        if turno.hora_entrada.hour < 13:
             return "mañana"
-        return "tarde" if t.hora_entrada.hour < 21 else "noche"
+        return "tarde" if turno.hora_entrada.hour < 22 else "noche"
 
     def localizado(self, turno_id: str) -> bool:
         """Guardia de LOCALIZACIÓN: 24 h de reloj (entrada = salida) que computan 8. No es
-        presencia física sino disponibilidad, así que no ocupa el día siguiente — por eso los
+        presencia física sino disponibilidad, así que no ocupa el día siguiente por eso los
         patrones la encadenan con otros turnos sin contradicción.
-
-        Ojo con confundirla con el turno PARTIDO, que también dura más de lo que computa (10 h de
-        reloj con 2 h de interrupción) pero sí ocupa: la marca es la duración de 24 h, no que
-        duración > horas.
         """
-        return self.duracion(turno_id) >= 24
+        return self.duracion(turno_id) == 24
 
     def duracion(self, turno_id: str) -> float:
         """Horas REALES que dura el turno de reloj a reloj. No es lo mismo que `Turno.horas`, que
-        son las computadas por convenio (el partido y el de 24 h computan 8)."""
+        son las computadas por convenio (el partido y el de 24 h computan 8)"""
         inicio, fin = self.intervalo(turno_id, date(2000, 1, 1))
         return (fin - inicio).total_seconds() / 3600
 
-    def disponible(self, trab_id: str, f: date) -> bool:
+    def disponible(self, trab_id: str, fecha: date) -> bool:
         """Devuelve si el trabajador esta disponible en esa fecha en base a sus vacaciones"""
-        return not any(ini <= f <= fin for ini, fin in self.trabajadores[trab_id].vacaciones)
+        return not any(ini <= fecha <= fin for ini, fin in self.trabajadores[trab_id].vacaciones)
 
-    def elegible(self, trab_id: str, turno_id: str, f: date) -> tuple[bool, bool]:
+    def elegible(self, trab_id: str, turno_id: str, fecha: date) -> tuple[bool, bool]:
         """Devuelve (elegible, es_refuerzo)
         Solo si la línea opera y el trabajador está disponible.
         Normal si su capacidad cubre el tipo de día, si no, de refuerzo si tiene v=1.
         """
-        if not self.opera(turno_id, f) or not self.disponible(trab_id, f):
+        if not self.opera(turno_id, fecha) or not self.disponible(trab_id, fecha):
             return (False, False)
         cap = self.capacidades.get((trab_id, turno_id))
         if cap is None:
             return (False, False)
-        td = self.tipo_dia(f, self.turnos[turno_id].municipio)
+        td = self.tipo_dia(fecha, self.turnos[turno_id].municipio)
         normal = {"LV": cap.lv, "SAB": cap.sab, "DOM": cap.dom, "FEST": cap.fest}[td] == 1
         if normal:
             return (True, False)
@@ -295,7 +288,7 @@ def _cargar_calendarios() -> dict[str, str]:
 def _cargar_festivos() -> dict[str, set[date]]:
     """
     Festivos es de la forma diccionario con key y valor un set:
-    Comun = (01/01/2026, 24/12/2026..)
+    Nacional = (01/01/2026, 24/12/2026..)
     Valladolid = (13/05/2026,08/09/2026)
     """
     festivos = {}
@@ -372,18 +365,18 @@ def _anadir_capacidades_patron(
     """
     # Turnos (excluye LIBRE y cualquier celda vacía) que rota cada patrón.
     turnos_por_patron: dict[str, set[str]] = {}
-    for patron, filas in patrones.items():
-        rotados = {turno for fila in filas for turno in fila.values()
+    for patron_id, filas_patron in patrones.items():
+        rotados = {turno for fila in filas_patron for turno in fila.values()
                    if turno and turno != LIBRE and turno in turnos}
-        turnos_por_patron[patron] = rotados
+        turnos_por_patron[patron_id] = rotados
 
     anadidas = 0
-    for w, t in trabajadores.items():
-        if t.tipo != "patron" or not t.patron:
+    for trabajador_id, trabajador in trabajadores.items():
+        if trabajador.tipo != "patron" or not trabajador.patron:
             continue
-        for turno in turnos_por_patron.get(t.patron, ()):
-            if (w, turno) not in capacidades:               # respeta lo que ya venga del CSV
-                capacidades[(w, turno)] = Capacidad(lv=1, sab=1, dom=1, fest=1, v=0)
+        for turno_id in turnos_por_patron.get(trabajador.patron, ()):
+            if (trabajador_id, turno_id) not in capacidades:               # respeta lo que ya venga del CSV
+                capacidades[(trabajador_id, turno_id)] = Capacidad(lv=1, sab=1, dom=1, fest=1, v=0) #Suponemos que puede hacer cualquier dia ese turno
                 anadidas += 1
     return anadidas
 
@@ -396,18 +389,16 @@ def _anadir_capacidad_fijo(
     """Deriva la capacidad de los FIJOS a partir de su `linea` (declarada en trabajadores.csv), igual
     que las de patrón se derivan de patrones.csv."""
     anadidas = 0
-    for w, t in trabajadores.items():
-        if t.tipo != "fijo":
+    for trabajador_id, trabajador in trabajadores.items():
+        if trabajador.tipo != "fijo":
             continue
-        if not t.linea:
-            # Falla en voz alta: con un trabajadores.csv anterior a la columna `linea`, el fijo se
-            # quedaría sin plaza congelada y el cuadrante saldría en silencio con su línea vacía.
-            raise ValueError(f"El fijo {w} no declara `linea` en trabajadores.csv "
+        if not trabajador.linea:
+            raise ValueError(f"El fijo {trabajador_id} no declara `linea` en trabajadores.csv "
                              f"(columna obligatoria para tipo=fijo)")
-        if t.linea not in turnos:
-            raise ValueError(f"El fijo {w} declara la línea '{t.linea}', que no existe en turnos.csv")
-        if (w, t.linea) not in capacidades:                 # respeta lo que ya venga del CSV
-            capacidades[(w, t.linea)] = Capacidad(lv=1, sab=0, dom=0, fest=0, v=0)
+        if trabajador.linea not in turnos:
+            raise ValueError(f"El fijo {trabajador_id} declara la línea '{trabajador.linea}', que no existe en turnos.csv")
+        if (trabajador_id, trabajador.linea) not in capacidades:                 # respeta lo que ya venga del CSV
+            capacidades[(trabajador_id, trabajador.linea)] = Capacidad(lv=1, sab=0, dom=0, fest=0, v=0) # Suponemos fijos trabajan lunes-viernes
             anadidas += 1
     return anadidas
 
@@ -429,15 +420,15 @@ def _anadir_capacidades_correturno(
             orden_max[turno] = max(orden_max.get(turno, 0), cap.v)
 
     anadidas = 0
-    for w, t in trabajadores.items():
-        if t.tipo != "correturno":
+    for trabajador_id, trabajador in trabajadores.items():
+        if trabajador.tipo != "correturno":
             continue
         for turno in turnos:
-            if (w, turno) in capacidades:            # excepción declarada: manda ella
+            if (trabajador_id, turno) in capacidades:            # excepción declarada: manda ella, prevalece algo designado
                 continue
-            if orden_max.get(turno):                 # línea con designados: no es para él
+            if orden_max.get(turno):                 # línea con designados: no es para el, debe ceder su capacidad
                 continue
-            capacidades[(w, turno)] = Capacidad(lv=1, sab=1, dom=1, fest=1, v=0)
+            capacidades[(trabajador_id, turno)] = Capacidad(lv=1, sab=1, dom=1, fest=1, v=0)
             anadidas += 1
     return anadidas
 
@@ -452,18 +443,18 @@ def offsets_patron(
     orden alfabetico, aunque por defecto suele ser indicarlo
     """
     grupos: dict[str, list[str]] = {}
-    for w, t in trabajadores.items():
-        if t.tipo == "patron" and t.patron:
-            grupos.setdefault(t.patron, []).append(w)
+    for trabajador_id, trabajador in trabajadores.items():
+        if trabajador.tipo == "patron" and trabajador.patron:
+            grupos.setdefault(trabajador.patron, []).append(trabajador_id)
 
     offsets: dict[str, int] = {}
-    for patron, trabs in grupos.items():
-        T = len(patrones.get(patron) or ())
+    for patron_id, lista_trabajadores_id in grupos.items():
+        T = len(patrones.get(patron_id) or ())
         if not T:
             continue                                   # patrón sin filas: no hay rotación que anclar
-        for orden, w in enumerate(sorted(trabs)):
-            declarada = trabajadores[w].fila_inicial
-            offsets[w] = (declarada if declarada is not None else orden) % T
+        for orden, trabajador_id in enumerate(sorted(lista_trabajadores_id)):
+            declarada = trabajadores[trabajador_id].fila_inicial
+            offsets[trabajador_id] = (declarada if declarada is not None else orden) % T
     return offsets
 
 
