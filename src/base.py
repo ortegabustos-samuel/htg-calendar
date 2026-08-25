@@ -235,6 +235,8 @@ def colocar_mixtos(datos: Datos, plan: dict[tuple[str, date], str], libro):
             candidatos = [fecha for fecha in datos.lista_dias_calendario
                           if datos.disponible(trabajador_id, fecha)
                           and (trabajador_id, fecha) not in plan
+                          and (clase != "DOM"
+                               or (trabajador_id, fecha - timedelta(days=1)) in plan)
                           and any(datos.tipo_dia(fecha, datos.turnos[s].municipio) == clase
                                   and datos.elegible(trabajador_id, s, fecha) == (True, False)
                                   and _libre(datos, cubiertas, s, fecha) for s in findes)]
