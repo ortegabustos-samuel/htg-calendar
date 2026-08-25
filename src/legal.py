@@ -65,6 +65,15 @@ def horas_semana_ok(datos: Datos, plan: Plan, trabajador_id: str, fecha: date, t
     return horas + datos.turnos[turno].horas <= datos.config.horas_max_semana
 
 
+def domingo_ok(datos: Datos, plan: Plan, trabajador_id: str, fecha: date, turno_id: str) -> bool:
+    """El domingo solo se trabaja si también se trabaja el sábado de ese mismo fin de semana.
+    No es del convenio (no lleva número de artículo): es una regla de reparto, pero se define
+    aquí porque la consumen los mismos sitios que C4/C5/C6."""
+    if datos.tipo_dia(fecha, datos.turnos[turno_id].municipio) != "DOM":
+        return True
+    return (trabajador_id, fecha - timedelta(days=1)) in plan
+
+
 def permite(datos: Datos, plan: Plan, trabjador_id: str, fecha: date, turno_id: str,
             exento_localizado: bool = False) -> bool:
     """¿Es legal añadir este turno a este trabajador este día, sobre el plan tal y como está?"""
@@ -72,7 +81,8 @@ def permite(datos: Datos, plan: Plan, trabjador_id: str, fecha: date, turno_id: 
         return False
     return (descanso_ok(datos, plan, trabjador_id, fecha, turno_id, exento_localizado)
             and dias_semana_ok(datos, plan, trabjador_id, fecha)
-            and horas_semana_ok(datos, plan, trabjador_id, fecha, turno_id))
+            and horas_semana_ok(datos, plan, trabjador_id, fecha, turno_id)
+            and domingo_ok(datos, plan, trabjador_id, fecha, turno_id))
 
 
 def pactadas(datos: Datos, plan: Plan) -> set:
@@ -171,6 +181,8 @@ def integridad(datos: Datos, plan: Plan) -> list[str]:
             fallos.append(f"{w} hace {s} el {f:%d/%m}, día en que esa línea no opera")
         elif not datos.elegible(w, s, f)[0]:
             fallos.append(f"{w} hace {s} el {f:%d/%m} sin capacidad declarada")
+        elif not domingo_ok(datos, plan, w, f, s):
+            fallos.append(f"{w} hace {s} el {f:%d/%m} (domingo) sin el sábado de ese fin de semana")
     for (s, f), n in cuenta.items():
         if datos.turnos[s].dem and n > datos.turnos[s].dem:
             fallos.append(f"{s} el {f:%d/%m}: {n} asignados para {datos.turnos[s].dem} de demanda")
