@@ -283,12 +283,24 @@ def _valido_dia(datos: Datos, plan: Plan, libro: LibroHoras,
     antes = legal.formas(datos, plan, a, desde, hasta) + legal.formas(datos, plan, b, desde, hasta)
     del plan[(a, da)], plan[(b, db)]
     plan[(b, da)], plan[(a, db)] = sa, sb
-    if _empeora(datos, plan, a, b, desde, hasta, antes, pactadas):
+    lunes = _lunes(da)
+    rompe_domingo = (not _semana_respeta_domingo(datos, plan, a, lunes)
+                      or not _semana_respeta_domingo(datos, plan, b, lunes))
+    if rompe_domingo or _empeora(datos, plan, a, b, desde, hasta, antes, pactadas):
         del plan[(b, da)], plan[(a, db)]
         plan[(a, da)], plan[(b, db)] = sa, sb
         return False
     libro.borra(a, sa); libro.apunta(a, sb)
     libro.borra(b, sb); libro.apunta(b, sa)
+    return True
+
+
+def _semana_respeta_domingo(datos: Datos, plan: Plan, trab: str, lunes: date) -> bool:
+    for i in range(7):
+        f = lunes + timedelta(days=i)
+        s = plan.get((trab, f))
+        if s is not None and not legal.domingo_ok(datos, plan, trab, f, s):
+            return False
     return True
 
 
