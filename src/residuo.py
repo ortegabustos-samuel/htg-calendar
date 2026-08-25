@@ -257,16 +257,14 @@ def resolver(datos: Datos, plan: Plan, libro: LibroHoras, rep: forma.Reparto,
                         exenciones.append(e)
 
     for w in pool:                          # domingo sin sábado: restricción dura, nunca se paga
-        vars_por_fecha_tipo: dict[tuple[date, str], list] = defaultdict(list)
+        vars_por_fecha: dict[date, list] = defaultdict(list)
         for f, s in por_trab[w]:
-            tipo = datos.tipo_dia(f, datos.turnos[s].municipio)
-            if tipo in ("SAB", "DOM"):
-                vars_por_fecha_tipo[(f, tipo)].append(x[(w, f, s)])
-        for (f, tipo), vs in vars_por_fecha_tipo.items():
-            if tipo != "DOM":
-                continue
-            sab_vars = vars_por_fecha_tipo.get((f - timedelta(days=1), "SAB"), [])
-            modelo.Add(sum(vs) <= sum(sab_vars))
+            vars_por_fecha[f].append(x[(w, f, s)])
+        dias_domingo = {f for f, s in por_trab[w]
+                        if datos.tipo_dia(f, datos.turnos[s].municipio) == "DOM"}
+        for f in dias_domingo:
+            dia_anterior = vars_por_fecha.get(f - timedelta(days=1), [])
+            modelo.Add(sum(vars_por_fecha[f]) <= sum(dia_anterior))
 
     for w in pool:
         # C9 — jornada anual. Los correturnos llegan a cero, así que su presupuesto es entero.
