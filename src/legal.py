@@ -10,11 +10,11 @@ básicas, más las dos estructurales que salen gratis.
 
   C4  descanso mínimo entre turnos de días consecutivos    (config.descanso_minimo, 12 h)
   C5  máx. días trabajados por SEMANA ISO                  (config.dias_max_semana, 6)
-  C6  máx. horas en cualquier ventana de 7 días            (config.horas_max_semana, 48)
+  C6  máx. horas trabajadas por SEMANA ISO                 (config.horas_max_semana, 48)
 """
 from __future__ import annotations
 
-from collections import Counter
+from collections import Counter, defaultdict
 from datetime import date, timedelta
 
 from cargar_datos import Datos
@@ -50,24 +50,19 @@ def descanso_ok(datos: Datos, plan: Plan, trabajador_id: str, fecha: date, turno
     return True
 
 
-def dias_semana_ok(datos: Datos, plan: Plan, trab: str, f: date) -> bool:
+def dias_semana_ok(datos: Datos, plan: Plan, trabajador_id: str, fecha: date) -> bool:
     """C5 — como mucho `dias_max_semana` días trabajados en la semana ISO en que cae `f`."""
-    lunes = f - timedelta(days=f.weekday())
-    trabajados = sum(1 for i in range(7) if (trab, lunes + timedelta(days=i)) in plan)
+    lunes = fecha - timedelta(days=fecha.weekday())
+    trabajados = sum(1 for i in range(7) if (trabajador_id, lunes + timedelta(days=i)) in plan)
     return trabajados + 1 <= datos.config.dias_max_semana
 
 
-def horas_7dias_ok(datos: Datos, plan: Plan, trab: str, f: date, turno: str) -> bool:
-    """C6 — ninguna ventana de 7 días consecutivos que contenga a `f` puede superar
-    `horas_max_semana` horas. Ventana deslizante, no semana ISO."""
-    horas = {i: datos.turnos[plan[(trab, f + timedelta(days=i))]].horas
-             for i in range(-6, 7) if (trab, f + timedelta(days=i)) in plan}
-    nuevas = datos.turnos[turno].horas
-    for arranque in range(-6, 1):
-        ventana = sum(h for i, h in horas.items() if arranque <= i < arranque + 7)
-        if ventana + nuevas > datos.config.horas_max_semana:
-            return False
-    return True
+def horas_semana_ok(datos: Datos, plan: Plan, trabajador_id: str, fecha: date, turno: str) -> bool:
+    """C6 — como mucho `horas_max_semana` horas trabajadas en la semana ISO en que cae `f`."""
+    lunes = fecha - timedelta(days=fecha.weekday())
+    horas = sum(datos.turnos[plan[(trabajador_id, lunes + timedelta(days=i))]].horas
+                for i in range(7) if (trabajador_id, lunes + timedelta(days=i)) in plan)
+    return horas + datos.turnos[turno].horas <= datos.config.horas_max_semana
 
 
 def permite(datos: Datos, plan: Plan, trabjador_id: str, fecha: date, turno_id: str,
@@ -77,7 +72,7 @@ def permite(datos: Datos, plan: Plan, trabjador_id: str, fecha: date, turno_id: 
         return False
     return (descanso_ok(datos, plan, trabjador_id, fecha, turno_id, exento_localizado)
             and dias_semana_ok(datos, plan, trabjador_id, fecha)
-            and horas_7dias_ok(datos, plan, trabjador_id, fecha, turno_id))
+            and horas_semana_ok(datos, plan, trabjador_id, fecha, turno_id))
 
 
 def pactadas(datos: Datos, plan: Plan) -> set:
@@ -89,7 +84,7 @@ def pactadas(datos: Datos, plan: Plan) -> set:
     return salida
 
 
-def formas(datos: Datos, plan: Plan, trab: str, desde: date, hasta: date) -> Counter:
+def formas(datos: Datos, plan: Plan, trabajador_id: str, desde: date, hasta: date) -> Counter:
     """(tipo, forma) -> nº de casos de ese trabajador en el tramo. La FORMA es la secuencia de
     turnos que provoca el incumplimiento, no la persona ni la fecha: es lo que permite decir si
     algo ya lo produce el patrón o se lo ha inventado el pipeline."""
@@ -97,7 +92,7 @@ def formas(datos: Datos, plan: Plan, trab: str, desde: date, hasta: date) -> Cou
     f = desde - timedelta(days=8)
     fin = hasta + timedelta(days=8)
     while f <= fin:
-        s = plan.get((trab, f))
+        s = plan.get((trabajador_id, f))
         if s is not None:
             dias[f] = s
         f += timedelta(days=1)
@@ -111,13 +106,15 @@ def formas(datos: Datos, plan: Plan, trab: str, desde: date, hasta: date) -> Cou
             # medio, que es disponibilidad y no presencia. Sigue contándose, pero no es lo mismo.
             loc = datos.localizado(s) or datos.localizado(dias[g])
             salida[("C4-loc" if loc else "C4", (s, dias[g]))] += 1
-        ventana = [dias[f + timedelta(days=i)] for i in range(7) if f + timedelta(days=i) in dias]
-        if sum(datos.turnos[x].horas for x in ventana) > datos.config.horas_max_semana:
-            salida[("C6", tuple(sorted(ventana)))] += 1
-    semanas: Counter = Counter(f - timedelta(days=f.weekday()) for f in dias)
-    for lunes, n in semanas.items():
-        if n > datos.config.dias_max_semana:
-            salida[("C5", n)] += 1
+
+    semanas: dict[date, list[str]] = defaultdict(list)
+    for f, s in dias.items():
+        semanas[f - timedelta(days=f.weekday())].append(s)
+    for turnos in semanas.values():
+        if len(turnos) > datos.config.dias_max_semana:
+            salida[("C5", len(turnos))] += 1
+        if sum(datos.turnos[x].horas for x in turnos) > datos.config.horas_max_semana:
+            salida[("C6", tuple(sorted(turnos)))] += 1
     return salida
 
 
@@ -147,18 +144,16 @@ def infracciones(datos: Datos, plan: Plan) -> list[str]:
                     fallos.append(f"{'C4-loc' if loc else 'C4'} {w} {f:%d/%m}->{sig:%d/%m}: "
                                   f"{hueco.total_seconds() / 3600:.1f} h de descanso")
 
-        semanas: dict[date, int] = {}                           # C5
+        semanas: dict[date, list[date]] = {}                    # C5 + C6, misma semana ISO
         for f in fechas:
             lunes = f - timedelta(days=f.weekday())
-            semanas[lunes] = semanas.get(lunes, 0) + 1
-        for lunes, n in sorted(semanas.items()):
-            if n > datos.config.dias_max_semana:
-                fallos.append(f"C5 {w} semana del {lunes:%d/%m}: {n} días trabajados")
-
-        for f in fechas:                                        # C6
-            ventana = sum(h for g, h in horas.items() if 0 <= (g - f).days < 7)
-            if ventana > datos.config.horas_max_semana:
-                fallos.append(f"C6 {w} 7 días desde {f:%d/%m}: {ventana:.0f} h")
+            semanas.setdefault(lunes, []).append(f)
+        for lunes, dias_semana in sorted(semanas.items()):
+            if len(dias_semana) > datos.config.dias_max_semana:
+                fallos.append(f"C5 {w} semana del {lunes:%d/%m}: {len(dias_semana)} días trabajados")
+            total = sum(horas[f] for f in dias_semana)
+            if total > datos.config.horas_max_semana:
+                fallos.append(f"C6 {w} semana del {lunes:%d/%m}: {total:.0f} h")
     return fallos
 
 
@@ -188,8 +183,8 @@ def auditar(datos: Datos, plan: Plan, pactadas_esqueleto: set) -> None:
     La legalidad NO se mide contando: se mide por FORMAS. Los patrones incumplen el convenio por
     acuerdo con los trabajadores, así que el cuadrante nace con más de mil incumplimientos que hay
     que respetar. Lo que importa no es el total, sino cuántos tienen una forma —un par de turnos
-    seguidos, una ventana de siete días— que el esqueleto NO produce por su cuenta: esos se los ha
-    inventado el pipeline, y son los únicos que hay que mirar.
+    seguidos, una semana ISO— que el esqueleto NO produce por su cuenta: esos se los ha inventado
+    el pipeline, y son los únicos que hay que mirar.
     """
     rotos = integridad(datos, plan)
     print(f"\nAUDITORÍA — integridad: "

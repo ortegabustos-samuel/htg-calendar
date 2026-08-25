@@ -91,9 +91,10 @@ con la cobertura como invariante.
 ## Restricciones
 
 Solo las básicas, en `legal.py` y definidas una vez: **C4** descanso mínimo entre turnos, **C5** máx.
-días por **semana ISO** (permite rachas >6 a caballo de dos semanas, a sabiendas), **C6** máx. horas
-en cualquier ventana **deslizante** de 7 días. C2 (un turno/día) y C3 (cualificación) salen gratis
-por cómo están construidos el plan y `Datos.elegible`.
+días por **semana ISO** y **C6** máx. horas por esa misma **semana ISO** (ambas permiten rachas de
+días u horas por encima del tope a caballo de dos semanas, a sabiendas — es lo que ya toleran los
+patrones pactados). C2 (un turno/día) y C3 (cualificación) salen gratis por cómo están construidos
+el plan y `Datos.elegible`.
 
 **`legal` se aplica donde el pipeline INVENTA una secuencia, y solo ahí** — nunca sobre un ciclo de
 patrón heredado.

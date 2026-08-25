@@ -262,20 +262,15 @@ def resolver(datos: Datos, plan: Plan, libro: LibroHoras, rep: forma.Reparto,
                    <= _decimas(libro.objetivo(w) - libro.horas(w)))
 
         semanas: dict[date, list] = defaultdict(list)
+        horas_semana: dict[date, list] = defaultdict(list)
         for f, s in por_trab[w]:
-            semanas[forma.lunes_de(f)].append(x[(w, f, s)])
+            lunes = forma.lunes_de(f)
+            semanas[lunes].append(x[(w, f, s)])
+            horas_semana[lunes].append(_decimas(datos.turnos[s].horas) * x[(w, f, s)])
         for vs in semanas.values():                               # C5 — días por semana ISO
             modelo.Add(sum(vs) <= datos.config.dias_max_semana)
-
-        # C6 — horas en cualquier ventana de 7 días. Solo hace falta una restricción por día en
-        # que ese trabajador pueda trabajar; las demás ventanas son redundantes.
-        dias = sorted({f for f, _ in por_trab[w]})
-        horas_dia: dict[date, list] = defaultdict(list)
-        for f, s in por_trab[w]:
-            horas_dia[f].append(_decimas(datos.turnos[s].horas) * x[(w, f, s)])
-        for inicio in dias:
-            ventana = [v for g in dias if 0 <= (g - inicio).days < 7 for v in horas_dia[g]]
-            modelo.Add(sum(ventana) <= _decimas(datos.config.horas_max_semana))
+        for vs in horas_semana.values():                          # C6 — horas por semana ISO
+            modelo.Add(sum(vs) <= _decimas(datos.config.horas_max_semana))
 
     # -- Nivel 1: cobertura --------------------------------------------------- #
     cubiertas = sum(x.values()) + sum(y.values()) + sum(z.values())
@@ -562,7 +557,7 @@ def rellenar_refuerzos(datos: Datos, plan: Plan, libro: LibroHoras) -> int:
         # viernes, así que repartir sobre todos los días libres tiraba la mitad de las elecciones
         # a fines de semana y el resto acababa completándose desde enero en orden de fecha.
         while libro.exceso(w) < 0:
-            libres = [f for f in datos.fechas
+            libres = [f for f in datos.lista_dias_calendario
                       if (w, f) not in plan and datos.disponible(w, f)
                       and any(datos.elegible(w, s, f)[0] for s in refuerzos)]
             if not libres:
@@ -590,7 +585,7 @@ def rellenar_refuerzos(datos: Datos, plan: Plan, libro: LibroHoras) -> int:
 
 def resumen(datos: Datos, plan: Plan, libro: LibroHoras) -> None:
     pendientes = forma.huecos(datos, plan)
-    demanda = sum(t.dem for s, t in datos.turnos.items() for f in datos.fechas
+    demanda = sum(t.dem for s, t in datos.turnos.items() for f in datos.lista_dias_calendario
                   if datos.opera(s, f) and t.dem > 0)
     print(f"\nPASO D — cobertura final: {demanda - len(pendientes)}/{demanda} "
           f"({(demanda - len(pendientes)) / demanda:.1%}), {len(pendientes)} huecos")
