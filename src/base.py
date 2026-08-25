@@ -69,7 +69,7 @@ def prescrito(datos: Datos, trabajador_id: str, fecha: date) -> str | None:
 def construir(datos: Datos) -> dict[tuple[str, date], str]:
     """Plan base del año: {(id_trab, fecha) -> id_turno}."""
     plan: dict[tuple[str, date], str] = {}
-    for dia in datos.fechas:
+    for dia in datos.lista_dias_calendario:
         for trabajador_id in datos.trabajadores:
             if not datos.disponible(trabajador_id, dia):
                 continue                                  # vacaciones: ausencia, no asignación
@@ -100,36 +100,32 @@ def lineas_de(datos: Datos, trabajador_id: str, clase: str) -> list[str]:
 def referencia_finde(datos: Datos, plan: dict[tuple[str, date], str]) -> dict[str, Counter]:
     """Municipio -> sábados/domingos/festivos que hace de media una persona del grupo de patrón MÁS
     NUMEROSO de ese municipio.
-
-    Es la vara de medir de la equidad: el reparto que la empresa ya da por bueno, y contra el que
-    hay que equiparar a quien hoy no hace ningún fin de semana. En Valladolid sale de
-    PAT_GRANDE_VALL (38 personas): 16 sábados, 6 domingos y 3 festivos.
     """
     gente: dict[str, int] = Counter()
     municipio: dict[str, Counter] = defaultdict(Counter)
     findes: dict[str, Counter] = defaultdict(Counter)
-    for w, t in datos.trabajadores.items():
-        if t.tipo == "patron" and t.patron:
-            gente[t.patron] += 1
-    for (w, f), s in plan.items():
-        t = datos.trabajadores[w]
-        if t.tipo != "patron" or not t.patron:
+    for trabajador_id, trabajador in datos.trabajadores.items():
+        if trabajador.tipo == "patron" and trabajador.patron:
+            gente[trabajador.patron] += 1
+    for (trabajador_id, fecha), turno_id in plan.items():
+        trabajador = datos.trabajadores[trabajador_id]
+        if trabajador.tipo != "patron" or not trabajador.patron:
             continue
-        muni = datos.turnos[s].municipio
-        municipio[t.patron][muni] += 1
-        dia = datos.tipo_dia(f, muni)
+        muni = datos.turnos[turno_id].municipio
+        municipio[trabajador.patron][muni] += 1
+        dia = datos.tipo_dia(fecha, muni)
         if dia in FINDE:
-            findes[t.patron][dia] += 1
+            findes[trabajador.patron][dia] += 1
 
     mayor: dict[str, tuple[int, str]] = {}
-    for patron, n in gente.items():
-        if not municipio[patron]:
+    for patron_id, n in gente.items():
+        if not municipio[patron_id]:
             continue
-        muni = municipio[patron].most_common(1)[0][0]
+        muni = municipio[patron_id].most_common(1)[0][0]
         if muni not in mayor or n > mayor[muni][0]:
-            mayor[muni] = (n, patron)
-    return {muni: Counter({d: round(findes[patron][d] / n) for d in FINDE})
-            for muni, (n, patron) in mayor.items()}
+            mayor[muni] = (n, patron_id)
+    return {muni: Counter({d: round(findes[patron_id][d] / n) for d in FINDE})
+            for muni, (n, patron_id) in mayor.items()}
 
 
 def cuota_finde(datos: Datos, trab: str, refs: dict[str, Counter]) -> Counter:
@@ -150,15 +146,6 @@ def _elegir_linea(datos: Datos, plan: dict[tuple[str, date], str], cubiertas: Co
                   anterior: str | None) -> str | None:
     """De sus líneas descubiertas ese día: la que hacía ayer (continuidad); si no, la que menos
     gente más puede hacer, que es la más difícil de tapar por otro.
-
-    Aquí SÍ se comprueba la legalidad, al revés que en un traspaso del paso B: el mixto va saltando
-    entre varias líneas suyas de franjas distintas, así que la secuencia que resulta se la inventa
-    el pipeline y no la ha pactado nadie (una tarde que acaba a las 21:30 seguida de una mañana que
-    entra a las 07:00 son 9,5 h de descanso).
-
-    `clases` acota el tipo de día, y no es un detalle: una misma línea puede declarar `lv=1` y
-    `sab=1`, así que sin este filtro la pasada de lunes a viernes se llevaba también los sábados
-    de esa línea, sin tope, y reventaba tanto la cuota de equidad como la jornada anual.
     """
     posibles = [turno_id for turno_id in lineas
                 if datos.tipo_dia(fecha, datos.turnos[turno_id].municipio) in clases
@@ -231,7 +218,7 @@ def colocar_mixtos(datos: Datos, plan: dict[tuple[str, date], str], libro):
     for trabajador_id in mixtos:
         lv = lineas_de(datos, trabajador_id, "lv")
         anterior: str | None = None
-        for fecha in datos.fechas:                          # 1) ocupa su línea de lunes a viernes
+        for fecha in datos.lista_dias_calendario:                          # 1) ocupa su línea de lunes a viernes
             if not datos.disponible(trabajador_id, fecha) or (trabajador_id, fecha) in plan:
                 continue
             turno_id = _elegir_linea(datos, plan, cubiertas, trabajador_id, fecha, lv, ("LV",), anterior)
@@ -245,7 +232,7 @@ def colocar_mixtos(datos: Datos, plan: dict[tuple[str, date], str], libro):
         findes = lineas_de(datos, trabajador_id, "finde")   # 2) su cuota, repartida por el año
         cuota = cuota_finde(datos, trabajador_id, refs)
         for clase in FINDE:
-            candidatos = [fecha for fecha in datos.fechas
+            candidatos = [fecha for fecha in datos.lista_dias_calendario
                           if datos.disponible(trabajador_id, fecha)
                           and (trabajador_id, fecha) not in plan
                           and any(datos.tipo_dia(fecha, datos.turnos[s].municipio) == clase

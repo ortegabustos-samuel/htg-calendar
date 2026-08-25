@@ -43,13 +43,11 @@ def main() -> int:
           f"objetivo {datos.config.horas_objetivo} h/año")
     print(f"Rotación anclada al lunes {datos.primer_lunes:%d/%m/%Y}")
 
-    horas.balance(datos)
-
     # -- Paso Base ------------------------------------------------------------- #
     plan = base.construir(datos)
     libro = horas.LibroHoras.desde_plan(datos, plan)
-    horas.resumen(datos, libro, "PASO A — horas que prescribe el paso base")
-    pactadas = legal.pactadas(datos, plan) #REVISION
+    horas.resumen(datos,libro,"PASO A ")
+    pactadas = legal.pactadas(datos,plan)
 
     # -- Paso A2 ------------------------------------------------------------ #
     protegidos, flexibles = base.colocar_mixtos(datos, plan, libro)

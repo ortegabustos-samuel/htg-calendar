@@ -107,7 +107,7 @@ class Datos:
         return date(self.config.anio, 12, 31)
 
     @property
-    def fechas(self) -> list[date]:
+    def lista_dias_calendario(self) -> list[date]:
         """Días del año, del 1 de enero al 31 de diciembre."""
         return [self.inicio + timedelta(days=i) for i in range((self.fin - self.inicio).days + 1)]
 

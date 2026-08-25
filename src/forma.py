@@ -57,7 +57,7 @@ def huecos(datos: Datos, plan: Plan) -> list[tuple[str, date]]:
         cubiertas[(s, f)] += 1
     sueltas: list[tuple[str, date]] = []
     for s, t in datos.turnos.items():
-        for f in datos.fechas:
+        for f in datos.lista_dias_calendario:
             if datos.opera(s, f):
                 sueltas += [(s, f)] * max(0, t.dem - cubiertas[(s, f)])
     return sueltas
@@ -71,7 +71,7 @@ def dias_por_semana(datos: Datos) -> float:
     gente hace falta en cada franja.
     """
     horas_turno = sum(t.horas for t in datos.turnos.values()) / len(datos.turnos)
-    semanas = len(datos.fechas) / 7
+    semanas = len(datos.lista_dias_calendario) / 7
     return datos.config.horas_objetivo / semanas / horas_turno
 
 
@@ -88,7 +88,7 @@ def pool_de(datos: Datos) -> list[str]:
 def derivar_zonas(datos: Datos, sueltas: list[tuple[str, date]]) -> dict[tuple[str, str], str]:
     """(franja, municipio) -> zona. Municipio propio si su demanda semanal en esa franja llena la
     semana de una persona; si no, `resto` de esa franja."""
-    semanas = len(datos.fechas) / 7
+    semanas = len(datos.lista_dias_calendario) / 7
     cuenta: Counter = Counter()
     for s, _ in sueltas:
         cuenta[(datos.franja(s), datos.turnos[s].municipio)] += 1

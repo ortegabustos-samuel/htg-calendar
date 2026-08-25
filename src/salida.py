@@ -146,7 +146,7 @@ def escribir_excel(datos: Datos, plan: dict[tuple[str, date], str],
     vacaciones o nada.
     """
     SALIDA.mkdir(parents=True, exist_ok=True)
-    fechas = datos.fechas
+    fechas = datos.lista_dias_calendario
     wb = Workbook()
     ws = wb.active
     ws.title = "Cuadrante"
