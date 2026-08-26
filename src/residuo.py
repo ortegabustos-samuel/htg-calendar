@@ -65,7 +65,7 @@ from datetime import date, timedelta
 from ortools.sat.python import cp_model
 
 import base, forma, legal
-from cargar_datos import Datos
+from cargar_datos import DIAS_LV, Datos
 from horas import EPS, LibroHoras
 
 Plan = dict[tuple[str, date], str]
@@ -270,6 +270,37 @@ def resolver(datos: Datos, plan: Plan, libro: LibroHoras, rep: forma.Reparto,
         for f in dias_domingo:
             dia_anterior = vars_por_fecha.get(f - timedelta(days=1), [])
             modelo.Add(sum(vars_por_fecha[f]) <= sum(dia_anterior))
+
+        # descanso consecutivo tras un finde completo: restricción dura, mismo nivel que arriba
+        for lunes in {forma.lunes_de(f) for f, s in por_trab[w]}:
+            dias_semana = [lunes + timedelta(days=i) for i in range(7)]
+            sab_vars = vars_por_fecha.get(dias_semana[5], [])
+            dom_vars = vars_por_fecha.get(dias_semana[6], [])
+            if not sab_vars or not dom_vars:
+                continue                                    # esta semana no tiene ambos en juego
+            ambos_finde = modelo.NewBoolVar(f"ambosfinde_{w}_{lunes:%m%d}")
+            modelo.Add(ambos_finde >= sum(sab_vars) + sum(dom_vars) - 1)
+
+            libres = []
+            for i in range(5):
+                dia_vars = vars_por_fecha.get(dias_semana[i], [])
+                libre = modelo.NewBoolVar(f"librefinde_{w}_{dias_semana[i]:%m%d}")
+                modelo.Add(sum(dia_vars) + libre == 1)       # C2 ya garantiza como mucho 1 turno/día
+                libres.append(libre)
+
+            fijos = datos.config.dias_descanso_finde
+            if fijos:
+                idx = {nombre: i for i, nombre in enumerate(DIAS_LV)}
+                i1, i2 = sorted(idx[n] for n in fijos)
+                modelo.Add(libres[i1] + libres[i2] >= 2 * ambos_finde)
+            else:
+                pares = []
+                for i in range(4):
+                    par = modelo.NewBoolVar(f"parfinde_{w}_{dias_semana[i]:%m%d}")
+                    modelo.Add(par <= libres[i])
+                    modelo.Add(par <= libres[i + 1])
+                    pares.append(par)
+                modelo.Add(sum(pares) >= ambos_finde)
 
     for w in pool:
         # C9 — jornada anual. Los correturnos llegan a cero, así que su presupuesto es entero.
