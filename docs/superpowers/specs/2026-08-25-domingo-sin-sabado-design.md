@@ -161,7 +161,17 @@ coste de diseño adicional.
   con demanda real solo podía cubrirlo un correturno sin sábado libre esa semana.
 - Tiempo de resolución del CP-SAT: la restricción nueva es lineal en el número de días de fin de
   semana del pool (pequeño respecto a las ~23.600 variables actuales), no se espera impacto
-  perceptible.
+  perceptible. **Contradicho en la práctica** (spike del 2026-08-26, tras cerrar el plan): aislado
+  en esta máquina, con el mismo dataset y setup, el nivel 1 pasa de OPTIMAL en 35 s (valor 2677)
+  a FEASIBLE agotando el tope de 300 s (valor 2661) solo por esta restricción — confirmado
+  comparando con y sin ella, dos reconstrucciones limpias seguidas para descartar ruido de
+  máquina. La causa más probable: el nivel 1 es el único de los cuatro que arranca sin semilla
+  (`AddHint`), y el acoplamiento nuevo entre las variables de sábado y domingo de cada correturno
+  endurece justo ese espacio de búsqueda sin ayuda de arranque. Aceptado como coste conocido — la
+  cobertura FINAL del pipeline completo (tras refuerzos, canjes y equidad) no empeoró en la
+  práctica (18287/18295 tras la Task 6 frente a 18284/18295 de referencia); si el tiempo de
+  resolución llega a ser un problema real, las palancas a explorar son dar más segundos solo al
+  nivel 1 o sembrarlo con una heurística propia (hoy es el único nivel sin `AddHint`).
 
 ## Verificación
 
