@@ -54,6 +54,9 @@ class Trabajador:
                                     # semana del horizonte.
 
 
+DIAS_LV = ("lunes", "martes", "miercoles", "jueves", "viernes")   # orden canónico L-V
+
+
 @dataclass(frozen=True)             #El uso de forzen impide que se modifique el propio objeto Config (logico la configuracion
                                     # no deberia modificarse)
 class Config:
@@ -66,8 +69,12 @@ class Config:
     descanso_minimo: int = 12               # descanso mínimo entre jornadas (h)              -> C4
     horas_max_semana: int = 48              # máx. horas en cualquier ventana de 7 días       -> C6
     dias_max_semana: int = 6                # máx. días trabajados por semana ISO             -> C5
-    ratio_rigido: float = 0.6               # Parametro a priori que permite saber como gestionar algunos patrones 
+    ratio_rigido: float = 0.6               # Parametro a priori que permite saber como gestionar algunos patrones
                                             # como el caso de UVI y Noches (replantear si añadir a patron como param)
+    dias_descanso_finde: tuple[str, ...] = ()   # regla de reparto (no convenio): si sáb+dom se
+                                            # trabajan, exige este par consecutivo de DIAS_LV; vacío
+                                            # = libre elección de qué par, con tal de que sean
+                                            # consecutivos
 
 @dataclass
 class Capacidad:
@@ -334,6 +341,8 @@ def _cargar_config() -> Config:
                                      f"los que hay son {sorted(campos)}")
                 if valor is None:
                     raise ValueError(f"config.toml: {clave}={valor!r} debería ser un valor")
+                if clave == "dias_descanso_finde" and isinstance(valor, list):
+                    valor = tuple(valor)
                 valores[clave] = valor
     return Config(**valores)                            # type: ignore[arg-type]
 
