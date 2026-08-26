@@ -524,17 +524,23 @@ def fase2(datos: Datos, plan: Plan, libro: LibroHoras, ritmos: dict[str, Ritmo],
 #  Orquestación e informe
 # --------------------------------------------------------------------------- #
 def ceder(datos: Datos, plan: Plan, libro: LibroHoras,
-          protegidos: dict[str, set[date]] | None = None) -> Registro:
+          protegidos: dict[str, set[date]] | None = None,
+          ritmos: dict[str, Ritmo] | None = None) -> Registro:
     """`protegidos` son días que no se pueden ceder aunque sobren horas — hoy, los fines de semana
     de cuota que el paso A2 le dio a los mixtos: no son exceso, son la equidad que justifica que el
-    mixto salga de su línea."""
-    ritmos = ritmo_mod.medir(datos, plan)
+    mixto salga de su línea.
+
+    `ritmos`, si no se pasa, se mide aquí mismo (comportamiento de siempre) — pipeline.py ya lo
+    calcula en este mismo punto (tras colocar_mixtos) y lo pasa, para no remedirlo tres veces."""
+    if ritmos is None:
+        ritmos = ritmo_mod.medir(datos, plan)
     ritmo_mod.resumen(ritmos)
     reg = Registro()
     for w, dias in (protegidos or {}).items():
         reg.protegidos[w] |= dias
     fase1(datos, plan, libro, ritmos, reg)
     fase2(datos, plan, libro, ritmos, reg)
+    _forzar_descanso_finde(datos, plan, libro, reg, ritmos)
     return reg
 
 
@@ -550,6 +556,50 @@ def escribir_csv(reg: Registro, ruta: Path) -> None:
             escritor.writerow([c.fase, c.titular, f"{c.dias[0]:%d/%m/%Y}", f"{c.dias[-1]:%d/%m/%Y}",
                                len(c.dias), f"{c.horas:.1f}", c.cubridor or "",
                                c.desalojadas, c.motivo])
+
+
+def _forzar_descanso_finde(datos: Datos, plan: Plan, libro: LibroHoras, reg: Registro,
+                           ritmos: dict[str, Ritmo]) -> None:
+    """Tras fase1+fase2: si una semana de sábado+domingo trabajado que el pipeline SÍ tocó (le
+    cedió al menos un día) sigue sin un par consecutivo libre, cede uno más para completarlo —
+    aunque cueste una cesión de más de la que pedían solo las horas. Las semanas que nadie tocó se
+    dejan como están, igual que el resto de reglas legales sobre un patrón heredado."""
+    def lunes_de(f: date) -> date:
+        return f - timedelta(days=f.weekday())
+
+    tocadas = {(c.titular, lunes_de(f)) for c in reg.cesiones for f in c.dias}
+    titulares = sorted({c.titular for c in reg.cesiones})
+    for titular in titulares:
+        if ritmo_mod.es_rigido(datos, ritmos, titular):
+            continue
+        lunes_de_titular = sorted({lunes_de(f) for (w, f) in plan if w == titular})
+        for lunes in lunes_de_titular:
+            if legal.descanso_finde_ok(datos, plan, titular, lunes):
+                continue
+            if (titular, lunes) not in tocadas:
+                continue                                  # esqueleto puro: se tolera
+            dias_semana = [lunes + timedelta(days=i) for i in range(5)]
+            libres = [d for d in dias_semana if (titular, d) not in plan]
+            trabajados = [d for d in dias_semana if (titular, d) in plan]
+            adyacentes = [d for d in trabajados if any(abs((d - lb).days) == 1 for lb in libres)]
+            mejor = None
+            for candidato in (adyacentes or trabajados):
+                libres_para_cubrir = _libres(datos, plan, libro, plan[(titular, candidato)],
+                                             candidato, {titular})
+                if libres_para_cubrir == 0:
+                    continue
+                if mejor is None or libres_para_cubrir > mejor[1]:
+                    mejor = (candidato, libres_para_cubrir)
+            if mejor is None:
+                print(f"  aviso  {titular} semana del {lunes:%d/%m}: sábado+domingo sin par "
+                      f"consecutivo y nadie puede cubrir el día que lo completaría")
+                continue
+            candidato, _ = mejor
+            s = plan.pop((titular, candidato))
+            libro.borra(titular, s)
+            reg.cesiones.append(Cesion(fase=2, titular=titular, dias=[candidato],
+                                       horas=datos.turnos[s].horas, cubridor=None,
+                                       desalojadas=0, motivo="descanso de finde"))
 
 
 def comprobar(datos: Datos, plan: Plan, libro: LibroHoras, reg: Registro) -> None:
