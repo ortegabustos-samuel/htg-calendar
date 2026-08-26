@@ -48,6 +48,7 @@ def main() -> int:
     libro = horas.LibroHoras.desde_plan(datos, plan)
     horas.resumen(datos,libro,"PASO A ")
     pactadas = legal.pactadas(datos,plan)
+    domingos_esqueleto = {(w, f) for (w, f), s in plan.items() if not legal.domingo_ok(datos, plan, w, f, s)}
 
     # -- Paso A2 ------------------------------------------------------------ #
     protegidos, flexibles = base.colocar_mixtos(datos, plan, libro)
@@ -84,7 +85,7 @@ def main() -> int:
     info = equidad.pulir(datos, plan, libro)
     equidad.resumen(datos, plan, info)
     horas.resumen(datos, libro, "PASO E — horas finales")
-    legal.auditar(datos, plan, pactadas)
+    legal.auditar(datos, plan, pactadas, domingos_esqueleto)
 
     horas.escribir_csv(datos, plan, libro, SALIDA / "horas.csv")
     salida.escribir_excel(datos, plan)

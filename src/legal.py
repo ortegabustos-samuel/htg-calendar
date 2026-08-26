@@ -189,7 +189,8 @@ def integridad(datos: Datos, plan: Plan) -> list[str]:
     return fallos
 
 
-def auditar(datos: Datos, plan: Plan, pactadas_esqueleto: set) -> None:
+def auditar(datos: Datos, plan: Plan, pactadas_esqueleto: set,
+            domingos_esqueleto: set[tuple[str, date]] | None = None) -> None:
     """El repaso legal que se imprime al cerrar cada ejecución.
 
     La legalidad NO se mide contando: se mide por FORMAS. Los patrones incumplen el convenio por
@@ -197,10 +198,28 @@ def auditar(datos: Datos, plan: Plan, pactadas_esqueleto: set) -> None:
     que respetar. Lo que importa no es el total, sino cuántos tienen una forma —un par de turnos
     seguidos, una semana ISO— que el esqueleto NO produce por su cuenta: esos se los ha inventado
     el pipeline, y son los únicos que hay que mirar.
+
+    `domingos_esqueleto` son los domingos sueltos que ya trae el esqueleto puro (Paso A) — se
+    toleran igual que las formas pactadas de los patrones y no cuentan como FALLOS nuevos.
     """
+    domingos_esqueleto = domingos_esqueleto or set()
     rotos = integridad(datos, plan)
-    print(f"\nAUDITORÍA — integridad: "
-          + ("correcta" if not rotos else f"*** {len(rotos)} FALLOS: {rotos[0]} ***"))
+    domingo_actual = {(w, f) for (w, f), s in plan.items() if not domingo_ok(datos, plan, w, f, s)}
+    heredados = domingo_actual & domingos_esqueleto
+    nuevos_domingo = domingo_actual - domingos_esqueleto
+    otros = [r for r in rotos if "sin el sábado" not in r]
+    graves = len(otros) + len(nuevos_domingo)
+    if graves == 0:
+        extra = (f" ({len(heredados)} domingo(s) heredado(s) del esqueleto, tolerados)"
+                 if heredados else "")
+        print(f"\nAUDITORÍA — integridad: correcta{extra}")
+    else:
+        if otros:
+            ejemplo = otros[0]
+        else:
+            w, f = next(iter(nuevos_domingo))
+            ejemplo = f"{w} el {f:%d/%m}: domingo NUEVO sin el sábado de ese fin de semana"
+        print(f"\nAUDITORÍA — integridad: *** {graves} FALLOS: {ejemplo} ***")
 
     total: Counter = Counter()
     for trab in {w for (w, _) in plan}:
