@@ -18,9 +18,10 @@ from __future__ import annotations
 
 import argparse
 import sys
-import salida                                            
-import base, equidad, forma, horas, legal, libranzas, residuo
-from cargar_datos import cargar                       
+import salida
+import base, equidad, forma, horas, legal, libranzas, residuo, ritmo
+from cargar_datos import cargar
+from datetime import date, timedelta
 from pathlib import Path
 
 RAIZ = Path(__file__).resolve().parents[1]
@@ -49,13 +50,33 @@ def main() -> int:
     horas.resumen(datos,libro,"PASO A ")
     pactadas = legal.pactadas(datos,plan)
     domingos_esqueleto = {(w, f) for (w, f), s in plan.items() if not legal.domingo_ok(datos, plan, w, f, s)}
+    # ritmos_esqueleto es SOLO para la línea base tolerada de descansos_esqueleto: medido sobre
+    # el Paso A puro (antes de que mixtos/correturnos tengan ninguna asignación), es correcto para
+    # clasificar a los grupos de PATRÓN que ya existen en ese punto — que es lo único que puede
+    # aparecer en descansos_esqueleto, ver legal.py.
+    ritmos_esqueleto = ritmo.medir(datos, plan)
+    descansos_esqueleto: set[tuple[str, date]] = set()
+    vistas_esqueleto: set[tuple[str, date]] = set()
+    for (w, f) in plan:
+        lunes = f - timedelta(days=f.weekday())
+        if (w, lunes) in vistas_esqueleto or ritmo.es_rigido(datos, ritmos_esqueleto, w):
+            continue
+        vistas_esqueleto.add((w, lunes))
+        if not legal.descanso_finde_ok(datos, plan, w, lunes):
+            descansos_esqueleto.add((w, lunes))
 
     # -- Paso A2 ------------------------------------------------------------ #
     protegidos, flexibles = base.colocar_mixtos(datos, plan, libro)
     base.resumen_mixtos(datos, plan, libro)
 
+    # ritmos (a secas) es la medición que se reparte al resto del pipeline: en este punto los
+    # mixtos ya tienen su línea L-V y su cuota de finde, así que su grupo ("mixto") sí es medible
+    # — medirlo antes (como ritmos_esqueleto) los dejaría fuera. libranzas.ceder ya media esto
+    # mismo internamente si no se le pasa; aquí se calcula una vez y se reparte.
+    ritmos = ritmo.medir(datos, plan)
+
     # -- Paso B ------------------------------------------------------------- #
-    reg = libranzas.ceder(datos, plan, libro, protegidos)
+    reg = libranzas.ceder(datos, plan, libro, protegidos, ritmos)
     libranzas.comprobar(datos, plan, libro, reg)
     libranzas.escribir_csv(reg, SALIDA / "cesiones.csv")
     horas.resumen(datos, libro, "PASO B — horas tras ceder el exceso")
@@ -82,10 +103,10 @@ def main() -> int:
     residuo.resumen(datos, plan, libro)
 
     # -- Paso E ------------------------------------------------------------- #
-    info = equidad.pulir(datos, plan, libro)
+    info = equidad.pulir(datos, plan, libro, ritmos=ritmos)
     equidad.resumen(datos, plan, info)
     horas.resumen(datos, libro, "PASO E — horas finales")
-    legal.auditar(datos, plan, pactadas, domingos_esqueleto)
+    legal.auditar(datos, plan, pactadas, domingos_esqueleto, descansos_esqueleto, ritmos)
 
     horas.escribir_csv(datos, plan, libro, SALIDA / "horas.csv")
     salida.escribir_excel(datos, plan)
