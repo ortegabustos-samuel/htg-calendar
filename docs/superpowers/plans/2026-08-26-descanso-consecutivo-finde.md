@@ -680,7 +680,7 @@ EOF
 Esta tarea, como la restricción de `domingo_ok`, no admite un test aislado del resto de
 `resolver()` — es un fragmento dentro de la función de ~500 líneas que construye un único modelo
 CP-SAT. La verificación real es la ejecución completa del pipeline (Task 8) y el spike de
-rendimiento (Task 13). Aquí solo se comprueba que el fragmento no rompe la construcción del modelo,
+rendimiento (Task 16). Aquí solo se comprueba que el fragmento no rompe la construcción del modelo,
 y se hace una comprobación aislada del modelo con datos sintéticos pequeños para confirmar que la
 restricción se comporta como se espera antes de gastar los ~5 minutos de un pipeline completo.
 
@@ -1791,7 +1791,7 @@ plan de `domingo_ok`):
   esperadas»); anotar la cifra nueva.
 - Los 4 niveles del CP-SAT (`OPTIMAL`/`FEASIBLE`, valor, tiempo) — no se espera que empeoren más
   allá de lo que ya se documentó en el spike de rendimiento de `domingo_ok`; si empeoran mucho más,
-  anotarlo para la Task 13 (spike dedicado a esta restricción).
+  anotarlo para la Task 16 (spike dedicado a esta restricción).
 - Tabla de PASO A2 (mixtos) y PASO E (equidad): confirmar que no hay una caída llamativa en la
   cuota de fin de semana de ningún mixto o grupo de patrón flexible.
 
@@ -2265,7 +2265,258 @@ los niveles del CP-SAT o en las cuotas de mixtos/patrones flexibles.
 
 ---
 
-### Task 13: Spike de rendimiento del CP-SAT (con y sin la restricción nueva)
+### Task 14 (amendment, descubierta en Task 12): `libranzas.py` — `_forzar_descanso_finde` también repara al cubridor
+
+**Descubierto en Task 12** (segunda re-verificación end-to-end): de las 130 violaciones
+originales, 128 las cerraron las Tasks 10-11; las 2 restantes son un séptimo mecanismo
+preexistente y distinto — `_forzar_descanso_finde` (Task 5) nunca comprueba la semana propia de
+un **cubridor** de plaza designada tras un traspaso de fase 1, solo la del titular que cede. Ver
+el Addendum 2 en `docs/superpowers/specs/2026-08-26-descanso-consecutivo-finde-design.md`.
+
+**Files:**
+- Modify: `src/libranzas.py:561-602` (`_forzar_descanso_finde`)
+
+**Interfaces:**
+- Consumes: `Cesion.cubridor`, `Cesion.dias` (ya existen).
+
+- [ ] **Step 1: Escribir el script de verificación (debe fallar: hoy no repara al cubridor)**
+
+```bash
+cd /home/samu/Documents/Universidad/HT-GROUP && PYTHONPATH=src python3 -c "
+from datetime import timedelta
+from cargar_datos import cargar
+import legal, libranzas, horas
+from libranzas import Registro, Cesion
+
+datos = cargar()
+turno_finde, turno_lv = 'VADN022', 'VADN001'
+cubridor = '71158833F'                      # id real, PAT_GRANDE_VALL (flexible)
+domingo = next(f for f in datos.lista_dias_calendario
+               if datos.tipo_dia(f, datos.turnos[turno_finde].municipio) == 'DOM'
+               and datos.disponible(cubridor, f) and datos.disponible(cubridor, f - timedelta(days=1)))
+sabado = domingo - timedelta(days=1)
+lunes = domingo - timedelta(days=6)
+martes, miercoles, jueves, viernes = (lunes + timedelta(days=i) for i in (1, 2, 3, 4))
+
+# El cubridor asume sábado+domingo de una plaza designada (fase 1) y pierde su propio martes (el
+# día con el que chocaba la ventana asumida) — quedan libres lunes y miércoles: NO consecutivos.
+plan = {(cubridor, sabado): turno_finde, (cubridor, domingo): turno_finde,
+        (cubridor, miercoles): turno_lv, (cubridor, jueves): turno_lv, (cubridor, viernes): turno_lv}
+libro = horas.LibroHoras.desde_plan(datos, plan)
+reg = Registro()
+# Cesion de fase 1: titular es OTRA persona (quien cedió la plaza), cubridor es el afectado real.
+reg.cesiones.append(Cesion(fase=1, titular='OTRO_TITULAR', dias=[sabado, domingo], horas=16.0,
+                           cubridor=cubridor, desalojadas=1, motivo='vacaciones de OTRO_TITULAR'))
+
+libranzas._forzar_descanso_finde(datos, plan, libro, reg, ritmos={})
+assert legal.descanso_finde_ok(datos, plan, cubridor, lunes), (
+    f'la semana del cubridor debía repararse: {plan}')
+print('_forzar_descanso_finde: también repara la semana propia del cubridor — OK')
+"
+```
+
+Expected: `AssertionError: la semana del cubridor debía repararse: ...` — hoy `tocadas`/el bucle
+exterior solo indexan por `c.titular` ('OTRO_TITULAR', que ni siquiera tiene días en `plan`), así
+que la semana rota del cubridor nunca se examina.
+
+- [ ] **Step 2: Modificar `_forzar_descanso_finde` (líneas 561-602 actuales)**
+
+Antes:
+```python
+def _forzar_descanso_finde(datos: Datos, plan: Plan, libro: LibroHoras, reg: Registro,
+                           ritmos: dict[str, Ritmo]) -> None:
+    """Tras fase1+fase2: si una semana de sábado+domingo trabajado que el pipeline SÍ tocó (le
+    cedió al menos un día) sigue sin un par consecutivo libre, cede uno más para completarlo —
+    aunque cueste una cesión de más de la que pedían solo las horas. Las semanas que nadie tocó se
+    dejan como están, igual que el resto de reglas legales sobre un patrón heredado."""
+    def lunes_de(f: date) -> date:
+        return f - timedelta(days=f.weekday())
+
+    tocadas = {(c.titular, lunes_de(f)) for c in reg.cesiones for f in c.dias}
+    titulares = sorted({c.titular for c in reg.cesiones})
+    for titular in titulares:
+        if ritmo_mod.es_rigido(datos, ritmos, titular):
+            continue
+        lunes_de_titular = sorted({lunes_de(f) for (w, f) in plan if w == titular})
+        for lunes in lunes_de_titular:
+            if legal.descanso_finde_ok(datos, plan, titular, lunes):
+                continue
+            if (titular, lunes) not in tocadas:
+                continue                                  # esqueleto puro: se tolera
+            dias_semana = [lunes + timedelta(days=i) for i in range(5)]
+            libres = [d for d in dias_semana if (titular, d) not in plan]
+            trabajados = [d for d in dias_semana if (titular, d) in plan]
+            adyacentes = [d for d in trabajados if any(abs((d - lb).days) == 1 for lb in libres)]
+            mejor = None
+            for candidato in (adyacentes or trabajados):
+                libres_para_cubrir = _libres(datos, plan, libro, plan[(titular, candidato)],
+                                             candidato, {titular})
+                if libres_para_cubrir == 0:
+                    continue
+                if mejor is None or libres_para_cubrir > mejor[1]:
+                    mejor = (candidato, libres_para_cubrir)
+            if mejor is None:
+                print(f"  aviso  {titular} semana del {lunes:%d/%m}: sábado+domingo sin par "
+                      f"consecutivo y nadie puede cubrir el día que lo completaría")
+                continue
+            candidato, _ = mejor
+            s = plan.pop((titular, candidato))
+            libro.borra(titular, s)
+            reg.cesiones.append(Cesion(fase=2, titular=titular, dias=[candidato],
+                                       horas=datos.turnos[s].horas, cubridor=None,
+                                       desalojadas=0, motivo="descanso de finde"))
+```
+
+Después (renombra `titular`/`titulares` a `afectado`/`afectados` a lo largo de la función, y
+añade al cubridor a `tocadas` y al conjunto de gente a revisar):
+```python
+def _forzar_descanso_finde(datos: Datos, plan: Plan, libro: LibroHoras, reg: Registro,
+                           ritmos: dict[str, Ritmo]) -> None:
+    """Tras fase1+fase2: si una semana de sábado+domingo trabajado que el pipeline SÍ tocó (le
+    cedió al menos un día) sigue sin un par consecutivo libre, cede uno más para completarlo —
+    aunque cueste una cesión de más de la que pedían solo las horas. Las semanas que nadie tocó se
+    dejan como están, igual que el resto de reglas legales sobre un patrón heredado.
+
+    'Tocado' incluye tanto al titular que cede/está de vacaciones como al CUBRIDOR de una plaza
+    designada (fase 1): el cubridor pierde sus propios días que chocan con la ventana asumida
+    (`_aplicar_fase1`), y esa pérdida puede romperle su propio par consecutivo igual que una
+    cesión de fase 2 se lo rompe a un titular."""
+    def lunes_de(f: date) -> date:
+        return f - timedelta(days=f.weekday())
+
+    tocadas = {(c.titular, lunes_de(f)) for c in reg.cesiones for f in c.dias}
+    tocadas |= {(c.cubridor, lunes_de(f)) for c in reg.cesiones if c.cubridor for f in c.dias}
+    afectados = sorted({c.titular for c in reg.cesiones}
+                       | {c.cubridor for c in reg.cesiones if c.cubridor})
+    for afectado in afectados:
+        if ritmo_mod.es_rigido(datos, ritmos, afectado):
+            continue
+        lunes_de_afectado = sorted({lunes_de(f) for (w, f) in plan if w == afectado})
+        for lunes in lunes_de_afectado:
+            if legal.descanso_finde_ok(datos, plan, afectado, lunes):
+                continue
+            if (afectado, lunes) not in tocadas:
+                continue                                  # esqueleto puro: se tolera
+            dias_semana = [lunes + timedelta(days=i) for i in range(5)]
+            libres = [d for d in dias_semana if (afectado, d) not in plan]
+            trabajados = [d for d in dias_semana if (afectado, d) in plan]
+            adyacentes = [d for d in trabajados if any(abs((d - lb).days) == 1 for lb in libres)]
+            mejor = None
+            for candidato in (adyacentes or trabajados):
+                libres_para_cubrir = _libres(datos, plan, libro, plan[(afectado, candidato)],
+                                             candidato, {afectado})
+                if libres_para_cubrir == 0:
+                    continue
+                if mejor is None or libres_para_cubrir > mejor[1]:
+                    mejor = (candidato, libres_para_cubrir)
+            if mejor is None:
+                print(f"  aviso  {afectado} semana del {lunes:%d/%m}: sábado+domingo sin par "
+                      f"consecutivo y nadie puede cubrir el día que lo completaría")
+                continue
+            candidato, _ = mejor
+            s = plan.pop((afectado, candidato))
+            libro.borra(afectado, s)
+            reg.cesiones.append(Cesion(fase=2, titular=afectado, dias=[candidato],
+                                       horas=datos.turnos[s].horas, cubridor=None,
+                                       desalojadas=0, motivo="descanso de finde"))
+```
+
+Nota: la nueva `Cesion` de reparación sigue registrándose con `titular=afectado` (nunca
+`cubridor=algo`) independientemente de si `afectado` era originalmente un titular o un cubridor —
+es correcto: esta cesión nueva es siempre de fase 2, sin traspaso, sobre la persona que la sufre
+directamente.
+
+- [ ] **Step 3: Ejecutar el script de verificación de nuevo**
+
+Mismo comando del Step 1.
+Expected: `_forzar_descanso_finde: también repara la semana propia del cubridor — OK`
+
+- [ ] **Step 4: Verificar que el caso ya cubierto (titular de fase 2, sin cubridor) sigue
+  funcionando — repetir el Step 7 de la Task 5**
+
+```bash
+cd /home/samu/Documents/Universidad/HT-GROUP && PYTHONPATH=src python3 -c "
+from datetime import timedelta
+from cargar_datos import cargar
+import legal, libranzas, horas
+from libranzas import Registro, Cesion
+
+datos = cargar()
+turno_finde, turno_lv = 'VADN022', 'VADN001'
+titular = '71158833F'
+domingo = next(f for f in datos.lista_dias_calendario
+               if datos.tipo_dia(f, datos.turnos[turno_finde].municipio) == 'DOM'
+               and datos.disponible(titular, f) and datos.disponible(titular, f - timedelta(days=1)))
+sabado = domingo - timedelta(days=1)
+lunes = domingo - timedelta(days=6)
+martes, miercoles, jueves, viernes = (lunes + timedelta(days=i) for i in (1, 2, 3, 4))
+
+def plan_semana():
+    return {(titular, sabado): turno_finde, (titular, domingo): turno_finde,
+            (titular, martes): turno_lv, (titular, jueves): turno_lv, (titular, viernes): turno_lv}
+
+plan = plan_semana()
+libro = horas.LibroHoras.desde_plan(datos, plan)
+reg = Registro()
+reg.cesiones.append(Cesion(fase=2, titular=titular, dias=[miercoles], horas=8.0,
+                           cubridor=None, desalojadas=0, motivo='ciclo entero'))
+libranzas._forzar_descanso_finde(datos, plan, libro, reg, ritmos={})
+assert legal.descanso_finde_ok(datos, plan, titular, lunes), 'debía quedar reparada (regresión)'
+print('_forzar_descanso_finde: caso de titular sin cubridor sigue funcionando — OK')
+"
+```
+
+Expected: `_forzar_descanso_finde: caso de titular sin cubridor sigue funcionando — OK`
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/libranzas.py
+git commit -m "$(cat <<'EOF'
+libranzas: _forzar_descanso_finde también repara al cubridor
+
+Un cubridor de plaza designada (fase 1) puede perder su propio día
+entre semana al asumir el ciclo de un titular ausente, rompiendo su
+propio par consecutivo — pero el guard solo indexaba por c.titular,
+nunca por c.cubridor. Encontrado en la Task 12 (2 de las 130
+violaciones originales eran este séptimo mecanismo, distinto de los
+que cerraron las Tasks 10-11). tocadas y el bucle exterior ahora
+incluyen también al cubridor.
+
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+EOF
+)"
+```
+
+---
+
+### Task 15: Tercera y última re-verificación end-to-end
+
+**Files:** ninguno (solo ejecución)
+
+- [ ] **Step 1: Ejecutar el pipeline completo y confirmar 0 semanas nuevas sin par consecutivo**
+
+Repetir exactamente el método de las Tasks 8 y 12 (pipeline completo + réplica inline comparando
+contra `descansos_esqueleto`), sobre el código con la Task 14 aplicada.
+
+Esperado: `Pipeline completo: 0 semanas nuevas sin descanso consecutivo (N toleradas del
+esqueleto). OK`.
+
+Si sigue habiendo semanas nuevas, repetir el diagnóstico (clasificar por tipo, comparar contra
+`descansos_esqueleto`, trazar contra qué paso del pipeline las rompe) — no asumir que la Task 14
+cierra todo sin comprobarlo. Con tres rondas de diagnóstico ya hechas (Tasks 8, 12, y esta), si
+aparece un OCTAVO mecanismo distinto, es una señal de que puede haber más — considerar en ese caso
+parar y consultar con el usuario antes de seguir añadiendo tasks de una en una.
+
+- [ ] **Step 2: Reportar el resultado**
+
+No hay commit en este paso. Resume en la conversación: si el invariante ya se sostiene end-to-end
+al 100%, cobertura final comparada con la Task 12 (referencia: 18277/18295), y cualquier cambio
+relevante en los niveles del CP-SAT o en las cuotas de mixtos/patrones flexibles.
+
+---
+
+### Task 16: Spike de rendimiento del CP-SAT (con y sin la restricción nueva)
 
 **Files:** ninguno (solo ejecución, scripts en el scratchpad de la sesión)
 
