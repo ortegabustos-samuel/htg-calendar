@@ -1,6 +1,7 @@
 # Descanso consecutivo tras un fin de semana completo
 
-Fecha: 2026-08-26 · Estado: diseño aprobado, pendiente de plan de implementación
+Fecha: 2026-08-26 · Estado: Tasks 1-7 implementadas y revisadas; la Task 8 (verificación
+end-to-end) encontró tres mecanismos de `residuo.py` sin cubrir — ver «Addendum» al final.
 
 ## El problema
 
@@ -366,3 +367,63 @@ Mismo método que la regla anterior: no hay tests, la verificación es la salida
    (`pipeline_task7.log`).
 3. Spike de rendimiento del CP-SAT (A/B con y sin esta restricción, mismo método que el de ayer)
    antes de considerar el plan cerrado — no se documenta como "sin impacto" a priori.
+
+## Addendum (2026-08-26): tres mecanismos de `residuo.py` sin cubrir
+
+La Task 8 (verificación end-to-end, tras implementar y revisar las Tasks 1-7) ejecutó el pipeline
+completo y encontró **130 semanas nuevas** sin par de días consecutivos libres — el invariante no
+se sostiene. Diagnóstico completo en
+`.superpowers/sdd/2026-08-26-descanso-consecutivo-finde/task-8-report.md`; resumen:
+
+- 0 de las 130 estaban en `descansos_esqueleto` (el esqueleto puro, tras `base.construir()`): las
+  130 son nuevas, introducidas por el pipeline. 0 casos en grupos rígidos: la exención estructural
+  funciona bien donde se aplicó.
+- Reparto: correturno 103 (los 11 del pool), mixto 19 (4 de 6), patrón flexible 8 (una semana cada
+  uno). El patrón de reparto —el pool entero, no casos aislados— apunta a un fallo sistémico de
+  cobertura, no a un caso raro.
+- Causa raíz, por inspección de código: la Task 3 (residuo.py) implementó la restricción dura solo
+  para las variables `x` (asignación directa del pool a huecos reales). Tres mecanismos más, todos
+  en el mismo archivo, **nunca comprueban `descanso_finde_ok`**:
+  1. `canjear_refuerzos` (`residuo.py:444-508`) y `_cadena`/`canjear_en_cadena`
+     (`residuo.py:511-587`) — corren DESPUÉS del modelo, iteran sobre `datos.trabajadores`
+     completo (no solo el pool) y asignan un día nuevo (`plan[(w, f)] = s`) a cualquier trabajador,
+     sábado o domingo incluido. Llevan un comentario explícito razonando que son "seguros frente
+     al domingo-sin-sábado" porque el REF CAL que sueltan es siempre `lv=1` — cierto para
+     `domingo_ok`, pero **ese razonamiento no se traslada a esta regla**: soltar o rellenar un día
+     entre semana es precisamente el mecanismo que crea o destruye el par consecutivo libre.
+  2. `rellenar_refuerzos` (`residuo.py:593-638`) — solo coloca turnos L-V, así que no puede crear
+     un sábado+domingo nuevo, pero sí puede ocupar exactamente el día que formaba el único par
+     consecutivo libre de una semana ya en regla, rompiéndolo. Usa `legal.permite`, que no incluye
+     `descanso_finde_ok` (por diseño: es de semana completa, no de un día).
+  3. Las variables `z` del CP-SAT (semana flexible del mixto, `residuo.py:153-174`) — el modelo
+     está obligado a reactivar exactamente `cuantos` días de los que el paso A2 le soltó al mixto
+     (`modelo.Add(sum(suyas) == min(cuantos, len(suyas)))`), pero es libre de elegir CUÁLES,
+     siempre que respete C4. Puede reactivar un día distinto al que la Task 4 (base.py) eligió
+     deliberadamente adyacente, dejando el par consecutivo roto aunque el conteo total de días
+     libres no cambie.
+- Las variables `y` (canje de un REF CAL ya en plan por una plaza real del mismo día) se
+  analizaron y se confirma que **no necesitan arreglo**: solo aplican a un día que el trabajador
+  YA tenía ocupado (con REF CAL) antes de que el modelo corra, y cambian el turno, nunca si ese
+  día está trabajado o libre — el mismo razonamiento que ya las eximía para `domingo_ok` se
+  traslada intacto aquí, porque esta regla también es puramente sobre "trabajado vs. libre", no
+  sobre qué turno concreto.
+
+### La corrección
+
+Ver Tasks 10-11 en `docs/superpowers/plans/2026-08-26-descanso-consecutivo-finde.md`:
+
+- **Task 10** — guarda `canjear_refuerzos`, `_cadena` y `rellenar_refuerzos` con
+  `legal.descanso_finde_ok`, en el mismo punto donde ya se comprueba `legal.permite`: si añadir el
+  día nuevo rompe la regla para la semana del trabajador afectado, se deshace ese intento concreto
+  y se sigue con el siguiente candidato — mismo patrón de "aplicar, comprobar, revertir" que ya usa
+  `equidad._valido_dia`. Ceder un día (nunca ocurre en estas tres funciones más que como pago,
+  nunca como resultado final) no necesita comprobación: liberar un día no puede romper la regla,
+  solo puede ayudar o ser neutro (ver «El problema» del spec original de esta misma regla).
+- **Task 11** — para las variables `z`, una restricción dura análoga a la de la Task 3 pero
+  aplicada a la semana flexible del mixto: si esa semana ya tiene sábado Y domingo fijados en
+  `plan` (decidido en el Paso A2, invariable en este punto), se construyen variables `libre` por
+  cada día L-V de esa semana (reificadas contra `z` para los días candidatos, constantes para los
+  días fijos fuera de `candidatos`) y se exige el mismo par consecutivo (o el fijo de
+  `config.dias_descanso_finde`) que ya exige la Task 3 para el pool.
+
+Ambas se verifican con la Task 12 (re-verificación end-to-end), repitiendo el método de la Task 8.
