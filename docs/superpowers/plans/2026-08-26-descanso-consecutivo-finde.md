@@ -2301,12 +2301,16 @@ martes, miercoles, jueves, viernes = (lunes + timedelta(days=i) for i in (1, 2, 
 # El cubridor asume sábado+domingo de una plaza designada (fase 1) y pierde su propio martes (el
 # día con el que chocaba la ventana asumida) — quedan libres lunes y miércoles: NO consecutivos.
 plan = {(cubridor, sabado): turno_finde, (cubridor, domingo): turno_finde,
-        (cubridor, miercoles): turno_lv, (cubridor, jueves): turno_lv, (cubridor, viernes): turno_lv}
+        (cubridor, martes): turno_lv, (cubridor, jueves): turno_lv, (cubridor, viernes): turno_lv}
 libro = horas.LibroHoras.desde_plan(datos, plan)
+assert legal.descanso_finde_ok(datos, plan, cubridor, lunes) is False, 'lunes y miércoles ya deberían ser NO consecutivos'
 reg = Registro()
-# Cesion de fase 1: titular es OTRA persona (quien cedió la plaza), cubridor es el afectado real.
-reg.cesiones.append(Cesion(fase=1, titular='OTRO_TITULAR', dias=[sabado, domingo], horas=16.0,
-                           cubridor=cubridor, desalojadas=1, motivo='vacaciones de OTRO_TITULAR'))
+# Cesion de fase 1: titular es OTRA persona real (quien cedió la plaza; el bucle exterior de
+# _forzar_descanso_finde itera por id real vía ritmo.grupo_de, así que no vale un id inventado),
+# cubridor es el afectado real cuya semana propia debe repararse.
+otro_titular = '71117540E'                  # id real, fijo, sin relación con este escenario
+reg.cesiones.append(Cesion(fase=1, titular=otro_titular, dias=[sabado, domingo], horas=16.0,
+                           cubridor=cubridor, desalojadas=1, motivo=f'vacaciones de {otro_titular}'))
 
 libranzas._forzar_descanso_finde(datos, plan, libro, reg, ritmos={})
 assert legal.descanso_finde_ok(datos, plan, cubridor, lunes), (
