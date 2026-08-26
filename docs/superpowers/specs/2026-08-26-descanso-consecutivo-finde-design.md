@@ -427,3 +427,29 @@ Ver Tasks 10-11 en `docs/superpowers/plans/2026-08-26-descanso-consecutivo-finde
   `config.dias_descanso_finde`) que ya exige la Task 3 para el pool.
 
 Ambas se verifican con la Task 12 (re-verificación end-to-end), repitiendo el método de la Task 8.
+
+## Addendum 2 (2026-08-26): séptimo mecanismo — `libranzas.ceder`, fase 1, el cubridor
+
+La Task 12 (re-verificación tras las Tasks 10-11) bajó las violaciones de 130 a **2**, ambas
+`tipo=patron`. Diagnóstico completo en
+`.superpowers/sdd/2026-08-26-descanso-consecutivo-finde/task-12-report.md`; resumen:
+
+- Las 2 ya estaban en la lista original de 130 de la Task 8 — no las introdujo nada de las
+  Tasks 10-11 (que solo tocan `residuo.py`; estas 2 nacen en `libranzas.ceder`, fase 1).
+- Causa raíz: en `_aplicar_fase1` (`libranzas.py:346-365`), cuando un cubridor de plaza designada
+  asume el ciclo de un titular ausente/que cede, se le desalojan sus propios días que chocan con
+  la ventana asumida (`libro.borra(cubridor, plan.pop((cubridor, f)))`). El `Cesion` que queda
+  registra `titular` (quien cede) pero **nunca `cubridor`** como sujeto a revisar:
+  `_forzar_descanso_finde` (Task 5, `libranzas.py:570-571`) construye `tocadas` y su bucle
+  exterior indexando solo por `c.titular`. Si el cubridor pierde un día entre semana que formaba
+  su único par consecutivo mientras gana un fin de semana ajeno, su propia semana rota nunca se
+  comprueba ni se repara — es él quien la tiene rota, no el titular.
+- Es una omisión de alcance de la propia Task 5 (nunca probó el camino de fase 1 con traspaso
+  real), no un defecto de las Tasks 10-11, que no tocan `libranzas.py`.
+
+### La corrección
+
+Ver Task 14 en el plan: `_forzar_descanso_finde` amplía `tocadas` y su bucle exterior para incluir
+también `(c.cubridor, lunes_de(f))` por cada `f in c.dias`, además de `(c.titular, lunes_de(f))`
+— mismo criterio, misma lista de fechas ya disponible en el `Cesion`, sin cambiar el modelo de
+datos. Se verifica con la Task 15 (tercera y última re-verificación end-to-end de este plan).
