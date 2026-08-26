@@ -1880,6 +1880,20 @@ intentó y deshizo el candidato (comparar `plan == antes` tras la llamada) — s
 porque no había hueco que cubrir con `w` ese día, ajustar la fecha/turno del guion hasta encontrar
 un caso real donde SÍ compita, en vez de aceptar un test que no ejercita nada.
 
+**Dos problemas reales ya encontrados al ejecutar este guion tal cual** (sesión de implementación
+de esta Task): (1) un REF CAL nunca opera en sábado (`turnos.csv`: todo turno `dem==0` es
+`lv=1, sab=0`), así que exigir `datos.elegible(w, turno_refcal, sabado)` en la búsqueda del
+`next(...)` revienta con `StopIteration` — el REF CAL debe buscarse/colocarse siempre en un día
+L-V, nunca en el propio sábado. (2) `canjear_refuerzos` recorre `datos.trabajadores` completo
+(`candidatos = sorted(datos.trabajadores, ...)`) y todos los huecos del año
+(`forma.huecos(datos, plan)`): con los datos reales de por medio, otro trabajador distinto de `w`
+puede cubrir el hueco de `martes` antes de que el bucle llegue a `w`, dejando el escenario sin
+ejercitar el candidato de interés — falso negativo silencioso. Para aislar de verdad el camino de
+código de `w`, hace falta acotar la búsqueda con monkeypatch temporal de `datos.trabajadores`
+(a `{w: ...}`) y de `forma.huecos` (a solo `[(turno_finde... o el turno del hueco, martes)]`)
+durante la llamada a `canjear_refuerzos`, restaurando ambos después — no es hacer trampa: son
+sustituciones legítimas de la ENTRADA de búsqueda, no del código bajo prueba.
+
 - [ ] **Step 2: Modificar `canjear_refuerzos` (líneas 481-507 actuales)**
 
 Antes:
