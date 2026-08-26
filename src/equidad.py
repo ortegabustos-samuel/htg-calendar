@@ -284,6 +284,13 @@ def _valido_dia(datos: Datos, plan: Plan, libro: LibroHoras,
     del plan[(a, da)], plan[(b, db)]
     plan[(b, da)], plan[(a, db)] = sa, sb
     lunes = _lunes(da)
+    assert lunes == _lunes(db), "_valido_dia espera da y db en la misma semana ISO"
+    # Asimetría deliberada frente a _empeora: _empeora es RELATIVA (solo rechaza una forma peor
+    # que lo que el esqueleto ya tolera), _semana_respeta_domingo es ABSOLUTA (rechaza CUALQUIER
+    # domingo huérfano, incluso uno que el esqueleto ya traía antes de este intercambio). Una
+    # semana con un domingo huérfano heredado del esqueleto queda así congelada para pulir_dias
+    # —ningún intercambio de día que involucre a alguno de los dos pasará nunca esa semana—, y es
+    # intencional: esta regla no es de convenio y es más dura que las formas pactadas.
     rompe_domingo = (not _semana_respeta_domingo(datos, plan, a, lunes)
                       or not _semana_respeta_domingo(datos, plan, b, lunes))
     if rompe_domingo or _empeora(datos, plan, a, b, desde, hasta, antes, pactadas):

@@ -257,6 +257,11 @@ def resolver(datos: Datos, plan: Plan, libro: LibroHoras, rep: forma.Reparto,
                         exenciones.append(e)
 
     for w in pool:                          # domingo sin sábado: restricción dura, nunca se paga
+        # "sábado trabajado" se mide solo con variables `x` (de decisión), nunca mirando
+        # `(w, f-1) in plan` directamente. Es seguro hoy porque ningún correturno llega al paso D
+        # con un fin de semana ya fijado en el plan (no hay correturno cubridor designado, y
+        # `forma.repartir` no asigna turnos antes de este punto) — si esa invariante cambia, esta
+        # restricción tendría que contar también los sábados fijados fuera del modelo.
         vars_por_fecha: dict[date, list] = defaultdict(list)
         for f, s in por_trab[w]:
             vars_por_fecha[f].append(x[(w, f, s)])
@@ -457,6 +462,11 @@ def canjear_refuerzos(datos: Datos, plan: Plan, libro: LibroHoras) -> int:
                 usados = []
             if not legal.permite(datos, plan, w, f, s):
                 continue
+            # Se suelta el REF CAL de otro día (g) para pagar la cobertura de f. Seguro frente al
+            # domingo-sin-sábado solo porque todo turno con dem==0 en turnos.csv es lv=1 con
+            # sab/dom/fest=0: un REF CAL nunca cae en fin de semana, así que soltarlo no puede
+            # dejar huérfano un domingo. Si algún día se añade un REF CAL de fin de semana, esto
+            # habría que revisarlo.
             for g in usados:
                 libro.borra(w, plan.pop((w, g)))
                 refuerzos_de[w].remove(g)
@@ -523,7 +533,11 @@ def _cadena(datos: Datos, plan: Plan, libro: LibroHoras, refcal_dia: dict, dias_
                 relleno = datos.turnos[plan[(c, g)]].horas
                 if libro.horas(c) - relleno + datos.turnos[propio].horas > libro.objetivo(c) + EPS:
                     continue
-                # Se vacía el día G de los dos para juzgar la secuencia que le queda a C.
+                # Se vacía el día G de los dos para juzgar la secuencia que le queda a C. `ref_c`
+                # es el REF CAL que C suelta para pagar la cobertura del hueco en F (día distinto):
+                # seguro frente al domingo-sin-sábado por la misma razón que en canjear_refuerzos
+                # — todo turno con dem==0 es lv=1 sin fin de semana, así que soltarlo nunca deja
+                # huérfano un domingo.
                 ref_c, turno_w = plan.pop((c, g)), plan.pop((w, g))
                 if not legal.permite(datos, plan, c, g, propio):
                     plan[(c, g)], plan[(w, g)] = ref_c, turno_w
