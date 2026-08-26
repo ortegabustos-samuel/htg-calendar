@@ -790,9 +790,13 @@ def resuelve(fijar_sab_dom, dias_libres_forzados=()):
         return None
     return [solver.Value(d) for d in dia]
 
-# 1. Sin sábado+domingo fijados: puede trabajar los 7 días (la restricción no se activa).
+# 1. Sin sábado+domingo fijados (el solver es libre de elegir sáb/dom él mismo, maximizando):
+#    el máximo real es 6, NO 7. El solver puede trabajar sábado+domingo+los 5 laborables (7) solo
+#    si rompe la restricción, así que maximizar lo evita trabajando SOLO uno de los dos días de
+#    fin de semana (sábado o domingo, nunca ambos) más los 5 laborables = 6. Trabajar los 7 días
+#    exigiría ambos_finde=1 sin ningún par consecutivo libre, lo que la restricción prohíbe.
 sol = resuelve(fijar_sab_dom=False)
-assert sum(sol) == 7, sol
+assert sum(sol) == 6, sol
 
 # 2. Con sábado+domingo fijados, maximizando días trabajados: como mucho 5 (7 - 2 consecutivos
 #    libres), nunca 6 o 7.
