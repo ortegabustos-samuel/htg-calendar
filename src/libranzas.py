@@ -317,15 +317,24 @@ def _coste_fase1(datos: Datos, plan: Plan, libro: LibroHoras, reg: Registro, tit
 
 
 def _mejor_cubridor(datos: Datos, plan: Plan, libro: LibroHoras, reg: Registro, titular: str,
-                    unidad: Unidad, turnos: dict[date, str], cubridores: list[str]):
+                    unidad: Unidad, turnos: dict[date, str], cubridores: list[str], *,
+                    protege_domingo_titular: bool = False):
     """(coste, cubridor, unidad) del cubridor más barato, ya recortada a lo que ese cubridor puede
-    asumir. None si ninguno puede."""
+    asumir. None si ninguno puede.
+
+    `_recortar` puede dejar la unidad más pequeña que la que aprobó `candidatas()` — si le quita
+    el domingo de un sábado que sigue dentro, el titular se queda con ese domingo huérfano al
+    soltar el sábado. `protege_domingo_titular` (solo lo activa la cesión por exceso, donde el
+    titular SÍ suelta lo suyo) descarta esos cubridores; la ausencia no lo necesita porque ahí no
+    se toca el plan del titular."""
     mejor = None
     for cubridor in cubridores:
         if cubridor == titular or _solapa(reg, cubridor, unidad):
             continue
         suya = _recortar(datos, plan, cubridor, unidad, turnos)
         if suya is None:
+            continue
+        if protege_domingo_titular and _huerfano_domingo(datos, plan, titular, suya.dias):
             continue
         coste = _coste_fase1(datos, plan, libro, reg, titular, cubridor, suya,
                              sin_asumir=len(unidad.dias) - len(suya.dias))
@@ -428,7 +437,8 @@ def fase1(datos: Datos, plan: Plan, libro: LibroHoras, ritmos: dict[str, Ritmo],
                 if not all(s in cubridores for s in turnos.values()):
                     continue                            # tramo mixto: no es plaza designada
                 elegido = _mejor_cubridor(datos, plan, libro, reg, titular, unidad, turnos,
-                                          cubridores[turnos[unidad.dias[0]]])
+                                          cubridores[turnos[unidad.dias[0]]],
+                                          protege_domingo_titular=True)
                 if elegido is not None and (mejor is None or elegido[0] < mejor[0]):
                     mejor = (elegido[0], elegido[2], elegido[1], turnos)
             if mejor is None:
