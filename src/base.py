@@ -178,17 +178,27 @@ def _soltar_dia_lv(datos: Datos, plan: dict[tuple[str, date], str], libro,
     sábado. Deja las horas neutras y evita pasarse del tope de días por semana (cinco de L-V más el
     sábado ya son seis, y con el domingo siete).
 
-    CUÁL se suelta es aquí solo una elección provisional —la línea que más gente puede tapar—,
-    porque en este paso los correturnos todavía no están colocados y no hay forma de saber quién
-    estará libre. La decisión de verdad la toma el paso D, que ve la semana entera: la devolvemos
-    marcada como flexible y allí se elige el día mirando quién puede cubrir el hueco que deja.
-    Devuelve (día soltado, línea) o None si no había ninguno.
+    Si esta semana ya se soltó otro día (p.ej. al conceder el sábado, antes de conceder el
+    domingo), se prioriza el día ADYACENTE a él: sábado+domingo trabajados exigen un par de días
+    consecutivos libres entre semana (`descanso_finde_ok`), y como SAB se procesa antes que DOM
+    en `colocar_mixtos`, esta es la segunda de las dos llamadas que arma ese par.
+
+    CUÁL se suelta si no hay una semana ya empezada es solo una elección provisional —la línea que
+    más gente puede tapar—, porque en este paso los correturnos todavía no están colocados y no
+    hay forma de saber quién estará libre. La decisión de verdad la toma el paso D, que ve la
+    semana entera: la devolvemos marcada como flexible y allí se elige el día mirando quién puede
+    cubrir el hueco que deja. Devuelve (día soltado, línea) o None si no había ninguno.
     """
     lunes = f - timedelta(days=f.weekday())
     suyos = [lunes + timedelta(days=i) for i in range(5) if (trab, lunes + timedelta(days=i)) in plan]
     if not suyos:
         return None
-    peor = max(suyos, key=lambda g: sum(1 for (_, ss) in datos.capacidades if ss == plan[(trab, g)]))
+    ya_libre = [lunes + timedelta(days=i) for i in range(5)
+                if (trab, lunes + timedelta(days=i)) not in plan]
+    adyacentes = [d for d in suyos if any(abs((d - libre).days) == 1 for libre in ya_libre)]
+    candidatos = adyacentes or suyos
+    peor = max(candidatos,
+              key=lambda g: sum(1 for (_, ss) in datos.capacidades if ss == plan[(trab, g)]))
     s = plan.pop((trab, peor))
     libro.borra(trab, s)
     cubiertas[(s, peor)] -= 1
