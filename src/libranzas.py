@@ -140,6 +140,27 @@ def _descanso_de(dias: list[date], rit: Ritmo, plan: Plan, trab: str) -> list[da
     return salida
 
 
+def _huerfano_domingo(datos: Datos, plan: Plan, trab: str, dias: list[date]) -> bool:
+    """Ceder estos días juntos, ¿deja huérfano un domingo que el titular seguiría trabajando?
+
+    Un día `f` lo deja huérfano si el siguiente tiene turno en `plan`, ese siguiente NO está
+    también en `dias` (si lo estuviera, se ceden ambos juntos: no hay orfandad) y es domingo. No
+    se exige que `f` mismo sea tipo SAB: un sábado festivo debe seguir contando como sábado
+    trabajado si el titular lo trabaja — el criterio es posicional (el día natural anterior), no
+    por etiqueta de tipo (mismo criterio que ya corrigió la restricción del CP-SAT en residuo.py)."""
+    conjunto = set(dias)
+    for f in dias:
+        siguiente = f + timedelta(days=1)
+        if siguiente in conjunto:
+            continue
+        turno_siguiente = plan.get((trab, siguiente))
+        if turno_siguiente is None:
+            continue
+        if datos.tipo_dia(siguiente, datos.turnos[turno_siguiente].municipio) == "DOM":
+            return True
+    return False
+
+
 def candidatas(datos: Datos, plan: Plan, rit: Ritmo, trab: str, exceso: float,
                protegidos: set[date]) -> list[Unidad]:
     """Qué se le puede quitar a este trabajador, según lo rígida que sea su plaza."""
@@ -156,13 +177,14 @@ def candidatas(datos: Datos, plan: Plan, rit: Ritmo, trab: str, exceso: float,
     if rit.rigido:
         # No se fracciona: se cede el ciclo entero aunque pase de largo del exceso. Lo que sobre
         # deja al titular por debajo del objetivo, y esa holgura la aprovechan los pasos C y D.
-        return [unidad(b) for b in bloques]
+        return [unidad(b) for b in bloques if not _huerfano_domingo(datos, plan, trab, b)]
 
     # En las plazas flexibles se cede SIEMPRE día a día, nunca el bloque entero. Ceder una semana
     # de golpe abre cinco días seguidos de la misma línea, y taparlos exige encontrar a alguien
     # libre los cinco; repartidos por el año, cada uno se tapa por separado y con mucha más gente
     # disponible. El exceso típico de un patrón (+71 h) son nueve días sueltos, no dos semanas.
-    return [unidad([f]) for b in bloques for f in b]
+    return [unidad([f]) for b in bloques for f in b
+            if not _huerfano_domingo(datos, plan, trab, [f])]
 
 
 # --------------------------------------------------------------------------- #
