@@ -235,9 +235,9 @@ def _valido_dia(datos, plan, libro, a, da, b, db, pactadas, ritmos):
     lunes = _lunes(da)
     rompe_domingo = (...)                                 # ya existente
     rompe_descanso = (
-        (not ritmos[ritmo_mod.grupo_de(datos, a)].rigido
+        (not ritmo_mod.es_rigido(datos, ritmos, a)
          and not legal.descanso_finde_ok(datos, plan, a, lunes))
-        or (not ritmos[ritmo_mod.grupo_de(datos, b)].rigido
+        or (not ritmo_mod.es_rigido(datos, ritmos, b)
             and not legal.descanso_finde_ok(datos, plan, b, lunes))
     )
     if rompe_domingo or rompe_descanso or _empeora(...):
@@ -297,18 +297,39 @@ Tres sitios distintos necesitan saber si el grupo de un trabajador es rígido o 
 más mutado— arriesga que la rigidez de un grupo "varíe" según cuándo se mida, cuando en realidad es
 una propiedad estructural fija del patrón (ritmo descanso/trabajo de su matriz en `patrones.csv`).
 
-Se calcula **una sola vez**, en `pipeline.py`, en el mismo punto donde ya se calcula `pactadas`
-(justo tras `base.construir()`, antes de `colocar_mixtos`):
+Se calcula **una sola vez**, en `pipeline.py`, en el mismo punto donde `libranzas.ceder()` ya la
+mide hoy internamente: justo después de `colocar_mixtos` (Paso A2), no justo tras
+`base.construir()` — a esa altura los mixtos ya tienen su línea L-V y su cuota de finde en `plan`,
+así que su grupo ("mixto") sí entra en la medición; justo tras el Paso A puro no tendrían ninguna
+asignación todavía y `ritmos["mixto"]` ni existiría.
 
 ```python
-ritmos = ritmo_mod.medir(datos, plan)          # plan = la salida pura de base.construir()
+ritmos = ritmo_mod.medir(datos, plan)          # plan = salida de base.construir() + colocar_mixtos
 ```
 
 y se pasa como parámetro a `libranzas.ceder(datos, plan, libro, protegidos, ritmos)` (sustituyendo
-su medición interna actual), a `equidad.pulir(datos, plan, libro, ritmos=ritmos)` y a
+su medición interna actual, que hacía exactamente esto en el mismo punto), a
+`equidad.pulir(datos, plan, libro, ritmos=ritmos)` y a
 `legal.auditar(datos, plan, pactadas, domingos_esqueleto, descansos_esqueleto, ritmos)`. Mismo
 patrón que ya se siguió con `pactadas_esqueleto`/`domingos_esqueleto`: una medición de referencia
 temprana, threaded a través de las funciones que la necesitan, en vez de recalculada por cada una.
+
+**El correturno sigue sin tener grupo medible** (cero asignaciones hasta el paso D): cualquier
+lookup `ritmos[grupo]` debe tratarlo como "no rígido" en vez de reventar con `KeyError` — nunca es
+rígido de todas formas, por decisión ya tomada ("mixtos y correturnos: sí, siempre"). Para no
+repetir ese `.get(...)` defensivo en tres archivos, `ritmo.py` gana un helper:
+
+```python
+def es_rigido(datos: Datos, ritmos: dict[str, Ritmo], trab: str) -> bool:
+    """Como ritmos[grupo].rigido, pero seguro para un grupo sin medición (p.ej. correturno antes
+    del paso D): sin datos, se trata como flexible — nunca es rígido de todas formas."""
+    r = ritmos.get(grupo_de(datos, trab))
+    return bool(r and r.rigido)
+```
+
+`libranzas.py` (que ya mide `ritmos` en el mismo punto) puede seguir indexando directamente para
+sus propios titulares (siempre de patrón, con grupo medible); `equidad.py` (secciones 5-6, que
+opera sobre cualquier tipo) y `legal.py` (auditoría, sección 7) deben usar `ritmo.es_rigido()`.
 
 `pulir()` ya tiene hoy un `pactadas: set | None = None` con fallback a
 `legal.pactadas(datos, base.construir(datos))` cuando se llama sin ese argumento (p.ej. desde un
