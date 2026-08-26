@@ -15,13 +15,19 @@ básicas, más las dos estructurales que salen gratis.
 También vive aquí `domingo_ok` — nunca domingo suelto sin el sábado de ese fin de semana. No es
 del convenio (no lleva número de artículo, es una regla de reparto), pero la consumen los mismos
 sitios que C4/C5/C6, así que se define en el mismo lugar en vez de en uno propio.
+
+También vive aquí `descanso_finde_ok` — si sábado y domingo se trabajan la misma semana, exige un
+par de días consecutivos libres entre semana. Tampoco es del convenio, y a diferencia de
+domingo_ok no se pliega en permite(): depende de la semana completa, no de un día contra el
+anterior, así que se evalúa una vez decidida la semana (ver equidad.py, libranzas.py).
 """
 from __future__ import annotations
 
 from collections import Counter, defaultdict
 from datetime import date, timedelta
 
-from cargar_datos import Datos
+import ritmo as ritmo_mod
+from cargar_datos import Datos, DIAS_LV
 
 Plan = dict[tuple[str, date], str]
 
@@ -76,6 +82,23 @@ def domingo_ok(datos: Datos, plan: Plan, trabajador_id: str, fecha: date, turno_
     if datos.tipo_dia(fecha, datos.turnos[turno_id].municipio) != "DOM":
         return True
     return (trabajador_id, fecha - timedelta(days=1)) in plan
+
+
+def descanso_finde_ok(datos: Datos, plan: Plan, trabajador_id: str, lunes: date) -> bool:
+    """Si esa semana ISO (`lunes`..`lunes+6`) se trabajan sábado Y domingo, exige un par de días
+    consecutivos libres entre semana: el que fije config.dias_descanso_finde si está fijado, o
+    cualquier par adyacente si no. No es del convenio: es una regla de reparto, como domingo_ok.
+    A diferencia de domingo_ok, no hace falta excepción de festivos: un festivo trabajado entre
+    semana ocupa el día igual que un laborable."""
+    dias = [lunes + timedelta(days=i) for i in range(7)]
+    if (trabajador_id, dias[5]) not in plan or (trabajador_id, dias[6]) not in plan:
+        return True
+    libres = {d for d in dias[:5] if (trabajador_id, d) not in plan}
+    fijos = datos.config.dias_descanso_finde
+    if fijos:
+        idx = {nombre: i for i, nombre in enumerate(DIAS_LV)}
+        return all(dias[idx[nombre]] in libres for nombre in fijos)
+    return any(dias[i] in libres and dias[i + 1] in libres for i in range(4))
 
 
 def permite(datos: Datos, plan: Plan, trabjador_id: str, fecha: date, turno_id: str,
@@ -171,7 +194,7 @@ def infracciones(datos: Datos, plan: Plan) -> list[str]:
     return fallos
 
 
-def integridad(datos: Datos, plan: Plan) -> list[str]:
+def integridad(datos: Datos, plan: Plan, ritmos: dict[str, "ritmo_mod.Ritmo"] | None = None) -> list[str]:
     """Lo que haría el cuadrante inejecutable, al margen del convenio: alguien asignado estando de
     vacaciones, un turno en un día en que su línea no opera, alguien sin capacidad para la línea que
     hace, o más gente asignada que demanda tiene la plaza. Aquí nunca debería haber nada."""
@@ -190,11 +213,25 @@ def integridad(datos: Datos, plan: Plan) -> list[str]:
     for (s, f), n in cuenta.items():
         if datos.turnos[s].dem and n > datos.turnos[s].dem:
             fallos.append(f"{s} el {f:%d/%m}: {n} asignados para {datos.turnos[s].dem} de demanda")
+
+    if ritmos is None:
+        ritmos = ritmo_mod.medir(datos, plan)
+    vistas: set[tuple[str, date]] = set()
+    for (w, f) in plan:
+        lunes = f - timedelta(days=f.weekday())
+        if (w, lunes) in vistas or ritmo_mod.es_rigido(datos, ritmos, w):
+            continue
+        vistas.add((w, lunes))
+        if not descanso_finde_ok(datos, plan, w, lunes):
+            fallos.append(f"{w} semana del {lunes:%d/%m}: sábado y domingo sin un par de días "
+                          f"consecutivos libres entre semana")
     return fallos
 
 
 def auditar(datos: Datos, plan: Plan, pactadas_esqueleto: set,
-            domingos_esqueleto: set[tuple[str, date]] | None = None) -> None:
+            domingos_esqueleto: set[tuple[str, date]] | None = None,
+            descansos_esqueleto: set[tuple[str, date]] | None = None,
+            ritmos: dict[str, "ritmo_mod.Ritmo"] | None = None) -> None:
     """El repaso legal que se imprime al cerrar cada ejecución.
 
     La legalidad NO se mide contando: se mide por FORMAS. Los patrones incumplen el convenio por
@@ -203,26 +240,52 @@ def auditar(datos: Datos, plan: Plan, pactadas_esqueleto: set,
     seguidos, una semana ISO— que el esqueleto NO produce por su cuenta: esos se los ha inventado
     el pipeline, y son los únicos que hay que mirar.
 
-    `domingos_esqueleto` son los domingos sueltos que ya trae el esqueleto puro (Paso A) — se
-    toleran igual que las formas pactadas de los patrones y no cuentan como FALLOS nuevos.
+    domingos_esqueleto y descansos_esqueleto son lo que ya trae el esqueleto puro (Paso A) para
+    cada regla — se toleran igual que las formas pactadas de los patrones y no cuentan como
+    FALLOS nuevos.
     """
     domingos_esqueleto = domingos_esqueleto or set()
-    rotos = integridad(datos, plan)
+    descansos_esqueleto = descansos_esqueleto or set()
+    if ritmos is None:
+        ritmos = ritmo_mod.medir(datos, plan)
+    rotos = integridad(datos, plan, ritmos)
+
     domingo_actual = {(w, f) for (w, f), s in plan.items() if not domingo_ok(datos, plan, w, f, s)}
-    heredados = domingo_actual & domingos_esqueleto
+    heredados_dom = domingo_actual & domingos_esqueleto
     nuevos_domingo = domingo_actual - domingos_esqueleto
-    otros = [r for r in rotos if "sin el sábado" not in r]
-    graves = len(otros) + len(nuevos_domingo)
+
+    descanso_actual: set[tuple[str, date]] = set()
+    vistas: set[tuple[str, date]] = set()
+    for (w, f) in plan:
+        lunes = f - timedelta(days=f.weekday())
+        if (w, lunes) in vistas or ritmo_mod.es_rigido(datos, ritmos, w):
+            continue
+        vistas.add((w, lunes))
+        if not descanso_finde_ok(datos, plan, w, lunes):
+            descanso_actual.add((w, lunes))
+    heredados_desc = descanso_actual & descansos_esqueleto
+    nuevos_descanso = descanso_actual - descansos_esqueleto
+
+    otros = [r for r in rotos if "sin el sábado" not in r and "consecutivos libres" not in r]
+    graves = len(otros) + len(nuevos_domingo) + len(nuevos_descanso)
     if graves == 0:
-        extra = (f" ({len(heredados)} domingo(s) heredado(s) del esqueleto, tolerados)"
-                 if heredados else "")
+        extra_bits = []
+        if heredados_dom:
+            extra_bits.append(f"{len(heredados_dom)} domingo(s) heredado(s) del esqueleto")
+        if heredados_desc:
+            extra_bits.append(f"{len(heredados_desc)} semana(s) sin descanso consecutivo "
+                              f"heredada(s) del esqueleto")
+        extra = f" ({', '.join(extra_bits)}, tolerados)" if extra_bits else ""
         print(f"\nAUDITORÍA — integridad: correcta{extra}")
     else:
         if otros:
             ejemplo = otros[0]
-        else:
+        elif nuevos_domingo:
             w, f = next(iter(nuevos_domingo))
             ejemplo = f"{w} el {f:%d/%m}: domingo NUEVO sin el sábado de ese fin de semana"
+        else:
+            w, lunes = next(iter(nuevos_descanso))
+            ejemplo = f"{w} semana del {lunes:%d/%m}: NUEVA sin par de días consecutivos libres"
         print(f"\nAUDITORÍA — integridad: *** {graves} FALLOS: {ejemplo} ***")
 
     total: Counter = Counter()

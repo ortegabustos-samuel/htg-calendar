@@ -63,6 +63,14 @@ def grupo_de(datos: Datos, trab: str) -> str:
     return t.patron if t.tipo == "patron" and t.patron else t.tipo
 
 
+def es_rigido(datos: Datos, ritmos: dict[str, Ritmo], trab: str) -> bool:
+    """Como ritmos[grupo].rigido, pero seguro para un grupo sin medición (p.ej. correturno antes
+    del paso D, sin ninguna asignación todavía): sin datos, se trata como flexible — nunca es
+    rígido de todas formas."""
+    r = ritmos.get(grupo_de(datos, trab))
+    return bool(r and r.rigido)
+
+
 def medir(datos: Datos, plan: Plan) -> dict[str, Ritmo]:
     """Ritmo de cada grupo, medido sobre el plan que se le pase."""
     trabajo: dict[str, Counter] = defaultdict(Counter)
