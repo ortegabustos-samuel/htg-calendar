@@ -173,6 +173,44 @@ def resolver(datos: Datos, plan: Plan, libro: LibroHoras, rep: forma.Reparto,
                         and (a, b) in _pares_incompatibles(datos, [a, b])[0]):
                     modelo.AddAtMostOne([z[(trab, g, a)], z[(trab, k, b)]])
 
+        dias_semana_trab = [lunes + timedelta(days=i) for i in range(7)]
+        sab_t, dom_t = dias_semana_trab[5], dias_semana_trab[6]
+        if (trab, sab_t) in plan and (trab, dom_t) in plan:
+            # Sábado y domingo ya están fijados en plan (decididos en el paso A2, invariables
+            # aquí) — igual que en el bloque de la Task 3, exige un par consecutivo libre entre
+            # semana. z solo cubre los días candidatos; los demás días L-V de esta semana están
+            # fijados fuera del modelo, así que su libre/trabajado es una constante, no una
+            # variable.
+            candidatos_por_dia = {g: s for g, s in candidatos}
+            libres_l_v = []
+            for i in range(5):
+                dia = dias_semana_trab[i]
+                s_dia = candidatos_por_dia.get(dia)
+                if s_dia is not None and (trab, dia, s_dia) in z:
+                    libre = modelo.NewBoolVar(f"librefinde_z_{trab}_{dia:%m%d}")
+                    modelo.Add(z[(trab, dia, s_dia)] + libre == 1)
+                else:
+                    libre = 0 if (trab, dia) in plan else 1
+                libres_l_v.append(libre)
+
+            fijos = datos.config.dias_descanso_finde
+            if fijos:
+                idx = {nombre: i for i, nombre in enumerate(DIAS_LV)}
+                i1, i2 = sorted(idx[n] for n in fijos)
+                modelo.Add(libres_l_v[i1] + libres_l_v[i2] >= 2)
+            else:
+                pares_z = []
+                for i in range(4):
+                    a, b = libres_l_v[i], libres_l_v[i + 1]
+                    if isinstance(a, int) and isinstance(b, int):
+                        pares_z.append(1 if a and b else 0)
+                        continue
+                    par = modelo.NewBoolVar(f"parfinde_z_{trab}_{dias_semana_trab[i]:%m%d}")
+                    modelo.Add(par <= a)
+                    modelo.Add(par <= b)
+                    pares_z.append(par)
+                modelo.Add(sum(pares_z) >= 1)
+
     por_dia: dict[tuple[str, date], list] = defaultdict(list)
     por_plaza: dict[tuple[str, date], list] = defaultdict(list)
     por_trab: dict[str, list[tuple[date, str]]] = defaultdict(list)
