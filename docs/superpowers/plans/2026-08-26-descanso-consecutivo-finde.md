@@ -873,43 +873,65 @@ EOF
 ```bash
 cd /home/samu/Documents/Universidad/HT-GROUP && PYTHONPATH=src python3 -c "
 from datetime import timedelta
-from cargar_datos import cargar
+from cargar_datos import cargar, Turno, Capacidad
 import base, horas
+from collections import Counter
 
 datos = cargar()
 turno = 'VADN022'
 domingo = next(f for f in datos.lista_dias_calendario
                if datos.tipo_dia(f, datos.turnos[turno].municipio) == 'DOM')
 lunes = domingo - timedelta(days=6)
-martes, miercoles, jueves, viernes = (lunes + timedelta(days=i) for i in (1, 2, 3, 4))
+dias = [lunes + timedelta(days=i) for i in range(5)]
+lunes_, martes, miercoles, jueves, viernes = dias
 trab = '12402832J'                          # id real, mixto
-turno_lv = next(s for s, t in datos.turnos.items()
-                if t.lv == 1 and datos.elegible(trab, s, lunes)[0])
 
-plan = {(trab, lunes): turno_lv, (trab, martes): turno_lv, (trab, miercoles): turno_lv,
-        (trab, jueves): turno_lv, (trab, viernes): turno_lv}
+# Un turno L-V SINTÉTICO POR DÍA, con 'popularidad' (nº de capacitados) muy distinta — usar el
+# MISMO turno los 5 días (como hacía una versión anterior de este script) empata el criterio
+# 'peor' por completo, y max() de Python resuelve el empate por orden de lista (lunes, martes...),
+# que salen adyacentes por pura coincidencia sin que la lógica de adyacencia haga nada. Con
+# popularidades distintas, el criterio SÍ discrimina: lunes es el más popular (gana la primera
+# llamada); viernes es el segundo más popular (ganaría la segunda llamada SIN la lógica de
+# adyacencia); martes es el menos popular pero adyacente a lunes (debe ganar la segunda llamada
+# CON la lógica de adyacencia).
+popularidad = {lunes_: 10, martes: 1, miercoles: 5, jueves: 2, viernes: 8}
+turno_de = {}
+for f in dias:
+    tid = f'TESTLV_{f:%m%d}'
+    datos.turnos[tid] = Turno(id=tid, municipio=datos.turnos[turno].municipio, lv=1, sab=0, dom=0,
+                              fes=0, hora_entrada=datos.turnos[turno].hora_entrada,
+                              hora_salida=datos.turnos[turno].hora_salida, dem=1, horas=8.0)
+    for j in range(popularidad[f]):
+        datos.capacidades[(f'FAKE_{f:%m%d}_{j}', tid)] = Capacidad(lv=1, sab=0, dom=0, fest=0, v=0)
+    turno_de[f] = tid
+
+plan = {(trab, f): turno_de[f] for f in dias}
 libro = horas.LibroHoras.desde_plan(datos, plan)
-cubiertas = __import__('collections').Counter()
+cubiertas = Counter()
 for (_, f), s in plan.items():
     cubiertas[(s, f)] += 1
 
-# Primera llamada (nada libre todavía): comportamiento normal, cualquiera puede salir.
+# Primera llamada (nada libre todavía): gana el más popular -> lunes (10).
 primero = base._soltar_dia_lv(datos, plan, libro, cubiertas, trab, domingo)
 assert primero is not None
 dia_libre_1, _ = primero
+assert dia_libre_1 == lunes_, f'se esperaba lunes (el más popular, 10), salió {dia_libre_1}'
 
-# Segunda llamada (ya hay un día libre esa semana): debe preferir el adyacente.
+# Segunda llamada: con lunes ya libre, debe preferir el ADYACENTE (martes, popularidad 1) en vez
+# del más popular de los restantes (viernes, popularidad 8) — eso es justo lo que probaría que la
+# lógica de adyacencia funciona: sin ella, ganaría viernes.
 segundo = base._soltar_dia_lv(datos, plan, libro, cubiertas, trab, domingo)
 assert segundo is not None
 dia_libre_2, _ = segundo
-assert abs((dia_libre_2 - dia_libre_1).days) == 1, (
-    f'{dia_libre_1} y {dia_libre_2} no son consecutivos')
-print('_soltar_dia_lv: la segunda llamada libera el día adyacente — OK')
+assert dia_libre_2 == martes, (
+    f'se esperaba martes (adyacente a lunes, aunque menos popular), salió {dia_libre_2}')
+print('_soltar_dia_lv: la segunda llamada prioriza el adyacente sobre el más popular — OK')
 "
 ```
 
-Expected: `AssertionError: ... no son consecutivos` (hoy cada llamada elige "peor" de forma
-independiente, sin garantía de adyacencia).
+Expected: `AssertionError: se esperaba martes (adyacente a lunes, aunque menos popular), salió
+2026-XX-XX` (con la fecha de viernes) — hoy la segunda llamada elige "peor" sobre TODOS los
+restantes sin mirar adyacencia, así que gana viernes (popularidad 8) en vez de martes.
 
 - [ ] **Step 2: Modificar `_soltar_dia_lv` (líneas 173-195 actuales)**
 
