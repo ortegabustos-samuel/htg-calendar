@@ -405,18 +405,18 @@ domingo = next(f for f in datos.lista_dias_calendario
                and datos.disponible(w, f) and datos.disponible(w, f - timedelta(days=1)))
 sabado = domingo - timedelta(days=1)
 lunes = domingo - timedelta(days=6)
-martes = lunes + timedelta(days=1)
+martes, miercoles, jueves, viernes = (lunes + timedelta(days=i) for i in (1, 2, 3, 4))
 
 # Semana sin par consecutivo: integridad() debe detectarlo (con ritmos vacío, correturno no es
-# rígido por defecto — ver Task 2 Step 1-3).
-plan = {(w, sabado): turno_finde, (w, domingo): turno_finde, (w, martes): turno_lv}
+# rígido por defecto — ver Task 2 Step 1-3). OJO: quitar un solo día de los 5 laborables NUNCA
+# rompe todos los pares posibles (con 4 libres de 5, siempre queda alguna pareja adyacente) — hay
+# que dejar TRES trabajados y dos libres NO consecutivos (lunes y jueves, a 3 días de distancia).
+plan = {(w, sabado): turno_finde, (w, domingo): turno_finde, (w, martes): turno_lv,
+        (w, miercoles): turno_lv, (w, viernes): turno_lv}
 fallos = legal.integridad(datos, plan, ritmos={})
 assert any('consecutivos libres' in f for f in fallos), fallos
 
 # Con el par consecutivo (lunes+martes libres, resto trabajado): no debe aparecer.
-miercoles = lunes + timedelta(days=2)
-jueves = lunes + timedelta(days=3)
-viernes = lunes + timedelta(days=4)
 plan_ok = {(w, sabado): turno_finde, (w, domingo): turno_finde,
            (w, miercoles): turno_lv, (w, jueves): turno_lv, (w, viernes): turno_lv}
 fallos_ok = legal.integridad(datos, plan_ok, ritmos={})
@@ -519,10 +519,13 @@ domingo = next(f for f in datos.lista_dias_calendario
                and datos.disponible(w, f) and datos.disponible(w, f - timedelta(days=1)))
 sabado = domingo - timedelta(days=1)
 lunes = domingo - timedelta(days=6)
-martes = lunes + timedelta(days=1)
+martes, miercoles, jueves, viernes = (lunes + timedelta(days=i) for i in (1, 2, 3, 4))
 
-# Semana sin par consecutivo, YA en la línea base tolerada -> auditoría limpia (con extra).
-plan = {(w, sabado): turno_finde, (w, domingo): turno_finde, (w, martes): turno_lv}
+# Semana sin par consecutivo, YA en la línea base tolerada -> auditoría limpia (con extra). Mismo
+# cuidado que en el Step 8: hacen falta 3 días trabajados entre semana (no 1) para dejar los dos
+# libres (lunes, jueves) sin ser adyacentes.
+plan = {(w, sabado): turno_finde, (w, domingo): turno_finde, (w, martes): turno_lv,
+        (w, miercoles): turno_lv, (w, viernes): turno_lv}
 legal.auditar(datos, plan, set(), descansos_esqueleto={(w, lunes)}, ritmos={})
 print()
 
