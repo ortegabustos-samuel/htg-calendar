@@ -1139,7 +1139,8 @@ def ceder(datos: Datos, plan: Plan, libro: LibroHoras,
 - [ ] **Step 3: Ejecutar el script de verificación de nuevo**
 
 Mismo comando del Step 1.
-Expected: `TypeError: _forzar_descanso_finde is not defined` (todavía no existe — es el Step 5).
+Expected: `NameError: name '_forzar_descanso_finde' is not defined` (todavía no existe — es el
+Step 5).
 Este es un fallo intermedio esperado: confirma que `ceder()` ya intenta llamarla.
 
 - [ ] **Step 4: Escribir el script de verificación de `_forzar_descanso_finde` (debe fallar: no
