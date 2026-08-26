@@ -11,6 +11,10 @@ básicas, más las dos estructurales que salen gratis.
   C4  descanso mínimo entre turnos de días consecutivos    (config.descanso_minimo, 12 h)
   C5  máx. días trabajados por SEMANA ISO                  (config.dias_max_semana, 6)
   C6  máx. horas trabajadas por SEMANA ISO                 (config.horas_max_semana, 48)
+
+También vive aquí `domingo_ok` — nunca domingo suelto sin el sábado de ese fin de semana. No es
+del convenio (no lleva número de artículo, es una regla de reparto), pero la consumen los mismos
+sitios que C4/C5/C6, así que se define en el mismo lugar en vez de en uno propio.
 """
 from __future__ import annotations
 

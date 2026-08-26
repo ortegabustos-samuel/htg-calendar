@@ -99,6 +99,10 @@ el plan y `Datos.elegible`.
 **`legal` se aplica donde el pipeline INVENTA una secuencia, y solo ahí** — nunca sobre un ciclo de
 patrón heredado.
 
+`legal.py` guarda también `domingo_ok` — nunca domingo suelto sin el sábado de ese fin de semana.
+No es del convenio (no lleva número de artículo, es una regla de reparto), pero va plegada como
+puerta dura dentro de `permite()`, así que se aplica en todos los sitios que ya llaman a `permite()`.
+
 **Localizado**: las guardias de 24 h (entrada = salida, computan 8) son de localización, no de
 presencia. No ocupan el día siguiente. Ojo: no vale "dura más de lo que computa", que también coge
 los turnos **partidos** (10 h de reloj con 2 h de interrupción), que sí ocupan. La exención de C4 va

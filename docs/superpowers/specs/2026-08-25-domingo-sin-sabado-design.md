@@ -1,7 +1,9 @@
 # Nunca domingo suelto: el domingo exige el sábado de su fin de semana
 
-Fecha: 2026-08-25 · Estado: Tasks 1-4 implementadas y revisadas; Task 5 (verificación end-to-end)
-encontró un sexto mecanismo no contemplado — ver «Addendum» al final.
+Fecha: 2026-08-25 · Estado: Tasks 1-7 implementadas y revisadas; Task 5 (verificación end-to-end)
+encontró un sexto mecanismo no contemplado (`libranzas.ceder`), la Task 6 lo cerró y la Task 7
+confirmó el invariante end-to-end — solo queda el caso benigno del esqueleto, tolerado por diseño.
+Ver «Addendum» al final.
 
 ## El problema
 
@@ -12,7 +14,8 @@ aplicarse a todos los trabajadores; los de patrón quedan a salvo por construcci
 secuencia — ver `CLAUDE.md`).
 
 La regla no existe hoy en ningún sitio, y hay **cinco mecanismos** que deciden, cada uno por su
-cuenta, si alguien trabaja un día concreto de fin de semana sin saber nada de los demás:
+cuenta, si alguien trabaja un día concreto de fin de semana sin saber nada de los demás (un sexto,
+`libranzas.ceder`, apareció más tarde en la verificación end-to-end — ver «Addendum»):
 
 1. `base.colocar_mixtos` (fase 2, paso A2) — reparte la cuota de SAB/DOM/FEST de cada mixto por
    separado, un `for clase in FINDE` independiente por clase.
