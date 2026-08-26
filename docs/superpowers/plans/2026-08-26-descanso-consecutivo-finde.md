@@ -680,7 +680,7 @@ EOF
 Esta tarea, como la restricción de `domingo_ok`, no admite un test aislado del resto de
 `resolver()` — es un fragmento dentro de la función de ~500 líneas que construye un único modelo
 CP-SAT. La verificación real es la ejecución completa del pipeline (Task 8) y el spike de
-rendimiento (Task 9). Aquí solo se comprueba que el fragmento no rompe la construcción del modelo,
+rendimiento (Task 13). Aquí solo se comprueba que el fragmento no rompe la construcción del modelo,
 y se hace una comprobación aislada del modelo con datos sintéticos pequeños para confirmar que la
 restricción se comporta como se espera antes de gastar los ~5 minutos de un pipeline completo.
 
@@ -1791,7 +1791,7 @@ plan de `domingo_ok`):
   esperadas»); anotar la cifra nueva.
 - Los 4 niveles del CP-SAT (`OPTIMAL`/`FEASIBLE`, valor, tiempo) — no se espera que empeoren más
   allá de lo que ya se documentó en el spike de rendimiento de `domingo_ok`; si empeoran mucho más,
-  anotarlo para la Task 9 (spike dedicado a esta restricción).
+  anotarlo para la Task 13 (spike dedicado a esta restricción).
 - Tabla de PASO A2 (mixtos) y PASO E (equidad): confirmar que no hay una caída llamativa en la
   cuota de fin de semana de ningún mixto o grupo de patrón flexible.
 
@@ -1806,7 +1806,452 @@ forma notable respecto a la referencia de `domingo_ok`.
 
 ---
 
-### Task 9: Spike de rendimiento del CP-SAT (con y sin la restricción nueva)
+### Task 10 (amendment, descubierta en Task 8): `residuo.py` — guarda los tres canjes/relleno posteriores al modelo
+
+**Descubierto en Task 8** (verificación end-to-end): 130 semanas nuevas sin par consecutivo, la
+mayoría (correturno + buena parte de mixto) trazables a `canjear_refuerzos`, `canjear_en_cadena`
+(`_cadena`) y `rellenar_refuerzos` — los tres asignan un día nuevo a un trabajador sin comprobar
+`legal.descanso_finde_ok`. Ver el Addendum en
+`docs/superpowers/specs/2026-08-26-descanso-consecutivo-finde-design.md` para el diagnóstico
+completo.
+
+**Files:**
+- Modify: `src/residuo.py:444-508` (`canjear_refuerzos`)
+- Modify: `src/residuo.py:545-587` (`_cadena`)
+- Modify: `src/residuo.py:593-638` (`rellenar_refuerzos`)
+
+**Interfaces:**
+- Consumes: `legal.descanso_finde_ok` (Task 2), `forma.lunes_de` (ya existe).
+
+Las tres funciones comparten el mismo patrón de arreglo: comprobar `legal.descanso_finde_ok`
+justo después de añadir el día nuevo al `plan` (nunca al ceder uno: ceder solo puede ayudar o ser
+neutro para esta regla, nunca romperla — ver «El problema» del spec), y deshacer ese candidato
+concreto si lo rompe, igual que ya se hace con `legal.permite`.
+
+- [ ] **Step 1: Escribir el script de verificación de `canjear_refuerzos` (debe fallar: hoy puede
+  romper el par consecutivo)**
+
+```bash
+cd /home/samu/Documents/Universidad/HT-GROUP && PYTHONPATH=src python3 -c "
+from datetime import timedelta
+from cargar_datos import cargar
+import legal, residuo, horas
+
+datos = cargar()
+turno_finde, turno_lv, turno_refcal = 'VADN022', 'VADN001', next(
+    s for s, t in datos.turnos.items() if t.dem == 0)
+w = '71225031B'                              # id real, correturno
+
+domingo = next(f for f in datos.lista_dias_calendario
+               if datos.tipo_dia(f, datos.turnos[turno_finde].municipio) == 'DOM'
+               and all(datos.disponible(w, f - timedelta(days=i)) for i in range(7))
+               and datos.elegible(w, turno_refcal, f - timedelta(days=1))[0])
+sabado = domingo - timedelta(days=1)
+lunes = domingo - timedelta(days=6)
+martes, miercoles, jueves, viernes = (lunes + timedelta(days=i) for i in (1, 2, 3, 4))
+
+# w tiene sábado+domingo trabajados y libres martes+miércoles (su único par consecutivo); el
+# REF CAL que 'usados' soltaría para pagar un hueco cualquiera es justo el sábado libre... no,
+# es un día YA TRABAJADO por w con turno_refcal: lo situamos en jueves (fuera del par). Al
+# soltarlo para pagar un hueco en, p.ej., viernes (que se AÑADE), w pasaría a trabajar viernes y
+# perder... en realidad lo que rompe el par es AÑADIR viernes mismo si viernes fuera parte del
+# par — aquí construimos el caso más directo: el hueco a cubrir (f) es exactamente uno de los dos
+# días libres del par (martes), y cubrirlo lo ocupa, dejando solo miércoles libre (sin pareja).
+plan = {(w, sabado): turno_finde, (w, domingo): turno_finde, (w, jueves): turno_refcal,
+        (w, viernes): turno_lv}
+libro = horas.LibroHoras.desde_plan(datos, plan)
+assert legal.descanso_finde_ok(datos, plan, w, lunes) is True, 'martes+miércoles ya son el par'
+
+antes = dict(plan)
+residuo.canjear_refuerzos(datos, plan, libro)
+# Si canjear_refuerzos ha cubierto el hueco de martes con w (rompiendo el par), debe haberse
+# deshecho — el plan de w para esa semana debe seguir respetando la regla.
+assert legal.descanso_finde_ok(datos, plan, w, lunes), (
+    f'canjear_refuerzos rompió el par consecutivo: {plan}')
+print('canjear_refuerzos: no rompe el par consecutivo — OK')
+"
+```
+
+Expected: este guion depende de que exista un hueco real en `martes` que `canjear_refuerzos`
+pueda cubrir con `w` gastando el REF CAL de `jueves` — si en la ejecución real no hay ningún
+hueco de ese tipo ese día concreto, el `assert` no llega a activarse (falso negativo). **Antes de
+dar este paso por bueno**, confirmar con un `print` intermedio si `canjear_refuerzos` realmente
+intentó y deshizo el candidato (comparar `plan == antes` tras la llamada) — si no tocó nada
+porque no había hueco que cubrir con `w` ese día, ajustar la fecha/turno del guion hasta encontrar
+un caso real donde SÍ compita, en vez de aceptar un test que no ejercita nada.
+
+- [ ] **Step 2: Modificar `canjear_refuerzos` (líneas 481-507 actuales)**
+
+Antes:
+```python
+                sueltos = sorted(refuerzos_de.get(w, []), key=lambda g: -abs((g - f).days))
+                usados: list[date] = []
+                for g in sueltos:
+                    if falta <= 0:
+                        break
+                    falta -= datos.turnos[plan[(w, g)]].horas
+                    usados.append(g)
+                if falta > 0:
+                    continue                              # no le llega ni soltándolos todos
+            else:
+                usados = []
+            if not legal.permite(datos, plan, w, f, s):
+                continue
+            # Se suelta el REF CAL de otro día (g) para pagar la cobertura de f. Seguro frente al
+            # domingo-sin-sábado solo porque todo turno con dem==0 en turnos.csv es lv=1 con
+            # sab/dom/fest=0: un REF CAL nunca cae en fin de semana, así que soltarlo no puede
+            # dejar huérfano un domingo. Si algún día se añade un REF CAL de fin de semana, esto
+            # habría que revisarlo.
+            for g in usados:
+                libro.borra(w, plan.pop((w, g)))
+                refuerzos_de[w].remove(g)
+            plan[(w, f)] = s
+            libro.apunta(w, s)
+            cerrados += 1
+            break
+```
+
+Después:
+```python
+                sueltos = sorted(refuerzos_de.get(w, []), key=lambda g: -abs((g - f).days))
+                usados: list[tuple[date, str]] = []
+                for g in sueltos:
+                    if falta <= 0:
+                        break
+                    turno_g = plan[(w, g)]
+                    falta -= datos.turnos[turno_g].horas
+                    usados.append((g, turno_g))
+                if falta > 0:
+                    continue                              # no le llega ni soltándolos todos
+            else:
+                usados = []
+            if not legal.permite(datos, plan, w, f, s):
+                continue
+            # Se suelta el REF CAL de otro día (g) para pagar la cobertura de f. Seguro frente al
+            # domingo-sin-sábado: todo turno con dem==0 es lv=1 sin fin de semana, así que soltarlo
+            # nunca deja huérfano un domingo. NO es seguro frente al descanso consecutivo: soltar o
+            # añadir un día entre semana es justo lo que forma o rompe el par, así que se comprueba
+            # tras aplicar el cambio y se deshace este candidato si lo rompe.
+            for g, _ in usados:
+                del plan[(w, g)]
+            plan[(w, f)] = s
+            if not legal.descanso_finde_ok(datos, plan, w, forma.lunes_de(f)):
+                del plan[(w, f)]
+                for g, turno_g in usados:
+                    plan[(w, g)] = turno_g
+                continue
+            for g, turno_g in usados:
+                libro.borra(w, turno_g)
+                refuerzos_de[w].remove(g)
+            libro.apunta(w, s)
+            cerrados += 1
+            break
+```
+
+- [ ] **Step 3: Ejecutar el script de verificación de nuevo**
+
+Mismo comando del Step 1.
+Expected: `canjear_refuerzos: no rompe el par consecutivo — OK`
+
+- [ ] **Step 4: Modificar `_cadena` (líneas 572-581 actuales)**
+
+Antes:
+```python
+                ref_c, turno_w = plan.pop((c, g)), plan.pop((w, g))
+                if not legal.permite(datos, plan, c, g, propio):
+                    plan[(c, g)], plan[(w, g)] = ref_c, turno_w
+                    continue
+                libro.borra(c, ref_c)
+                plan[(c, g)] = propio
+                libro.apunta(c, propio)
+                libro.borra(w, turno_w)
+                plan[(w, f)] = s
+                libro.apunta(w, s)
+                refcal_dia[g].remove(c)
+                dias_de[w].remove(g)
+                dias_de[w].append(f)
+                dias_de[c].append(g) if g not in dias_de[c] else None
+                return True
+```
+
+Después:
+```python
+                ref_c, turno_w = plan.pop((c, g)), plan.pop((w, g))
+                if not legal.permite(datos, plan, c, g, propio):
+                    plan[(c, g)], plan[(w, g)] = ref_c, turno_w
+                    continue
+                plan[(c, g)] = propio
+                plan[(w, f)] = s
+                if not legal.descanso_finde_ok(datos, plan, w, forma.lunes_de(f)):
+                    del plan[(c, g)], plan[(w, f)]
+                    plan[(c, g)], plan[(w, g)] = ref_c, turno_w
+                    continue
+                libro.borra(c, ref_c)
+                libro.apunta(c, propio)
+                libro.borra(w, turno_w)
+                libro.apunta(w, s)
+                refcal_dia[g].remove(c)
+                dias_de[w].remove(g)
+                dias_de[w].append(f)
+                dias_de[c].append(g) if g not in dias_de[c] else None
+                return True
+```
+
+Nota: `c` gana el turno `propio` en el mismo día `g` que ya tenía ocupado con su REF CAL — no
+cambia si ese día está trabajado o libre para `c` (mismo turno, distinto día no aplica aquí), así
+que no necesita su propia comprobación de `descanso_finde_ok`. Solo `w` gana un día NUEVO (`f`).
+
+- [ ] **Step 5: Modificar `rellenar_refuerzos` (líneas 629-635 actuales)**
+
+Antes:
+```python
+                    if (datos.elegible(w, s, f)[0] and libro.cabe(w, s)
+                            and legal.permite(datos, plan, w, f, s)):
+                        plan[(w, f)] = s
+                        libro.apunta(w, s)
+                        puestas += 1
+                        colocado = True
+                        break
+```
+
+Después:
+```python
+                    if (datos.elegible(w, s, f)[0] and libro.cabe(w, s)
+                            and legal.permite(datos, plan, w, f, s)):
+                        plan[(w, f)] = s
+                        if not legal.descanso_finde_ok(datos, plan, w, forma.lunes_de(f)):
+                            del plan[(w, f)]
+                            continue
+                        libro.apunta(w, s)
+                        puestas += 1
+                        colocado = True
+                        break
+```
+
+- [ ] **Step 6: Verificar que el módulo importa sin errores**
+
+```bash
+cd /home/samu/Documents/Universidad/HT-GROUP && PYTHONPATH=src python3 -c "
+import residuo
+print('residuo.py importa sin errores: OK')
+"
+```
+
+Expected: `residuo.py importa sin errores: OK`
+
+`_cadena` y `rellenar_refuerzos` no admiten un guion de verificación aislado tan directo como
+`canjear_refuerzos` sin gastar mucho más tiempo montando las condiciones exactas que cada uno
+necesita (huecos, presupuesto de horas, REF CAL de un tercero disponible) — mismo compromiso que
+ya se aceptó para el bloque CP-SAT de la Task 3. Su verificación real es la Task 12
+(re-ejecución completa del pipeline): si tras aplicar estas tres correcciones siguen apareciendo
+semanas nuevas rotas trazables a `_cadena` o `rellenar_refuerzos`, se vuelve aquí.
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add src/residuo.py
+git commit -m "$(cat <<'EOF'
+residuo: canjear_refuerzos/_cadena/rellenar_refuerzos respetan el descanso
+
+Los tres asignan un día nuevo a un trabajador sin comprobar
+descanso_finde_ok — encontrado en la verificación end-to-end de la
+Task 8 (130 semanas nuevas rotas). Se comprueba tras aplicar el
+cambio, igual que ya se hace con legal.permite, y se deshace ese
+candidato concreto si rompe el par consecutivo. Ceder un día (siempre
+como pago, nunca como resultado final en estas tres funciones) no
+necesita comprobación: solo puede ayudar o ser neutro para esta regla.
+
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+EOF
+)"
+```
+
+---
+
+### Task 11 (amendment, descubierta en Task 8): `residuo.py` — restricción dura para la semana flexible del mixto (`z`)
+
+**Descubierto en Task 8**, mismo diagnóstico que la Task 10: el CP-SAT está obligado a reactivar
+exactamente `cuantos` de los días candidatos de la semana flexible de un mixto
+(`modelo.Add(sum(suyas) == min(cuantos, len(suyas)))`), pero es libre de elegir CUÁLES —puede
+dejar libres días distintos a los que la Task 4 (`base.py`) eligió deliberadamente adyacentes,
+rompiendo el par aunque el conteo total de días libres no cambie.
+
+**Files:**
+- Modify: `src/residuo.py:174` (justo después del bloque existente de variables `z`, dentro del
+  mismo `for (trab, lunes), (candidatos, cuantos) in flex.items():`)
+
+**Interfaces:**
+- Consumes: `datos.config.dias_descanso_finde`, `cargar_datos.DIAS_LV` (Task 1); `z`, `flex`,
+  `plan` (ya construidos en `resolver()`).
+
+Igual que la Task 3, este bloque no admite un test aislado del resto de `resolver()` — es un
+fragmento dentro de la función que construye el único modelo CP-SAT. Se verifica con un modelo
+sintético aislado (Step 2) antes de gastar un pipeline completo, y con la Task 12 como
+verificación real.
+
+- [ ] **Step 1: Localizar el bloque de variables `z` en el archivo real**
+
+```bash
+cd /home/samu/Documents/Universidad/HT-GROUP && grep -n "El mixto vuelve a coger todos sus días\|AddAtMostOne(\[z\[" src/residuo.py
+```
+
+Expected: dos líneas, confirmando el bloque existente. Si el texto no coincide, releerlo entero
+antes de continuar.
+
+- [ ] **Step 2: Comprobación aislada del modelo con un escenario sintético**
+
+```bash
+cd /home/samu/Documents/Universidad/HT-GROUP && PYTHONPATH=src python3 -c "
+from ortools.sat.python import cp_model
+
+# Reproduce el patrón: 5 booleanas z (una por día L-V candidato), obligadas a activarse EXACTAMENTE
+# 3 de las 5 (cuantos=3, len(candidatos)=5 -> se quedan libres 2). Sin la restricción nueva, el
+# modelo es libre de dejar libres dos días no consecutivos (p.ej. lunes y miércoles). Con ella,
+# debe verse forzado a dejar libres un par consecutivo.
+modelo = cp_model.CpModel()
+z = [modelo.NewBoolVar(f'z{i}') for i in range(5)]         # 1 = reactivado (trabajado)
+modelo.Add(sum(z) == 3)                                     # se quedan libres exactamente 2
+
+libres = []
+for i in range(5):
+    libre = modelo.NewBoolVar(f'libre{i}')
+    modelo.Add(z[i] + libre == 1)
+    libres.append(libre)
+pares = []
+for i in range(4):
+    par = modelo.NewBoolVar(f'par{i}')
+    modelo.Add(par <= libres[i])
+    modelo.Add(par <= libres[i + 1])
+    pares.append(par)
+modelo.Add(sum(pares) >= 1)                                 # ambos_finde=1 siempre en este escenario
+
+# Fuerza a que lunes (0) y miércoles (2) NO sean los que queden libres (para comprobar que el
+# modelo encuentra una alternativa válida en vez de quedar infactible).
+modelo.Add(z[1] == 1)                                        # martes trabajado
+
+solver = cp_model.CpSolver()
+estado = solver.Solve(modelo)
+assert estado in (cp_model.OPTIMAL, cp_model.FEASIBLE), estado
+valores = [solver.Value(v) for v in z]
+libres_idx = [i for i in range(5) if valores[i] == 0]
+assert len(libres_idx) == 2, libres_idx
+assert libres_idx[1] - libres_idx[0] == 1, f'los libres no son consecutivos: {libres_idx}'
+print('restricción de par consecutivo sobre z: fuerza un par adyacente — OK')
+"
+```
+
+Expected: `restricción de par consecutivo sobre z: fuerza un par adyacente — OK`
+
+- [ ] **Step 3: Añadir la restricción real, dentro del bucle de `flex.items()` (tras la línea 174
+  actual, `modelo.AddAtMostOne([z[(trab, g, a)], z[(trab, k, b)]])`, todavía dentro del mismo
+  `for (trab, lunes), (candidatos, cuantos) in flex.items():`)**
+
+```python
+        dias_semana_trab = [lunes + timedelta(days=i) for i in range(7)]
+        sab_t, dom_t = dias_semana_trab[5], dias_semana_trab[6]
+        if (trab, sab_t) in plan and (trab, dom_t) in plan:
+            # Sábado y domingo ya están fijados en plan (decididos en el paso A2, invariables
+            # aquí) — igual que en el bloque de la Task 3, exige un par consecutivo libre entre
+            # semana. z solo cubre los días candidatos; los demás días L-V de esta semana están
+            # fijados fuera del modelo, así que su libre/trabajado es una constante, no una
+            # variable.
+            candidatos_por_dia = {g: s for g, s in candidatos}
+            libres_l_v = []
+            for i in range(5):
+                dia = dias_semana_trab[i]
+                s_dia = candidatos_por_dia.get(dia)
+                if s_dia is not None and (trab, dia, s_dia) in z:
+                    libre = modelo.NewBoolVar(f"librefinde_z_{trab}_{dia:%m%d}")
+                    modelo.Add(z[(trab, dia, s_dia)] + libre == 1)
+                else:
+                    libre = 0 if (trab, dia) in plan else 1
+                libres_l_v.append(libre)
+
+            fijos = datos.config.dias_descanso_finde
+            if fijos:
+                idx = {nombre: i for i, nombre in enumerate(DIAS_LV)}
+                i1, i2 = sorted(idx[n] for n in fijos)
+                modelo.Add(libres_l_v[i1] + libres_l_v[i2] >= 2)
+            else:
+                pares_z = []
+                for i in range(4):
+                    a, b = libres_l_v[i], libres_l_v[i + 1]
+                    if isinstance(a, int) and isinstance(b, int):
+                        pares_z.append(1 if a and b else 0)
+                        continue
+                    par = modelo.NewBoolVar(f"parfinde_z_{trab}_{dias_semana_trab[i]:%m%d}")
+                    modelo.Add(par <= a)
+                    modelo.Add(par <= b)
+                    pares_z.append(par)
+                modelo.Add(sum(pares_z) >= 1)
+```
+
+Nota sobre `candidatos_por_dia = {g: s for g, s in candidatos}`: asume un único turno candidato
+por fecha para este mixto esa semana. Comprobar contra los datos reales en el Step 4 — si algún
+mixto tiene más de un turno candidato el mismo día (`candidatos` con fechas repetidas), este
+`dict` se queda solo con el último y habría que agrupar por fecha en vez de sobrescribir.
+
+- [ ] **Step 4: Verificar que el módulo importa sin errores y que no hay fechas repetidas en
+  `candidatos` para el mismo mixto/semana en los datos reales**
+
+```bash
+cd /home/samu/Documents/Universidad/HT-GROUP && PYTHONPATH=src python3 -c "
+import residuo
+print('residuo.py importa sin errores: OK')
+"
+```
+
+Si al ejecutar el pipeline completo (Task 12) aparece algún mixto con fechas repetidas en
+`candidatos` (la nota del Step 3), ajustar `candidatos_por_dia` para agrupar en vez de
+sobrescribir antes de confiar en el resultado.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/residuo.py
+git commit -m "$(cat <<'EOF'
+CP-SAT: la semana flexible del mixto respeta el descanso consecutivo
+
+Las variables z pueden reactivar un día distinto al que base.py eligió
+deliberadamente adyacente al conceder sábado+domingo — el conteo total
+de días libres se mantenía pero no su consecutividad. Misma
+restricción que la Task 3 (par fijo o disyunción de 4 pares
+adyacentes), aplicada a la semana flexible cuando sábado+domingo ya
+están fijados en plan.
+
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+EOF
+)"
+```
+
+---
+
+### Task 12: Re-verificación end-to-end tras las Tasks 10-11
+
+**Files:** ninguno (solo ejecución)
+
+- [ ] **Step 1: Ejecutar el pipeline completo y confirmar 0 semanas nuevas sin par consecutivo**
+
+Repetir exactamente el Step 1 y Step 2 de la Task 8 (pipeline completo + réplica inline
+comparando contra `descansos_esqueleto`), sobre el código ya con las Tasks 10-11 aplicadas.
+
+Esperado: `Pipeline completo: 0 semanas nuevas sin descanso consecutivo (N toleradas del
+esqueleto). OK` — mismo formato que el Step 2 de la Task 8.
+
+Si sigue habiendo semanas nuevas, repetir el diagnóstico de la Task 8 (clasificar por tipo de
+trabajador, comparar contra `descansos_esqueleto`, identificar el mecanismo concreto) — no asumir
+que las Tasks 10-11 cierran todo sin comprobarlo. Prestar atención especial a si el patrón de
+fallos apunta a la nota de la Task 11 Step 3 (fechas repetidas en `candidatos`).
+
+- [ ] **Step 2: Reportar el resultado**
+
+No hay commit en este paso. Resume en la conversación: si el invariante ya se sostiene end-to-end,
+cobertura final comparada con la Task 8 (referencia: 18285/18295), y cualquier cambio relevante en
+los niveles del CP-SAT o en las cuotas de mixtos/patrones flexibles.
+
+---
+
+### Task 13: Spike de rendimiento del CP-SAT (con y sin la restricción nueva)
 
 **Files:** ninguno (solo ejecución, scripts en el scratchpad de la sesión)
 
