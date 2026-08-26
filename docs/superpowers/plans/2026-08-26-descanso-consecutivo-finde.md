@@ -129,6 +129,10 @@ class Config:
 
 - [ ] **Step 3: Añadir la sección al `config.toml`**
 
+`data/input/config.toml` está en `.gitignore` (todo `/data/*` lo está, desde que `config.toml`
+existe) — es un fichero de entrada más, igual que los CSV reales de la empresa: se edita en disco,
+nunca se comittea. **No hacer `git add` de este archivo en el Step 8.**
+
 Al final del archivo (`data/input/config.toml`), añadir:
 
 ```toml
@@ -231,7 +235,7 @@ Expected: `revisar_config valida dias_descanso_finde — OK`
 - [ ] **Step 8: Commit**
 
 ```bash
-git add src/cargar_datos.py data/input/config.toml src/validar_datos.py
+git add src/cargar_datos.py src/validar_datos.py
 git commit -m "$(cat <<'EOF'
 Añade el parámetro dias_descanso_finde a config.toml
 
