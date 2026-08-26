@@ -481,12 +481,13 @@ def canjear_refuerzos(datos: Datos, plan: Plan, libro: LibroHoras) -> int:
                 # Se sueltan refuerzos suyos, empezando por los más lejanos del hueco para no
                 # remover la misma semana. Solo hacen falta los justos para que quepa el turno.
                 sueltos = sorted(refuerzos_de.get(w, []), key=lambda g: -abs((g - f).days))
-                usados: list[date] = []
+                usados: list[tuple[date, str]] = []
                 for g in sueltos:
                     if falta <= 0:
                         break
-                    falta -= datos.turnos[plan[(w, g)]].horas
-                    usados.append(g)
+                    turno_g = plan[(w, g)]
+                    falta -= datos.turnos[turno_g].horas
+                    usados.append((g, turno_g))
                 if falta > 0:
                     continue                              # no le llega ni soltándolos todos
             else:
@@ -494,14 +495,21 @@ def canjear_refuerzos(datos: Datos, plan: Plan, libro: LibroHoras) -> int:
             if not legal.permite(datos, plan, w, f, s):
                 continue
             # Se suelta el REF CAL de otro día (g) para pagar la cobertura de f. Seguro frente al
-            # domingo-sin-sábado solo porque todo turno con dem==0 en turnos.csv es lv=1 con
-            # sab/dom/fest=0: un REF CAL nunca cae en fin de semana, así que soltarlo no puede
-            # dejar huérfano un domingo. Si algún día se añade un REF CAL de fin de semana, esto
-            # habría que revisarlo.
-            for g in usados:
-                libro.borra(w, plan.pop((w, g)))
-                refuerzos_de[w].remove(g)
+            # domingo-sin-sábado: todo turno con dem==0 es lv=1 sin fin de semana, así que soltarlo
+            # nunca deja huérfano un domingo. NO es seguro frente al descanso consecutivo: soltar o
+            # añadir un día entre semana es justo lo que forma o rompe el par, así que se comprueba
+            # tras aplicar el cambio y se deshace este candidato si lo rompe.
+            for g, _ in usados:
+                del plan[(w, g)]
             plan[(w, f)] = s
+            if not legal.descanso_finde_ok(datos, plan, w, forma.lunes_de(f)):
+                del plan[(w, f)]
+                for g, turno_g in usados:
+                    plan[(w, g)] = turno_g
+                continue
+            for g, turno_g in usados:
+                libro.borra(w, turno_g)
+                refuerzos_de[w].remove(g)
             libro.apunta(w, s)
             cerrados += 1
             break
@@ -573,11 +581,15 @@ def _cadena(datos: Datos, plan: Plan, libro: LibroHoras, refcal_dia: dict, dias_
                 if not legal.permite(datos, plan, c, g, propio):
                     plan[(c, g)], plan[(w, g)] = ref_c, turno_w
                     continue
-                libro.borra(c, ref_c)
                 plan[(c, g)] = propio
+                plan[(w, f)] = s
+                if not legal.descanso_finde_ok(datos, plan, w, forma.lunes_de(f)):
+                    del plan[(c, g)], plan[(w, f)]
+                    plan[(c, g)], plan[(w, g)] = ref_c, turno_w
+                    continue
+                libro.borra(c, ref_c)
                 libro.apunta(c, propio)
                 libro.borra(w, turno_w)
-                plan[(w, f)] = s
                 libro.apunta(w, s)
                 refcal_dia[g].remove(c)
                 dias_de[w].remove(g)
@@ -629,6 +641,9 @@ def rellenar_refuerzos(datos: Datos, plan: Plan, libro: LibroHoras) -> int:
                     if (datos.elegible(w, s, f)[0] and libro.cabe(w, s)
                             and legal.permite(datos, plan, w, f, s)):
                         plan[(w, f)] = s
+                        if not legal.descanso_finde_ok(datos, plan, w, forma.lunes_de(f)):
+                            del plan[(w, f)]
+                            continue
                         libro.apunta(w, s)
                         puestas += 1
                         colocado = True
