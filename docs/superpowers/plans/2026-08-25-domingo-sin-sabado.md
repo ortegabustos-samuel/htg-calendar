@@ -595,3 +595,251 @@ antes/después.
 
 No hay commit en este paso (no se toca código). Resume en la conversación: cobertura final,
 diferencia con la referencia, y si algún nivel del CP-SAT dejó de ser `OPTIMAL`.
+
+---
+
+### Task 6 (amendment, descubierta en Task 5): `libranzas.py` — `candidatas()` no cede un sábado que deja huérfano el domingo
+
+**Descubierto en Task 5** (verificación end-to-end): 22 de 23 domingos sueltos en el plan final son
+nuevos, todos de trabajadores `tipo=patron`, y todos trazables a `libranzas.ceder()` — un sexto
+mecanismo que no estaba en la lista de cinco del spec original. Ver el Addendum en
+`docs/superpowers/specs/2026-08-25-domingo-sin-sabado-design.md` para el diagnóstico completo.
+
+**Files:**
+- Modify: `src/libranzas.py:143-165` (`candidatas`, añadir función `_huerfano_domingo` justo antes
+  y filtrar sus dos `return`)
+
+**Interfaces:**
+- Consumes: nada nuevo (usa solo `datos`/`plan`, ya disponibles en el ámbito de `candidatas`).
+
+- [ ] **Step 1: Escribir el script de verificación (debe fallar: hoy `candidatas` puede ofrecer un
+  sábado que deja huérfano el domingo)**
+
+```bash
+cd /home/samu/Documents/Universidad/HT-GROUP && PYTHONPATH=src python3 -c "
+from datetime import timedelta
+from cargar_datos import cargar
+import legal, ritmo
+
+datos = cargar()
+import libranzas
+
+# Construye un escenario mínimo: un trabajador con sábado Y domingo trabajados, y sin nada más
+# alrededor que pueda confundir la ventana de descanso.
+turno = 'VADN022'   # sab=1/dom=1, ver capacidades.csv
+domingo = next(f for f in datos.lista_dias_calendario
+               if datos.tipo_dia(f, datos.turnos[turno].municipio) == 'DOM')
+sabado = domingo - timedelta(days=1)
+trab = '71225031B'   # id real, correturno (da igual el tipo real: candidatas() no debe mirarlo)
+
+plan = {(trab, sabado): turno, (trab, domingo): turno}
+
+class RitmoFalso:
+    rigido = False
+    ratio = 0.0
+
+candidatas = libranzas.candidatas(datos, plan, RitmoFalso(), trab, exceso=100.0, protegidos=set())
+sueltas = {u.dias[0] for u in candidatas if len(u.dias) == 1}
+assert sabado not in sueltas, f'candidatas() sigue ofreciendo el sábado {sabado} suelto, dejaría huérfano el domingo {domingo}'
+assert domingo in sueltas, 'el domingo SÍ debe poder cederse suelto (ceder el domingo nunca deja huérfano nada)'
+print('candidatas(): no ofrece el sábado suelto cuando el domingo sigue trabajado — OK')
+"
+```
+
+Expected (antes del fix): `AssertionError: candidatas() sigue ofreciendo el sábado ... suelto,
+dejaría huérfano el domingo ...`
+
+- [ ] **Step 2: Añadir `_huerfano_domingo` y filtrar los dos `return` de `candidatas` (líneas
+  143-165 actuales)**
+
+Antes:
+```python
+def candidatas(datos: Datos, plan: Plan, rit: Ritmo, trab: str, exceso: float,
+               protegidos: set[date]) -> list[Unidad]:
+    """Qué se le puede quitar a este trabajador, según lo rígida que sea su plaza."""
+    bloques = [b for b in ritmo_mod.bloques(plan, trab)
+               if not (protegidos & set(b))]
+    if not bloques:
+        return []
+
+    def unidad(dias: list[date]) -> Unidad:
+        return Unidad(dias=dias,
+                      descanso=_descanso_de(dias, rit, plan, trab),
+                      horas=sum(datos.turnos[plan[(trab, f)]].horas for f in dias))
+
+    if rit.rigido:
+        # No se fracciona: se cede el ciclo entero aunque pase de largo del exceso. Lo que sobre
+        # deja al titular por debajo del objetivo, y esa holgura la aprovechan los pasos C y D.
+        return [unidad(b) for b in bloques]
+
+    # En las plazas flexibles se cede SIEMPRE día a día, nunca el bloque entero. Ceder una semana
+    # de golpe abre cinco días seguidos de la misma línea, y taparlos exige encontrar a alguien
+    # libre los cinco; repartidos por el año, cada uno se tapa por separado y con mucha más gente
+    # disponible. El exceso típico de un patrón (+71 h) son nueve días sueltos, no dos semanas.
+    return [unidad([f]) for b in bloques for f in b]
+```
+
+Después:
+```python
+def _huerfano_domingo(datos: Datos, plan: Plan, trab: str, dias: list[date]) -> bool:
+    """Ceder estos días juntos, ¿deja huérfano un domingo que el titular seguiría trabajando?
+
+    Un día `f` lo deja huérfano si el siguiente tiene turno en `plan`, ese siguiente NO está
+    también en `dias` (si lo estuviera, se ceden ambos juntos: no hay orfandad) y es domingo. No
+    se exige que `f` mismo sea tipo SAB: un sábado festivo debe seguir contando como sábado
+    trabajado si el titular lo trabaja — el criterio es posicional (el día natural anterior), no
+    por etiqueta de tipo (mismo criterio que ya corrigió la restricción del CP-SAT en residuo.py)."""
+    conjunto = set(dias)
+    for f in dias:
+        siguiente = f + timedelta(days=1)
+        if siguiente in conjunto:
+            continue
+        turno_siguiente = plan.get((trab, siguiente))
+        if turno_siguiente is None:
+            continue
+        if datos.tipo_dia(siguiente, datos.turnos[turno_siguiente].municipio) == "DOM":
+            return True
+    return False
+
+
+def candidatas(datos: Datos, plan: Plan, rit: Ritmo, trab: str, exceso: float,
+               protegidos: set[date]) -> list[Unidad]:
+    """Qué se le puede quitar a este trabajador, según lo rígida que sea su plaza."""
+    bloques = [b for b in ritmo_mod.bloques(plan, trab)
+               if not (protegidos & set(b))]
+    if not bloques:
+        return []
+
+    def unidad(dias: list[date]) -> Unidad:
+        return Unidad(dias=dias,
+                      descanso=_descanso_de(dias, rit, plan, trab),
+                      horas=sum(datos.turnos[plan[(trab, f)]].horas for f in dias))
+
+    if rit.rigido:
+        # No se fracciona: se cede el ciclo entero aunque pase de largo del exceso. Lo que sobre
+        # deja al titular por debajo del objetivo, y esa holgura la aprovechan los pasos C y D.
+        return [unidad(b) for b in bloques if not _huerfano_domingo(datos, plan, trab, b)]
+
+    # En las plazas flexibles se cede SIEMPRE día a día, nunca el bloque entero. Ceder una semana
+    # de golpe abre cinco días seguidos de la misma línea, y taparlos exige encontrar a alguien
+    # libre los cinco; repartidos por el año, cada uno se tapa por separado y con mucha más gente
+    # disponible. El exceso típico de un patrón (+71 h) son nueve días sueltos, no dos semanas.
+    return [unidad([f]) for b in bloques for f in b
+            if not _huerfano_domingo(datos, plan, trab, [f])]
+```
+
+- [ ] **Step 3: Ejecutar el script de verificación de nuevo**
+
+Mismo comando del Step 1.
+Expected: `candidatas(): no ofrece el sábado suelto cuando el domingo sigue trabajado — OK`
+
+- [ ] **Step 4: Verificar que un sábado SÍ se puede ceder cuando el domingo NO está trabajado (no
+  sobre-restringir)**
+
+```bash
+cd /home/samu/Documents/Universidad/HT-GROUP && PYTHONPATH=src python3 -c "
+from datetime import timedelta
+from cargar_datos import cargar
+import libranzas
+
+datos = cargar()
+turno = 'VADN022'
+domingo = next(f for f in datos.lista_dias_calendario
+               if datos.tipo_dia(f, datos.turnos[turno].municipio) == 'DOM')
+sabado = domingo - timedelta(days=1)
+trab = '71225031B'
+
+# Solo el sábado trabajado, el domingo NO — cederlo suelto no deja huérfano nada, debe seguir
+# ofreciéndose.
+plan = {(trab, sabado): turno}
+
+class RitmoFalso:
+    rigido = False
+    ratio = 0.0
+
+candidatas = libranzas.candidatas(datos, plan, RitmoFalso(), trab, exceso=100.0, protegidos=set())
+sueltas = {u.dias[0] for u in candidatas if len(u.dias) == 1}
+assert sabado in sueltas, 'el sábado sin domingo trabajado SÍ debe poder cederse suelto'
+print('candidatas(): no sobre-restringe cuando no hay domingo que proteger — OK')
+"
+```
+
+Expected: `candidatas(): no sobre-restringe cuando no hay domingo que proteger — OK`
+
+- [ ] **Step 5: Verificar que un bloque rígido que incluye sábado+domingo consecutivos se sigue
+  cediendo entero (no se rompe la Task de patrones rígidos)**
+
+```bash
+cd /home/samu/Documents/Universidad/HT-GROUP && PYTHONPATH=src python3 -c "
+from datetime import timedelta
+from cargar_datos import cargar
+import libranzas
+
+datos = cargar()
+turno = 'VADN022'
+domingo = next(f for f in datos.lista_dias_calendario
+               if datos.tipo_dia(f, datos.turnos[turno].municipio) == 'DOM')
+sabado = domingo - timedelta(days=1)
+viernes = sabado - timedelta(days=1)
+trab = '71225031B'
+
+# Bloque rígido de 3 días consecutivos que incluye el sábado y el domingo juntos: debe cederse
+# entero, no filtrarse por huerfano_domingo (van juntos en la misma unidad).
+plan = {(trab, viernes): turno, (trab, sabado): turno, (trab, domingo): turno}
+
+class RitmoFalso:
+    rigido = True
+    ratio = 1.0
+
+candidatas = libranzas.candidatas(datos, plan, RitmoFalso(), trab, exceso=100.0, protegidos=set())
+assert len(candidatas) == 1, f'se esperaba 1 unidad (bloque entero), salieron {len(candidatas)}'
+assert set(candidatas[0].dias) == {viernes, sabado, domingo}, candidatas[0].dias
+print('candidatas(): bloque rígido con sábado+domingo se cede entero — OK')
+"
+```
+
+Expected: `candidatas(): bloque rígido con sábado+domingo se cede entero — OK`
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add src/libranzas.py
+git commit -m "$(cat <<'EOF'
+libranzas: no cede un sábado suelto que deje huérfano el domingo
+
+candidatas() es la única fuente de unidades cedibles (fase1 y fase2 la
+comparten): un sexto mecanismo que el spec original no había listado.
+_huerfano_domingo() bloquea ceder un día cuando el siguiente sigue
+trabajado y es domingo, sin exigir que el día cedido sea tipo SAB (un
+sábado festivo cuenta igual) y sin distinguir bloque rígido de día
+suelto: si el domingo va en la misma unidad, se cede junto y no hay
+orfandad.
+
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+EOF
+)"
+```
+
+---
+
+### Task 7: Re-verificación end-to-end tras la Task 6
+
+**Files:** ninguno (solo ejecución)
+
+- [ ] **Step 1: Ejecutar el pipeline completo y confirmar 0 domingos sueltos**
+
+Repetir exactamente el Step 1 y Step 2 de la Task 5 (pipeline completo + réplica inline con
+`legal.integridad`), sobre el código ya con la Task 6 aplicada. Esperado:
+`AUDITORÍA — integridad: correcta` (o, si quedan fallos, que ninguno mencione "sin el sábado") y
+`Pipeline completo: 0 domingos sueltos en NNNNN asignaciones. OK`.
+
+Si aparece CUALQUIER domingo suelto nuevo, repetir el diagnóstico de la Task 5 (clasificar por
+tipo de trabajador, comparar contra el plan justo tras el Paso A) para identificar si es un
+séptimo mecanismo no contemplado — no asumir que la Task 6 lo cierra todo sin comprobarlo.
+
+- [ ] **Step 2: Reportar el resultado**
+
+No hay commit en este paso. Resume en la conversación: si el invariante ya se sostiene end-to-end,
+y la cobertura final comparada con la Task 5 (referencia: 18284/18295, 99.9%). El rendimiento del
+CP-SAT (niveles 1 y 4 en FEASIBLE en vez de OPTIMAL) queda fuera de alcance de esta
+re-verificación — se investiga por separado, no bloquea el cierre de este plan.

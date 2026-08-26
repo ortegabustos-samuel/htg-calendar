@@ -1,6 +1,7 @@
 # Nunca domingo suelto: el domingo exige el sábado de su fin de semana
 
-Fecha: 2026-08-25 · Estado: aprobado, pendiente de plan de implementación
+Fecha: 2026-08-25 · Estado: Tasks 1-4 implementadas y revisadas; Task 5 (verificación end-to-end)
+encontró un sexto mecanismo no contemplado — ver «Addendum» al final.
 
 ## El problema
 
@@ -170,3 +171,53 @@ No hay tests en el proyecto: la verificación es la salida (`CLAUDE.md`). Plan:
    mixtos/correturnos baja respecto a la ejecución de referencia de esta sesión (ver
    `pipeline_run2.log`), y si el nº de huecos sin cubrir del paso D sube.
 4. Confirmar que el tiempo de resolución del CP-SAT no se degrada de forma notable.
+
+## Addendum (2026-08-26): sexto mecanismo — `libranzas.ceder`
+
+La Task 5 (verificación end-to-end, tras implementar y revisar las Tasks 1-4) ejecutó el pipeline
+completo y encontró **23 domingos sueltos** en el plan final — el invariante no se sostiene todavía.
+Diagnóstico completo en `.superpowers/sdd/2026-08-25-domingo-sin-sabado/task-5-report.md`; resumen:
+
+- Los 23 son, sin excepción, trabajadores `tipo=patron`. Cero en `mixto`/`correturno`: las Tasks 2
+  (mixtos), 3 (CP-SAT del pool) y 4 (`pulir_dias`) cierran correctamente los cinco mecanismos que
+  este documento identificó.
+- Solo 1 de los 23 coincide con un domingo suelto que ya existía justo tras el Paso A puro (el caso
+  benigno, aceptado por construcción). **Los otros 22 son nuevos.**
+- Causa: `libranzas.ceder()` (Paso B) — no listado como mecanismo en la sección «El problema» —
+  cede días sueltos (típicamente un sábado) del ciclo de un patrón para devolver su exceso de
+  horas, sin comprobar nunca si eso deja huérfano el domingo de ese mismo fin de semana que el
+  titular sigue trabajando. `libranzas.py` no importa `legal` en ningún punto; es deliberado para
+  la legalidad del convenio (`_recortar`: "No hay comprobación legal, y es deliberado" — ahí habla
+  de C4/C5/C6 sobre un traspaso de ciclo heredado, un caso distinto), pero nadie había puesto esta
+  regla nueva de reparto en su radar.
+- Por la filosofía del proyecto ("legal se aplica donde el pipeline INVENTA una secuencia"), esto
+  sí debería estar sujeto a la regla: **qué día se cede** es una decisión que toma el pipeline en
+  el Paso B, no algo heredado intacto del patrón.
+
+### La corrección: filtrar en `candidatas()`
+
+`candidatas()` (`libranzas.py:143-165`) es la única función que genera las unidades cedibles, tanto
+para la rama de exceso de `fase1` (plazas designadas) como para `fase2` (el resto) — filtrar ahí
+cubre ambos caminos sin sesgo por fase ni por tipo de trabajador.
+
+Nueva función `_huerfano_domingo`: dado un conjunto de días que se cederían juntos, ¿deja huérfano
+algún domingo que el titular seguiría trabajando? Un día `f` lo deja huérfano si el día siguiente
+(`f + 1`) tiene turno asignado en `plan`, ese día siguiente NO está también en el conjunto que se
+cede (si lo estuviera, se ceden ambos juntos: no hay orfandad), y `tipo_dia` de ese día siguiente es
+`"DOM"`. No se exige que `f` mismo sea `tipo_dia == "SAB"` — igual que la Task 3 tuvo que corregir,
+un sábado festivo (`tipo_dia` devuelve `"FEST"`) debe seguir contando como "sábado trabajado" si el
+titular lo trabaja; el criterio correcto es puramente posicional (el día natural anterior), no por
+etiqueta de tipo.
+
+Aplica igual a las plazas rígidas (ciclo entero) que a las flexibles (día suelto): en las rígidas,
+si el bloque cedido incluye el sábado y domingo consecutivos, ambos se quitan juntos y
+`_huerfano_domingo` no los marca (están en el mismo conjunto); solo protege el caso donde el
+sábado se cede solo y el domingo del titular queda huérfano — que es exactamente el patrón
+confirmado en los 22 casos nuevos, todos plazas flexibles cediendo día a día.
+
+Si excluir una unidad dado dejaría a un titular sin nada que ceder ese ciclo, el camino ya existente
+(`fase1`/`fase2` imprimen un aviso y siguen: "no le queda nada que ceder") absorbe el caso sin
+cambios — es el mismo compromiso que ya aceptan las Tasks 2-4: coherente con «Consecuencias
+esperadas» de este documento (preferible a romper la regla).
+
+Ver Task 6 en `docs/superpowers/plans/2026-08-25-domingo-sin-sabado.md` para la implementación.
