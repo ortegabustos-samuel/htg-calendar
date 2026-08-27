@@ -685,7 +685,7 @@ def rellenar_refuerzos(datos: Datos, plan: Plan, libro: LibroHoras) -> int:
                         plan[(w, f)] = s
                         if not legal.descanso_finde_ok(datos, plan, w, forma.lunes_de(f)):
                             del plan[(w, f)]
-                            continue
+                            break                       # falla igual para cualquier otro s ese f
                         libro.apunta(w, s)
                         puestas += 1
                         colocado = True

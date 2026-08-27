@@ -587,7 +587,8 @@ def _forzar_descanso_finde(datos: Datos, plan: Plan, libro: LibroHoras, reg: Reg
                 continue                                  # esqueleto puro: se tolera
             dias_semana = [lunes + timedelta(days=i) for i in range(5)]
             libres = [d for d in dias_semana if (afectado, d) not in plan]
-            trabajados = [d for d in dias_semana if (afectado, d) in plan]
+            trabajados = [d for d in dias_semana if (afectado, d) in plan
+                         and d not in reg.protegidos.get(afectado, set())]
             fijos = datos.config.dias_descanso_finde
             if fijos:
                 idx = {nombre: i for i, nombre in enumerate(DIAS_LV)}
