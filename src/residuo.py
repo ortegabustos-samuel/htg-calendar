@@ -65,8 +65,10 @@ from datetime import date, timedelta
 from ortools.sat.python import cp_model
 
 import base, forma, legal
+import ritmo as ritmo_mod
 from cargar_datos import DIAS_LV, Datos
 from horas import EPS, LibroHoras
+from ritmo import Ritmo
 
 Plan = dict[tuple[str, date], str]
 DECIMAS = 10                    # las horas son floats; el modelo trabaja en décimas de hora
@@ -479,7 +481,7 @@ def _volcar(datos: Datos, plan: Plan, libro: LibroHoras, x: dict, y: dict, z: di
 # --------------------------------------------------------------------------- #
 #  Canje de refuerzos por cobertura real
 # --------------------------------------------------------------------------- #
-def canjear_refuerzos(datos: Datos, plan: Plan, libro: LibroHoras) -> int:
+def canjear_refuerzos(datos: Datos, plan: Plan, libro: LibroHoras, ritmos: dict[str, Ritmo]) -> int:
     """Cierra huecos soltando un REF CAL del propio candidato en OTRA fecha del año.
 
     El caso típico: el 1 de enero falta `VADN006` y hay 31 personas libres, capacitadas y legales
@@ -540,7 +542,8 @@ def canjear_refuerzos(datos: Datos, plan: Plan, libro: LibroHoras) -> int:
             for g, _ in usados:
                 del plan[(w, g)]
             plan[(w, f)] = s
-            if not legal.descanso_finde_ok(datos, plan, w, forma.lunes_de(f)):
+            if (not ritmo_mod.es_rigido(datos, ritmos, w)
+                    and not legal.descanso_finde_ok(datos, plan, w, forma.lunes_de(f))):
                 del plan[(w, f)]
                 for g, turno_g in usados:
                     plan[(w, g)] = turno_g
@@ -554,7 +557,7 @@ def canjear_refuerzos(datos: Datos, plan: Plan, libro: LibroHoras) -> int:
     return cerrados
 
 
-def canjear_en_cadena(datos: Datos, plan: Plan, libro: LibroHoras) -> int:
+def canjear_en_cadena(datos: Datos, plan: Plan, libro: LibroHoras, ritmos: dict[str, Ritmo]) -> int:
     """Cierra huecos con un canje A TRES BANDAS, sin gastar el refuerzo del propio candidato.
 
     El escalón simple funciona, pero paga con el REF CAL del candidato — y cuando el candidato es un
@@ -583,13 +586,13 @@ def canjear_en_cadena(datos: Datos, plan: Plan, libro: LibroHoras) -> int:
 
     cerrados = 0
     for (s, f) in forma.huecos(datos, plan):
-        if _cadena(datos, plan, libro, refcal_dia, dias_de, s, f):
+        if _cadena(datos, plan, libro, refcal_dia, dias_de, s, f, ritmos):
             cerrados += 1
     return cerrados
 
 
 def _cadena(datos: Datos, plan: Plan, libro: LibroHoras, refcal_dia: dict, dias_de: dict,
-            s: str, f: date) -> bool:
+            s: str, f: date, ritmos: dict[str, Ritmo]) -> bool:
     for w in datos.trabajadores:
         if (w, f) in plan or not datos.elegible(w, s, f)[0]:
             continue
@@ -621,7 +624,8 @@ def _cadena(datos: Datos, plan: Plan, libro: LibroHoras, refcal_dia: dict, dias_
                     continue
                 plan[(c, g)] = propio
                 plan[(w, f)] = s
-                if not legal.descanso_finde_ok(datos, plan, w, forma.lunes_de(f)):
+                if (not ritmo_mod.es_rigido(datos, ritmos, w)
+                        and not legal.descanso_finde_ok(datos, plan, w, forma.lunes_de(f))):
                     del plan[(c, g)], plan[(w, f)]
                     plan[(c, g)], plan[(w, g)] = ref_c, turno_w
                     continue
