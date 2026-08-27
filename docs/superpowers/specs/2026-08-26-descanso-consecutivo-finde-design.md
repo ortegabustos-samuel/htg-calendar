@@ -342,10 +342,17 @@ ya hace con `pactadas` — así cualquier guion que llame a `pulir_dias`/`_valid
 
 ## Consecuencias esperadas
 
-- **Rendimiento del CP-SAT**: dado lo ya medido con `domingo_ok` (nivel 1 pasó de OPTIMAL/35s a
-  FEASIBLE/300s), es razonable esperar un impacto igual o mayor aquí — esta restricción añade más
-  variables auxiliares por trabajador-semana que la de domingo. Se medirá con el mismo método de
-  spike (A/B aislado) antes de dar el plan por cerrado, no se asume que será despreciable.
+- **Rendimiento del CP-SAT — medido (Task 16, spike A/B aislado, dos réplicas con orden invertido
+  para descartar ruido de máquina)**: al contrario de lo que el precedente de `domingo_ok` hacía
+  temer, esta restricción no penaliza el nivel 1 — lo mejora. **CON** la restricción: nivel 1
+  llega a **OPTIMAL** en 116s y 203s (dos réplicas) con cobertura 2661. **SIN** ella: el solver
+  agota el tope de 300s y se queda en **FEASIBLE** (no probado óptimo) con cobertura 2664 — solo
+  3 plazas más (0,1%) de las ~26.000 en juego, y sin garantía de que sea el verdadero óptimo. La
+  explicación más plausible: la restricción poda simetría del espacio de soluciones (menos formas
+  equivalentes de repartir sábado+domingo entre el pool), lo que le facilita al solver CERRAR el
+  hueco de optimalidad — el efecto contrario al de `domingo_ok`, que añadía complejidad sin podar
+  nada. No hace falta subir el tope de segundos ni buscar una formulación más barata: el plan se da
+  por cerrado en este punto sin ajustes adicionales.
 - **Cobertura y horas**: forzar un par consecutivo cuando no existe puede dejar a algún patrón
   flexible por debajo de su objetivo de horas más de lo estrictamente necesario (sección 5), y
   puede reducir ligeramente la cuota de fin de semana de algún mixto si `_soltar_dia_lv` no
