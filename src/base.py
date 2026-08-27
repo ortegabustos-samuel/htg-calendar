@@ -29,7 +29,7 @@ from collections import Counter, defaultdict
 from datetime import date, timedelta
 
 import legal
-from cargar_datos import DIAS, LIBRE, Datos
+from cargar_datos import DIAS, DIAS_LV, LIBRE, Datos
 
 def turno_patron(datos: Datos, trabajador_id: str, fecha: date) -> str:
     """Celda que la rotación prescribe al trabajador el día fecha: un id de turno, `LIBRE`
@@ -181,7 +181,9 @@ def _soltar_dia_lv(datos: Datos, plan: dict[tuple[str, date], str], libro,
     Si esta semana ya se soltó otro día (p.ej. al conceder el sábado, antes de conceder el
     domingo), se prioriza el día ADYACENTE a él: sábado+domingo trabajados exigen un par de días
     consecutivos libres entre semana (`descanso_finde_ok`), y como SAB se procesa antes que DOM
-    en `colocar_mixtos`, esta es la segunda de las dos llamadas que arma ese par.
+    en `colocar_mixtos`, esta es la segunda de las dos llamadas que arma ese par. Si
+    `config.dias_descanso_finde` fija un par concreto, se prioriza ESE par en vez de "cualquier
+    adyacente".
 
     CUÁL se suelta si no hay una semana ya empezada es solo una elección provisional —la línea que
     más gente puede tapar—, porque en este paso los correturnos todavía no están colocados y no
@@ -193,10 +195,18 @@ def _soltar_dia_lv(datos: Datos, plan: dict[tuple[str, date], str], libro,
     suyos = [lunes + timedelta(days=i) for i in range(5) if (trab, lunes + timedelta(days=i)) in plan]
     if not suyos:
         return None
-    ya_libre = [lunes + timedelta(days=i) for i in range(5)
-                if (trab, lunes + timedelta(days=i)) not in plan]
-    adyacentes = [d for d in suyos if any(abs((d - libre).days) == 1 for libre in ya_libre)]
-    candidatos = adyacentes or suyos
+    fijos = datos.config.dias_descanso_finde
+    if fijos:
+        # El par está fijado por config: si uno de los dos días sigue trabajado, es ÉSE el que
+        # hay que soltar (en cualquiera de las dos llamadas de la semana), no "cualquier adyacente".
+        idx = {nombre: i for i, nombre in enumerate(DIAS_LV)}
+        dias_fijos = {lunes + timedelta(days=idx[n]) for n in fijos}
+        candidatos = [d for d in suyos if d in dias_fijos] or suyos
+    else:
+        ya_libre = [lunes + timedelta(days=i) for i in range(5)
+                    if (trab, lunes + timedelta(days=i)) not in plan]
+        adyacentes = [d for d in suyos if any(abs((d - libre).days) == 1 for libre in ya_libre)]
+        candidatos = adyacentes or suyos
     peor = max(candidatos,
               key=lambda g: sum(1 for (_, ss) in datos.capacidades if ss == plan[(trab, g)]))
     s = plan.pop((trab, peor))
