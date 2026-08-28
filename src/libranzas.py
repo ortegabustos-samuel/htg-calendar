@@ -35,9 +35,8 @@ from datetime import date, timedelta
 from pathlib import Path
 
 import base, legal, ritmo as ritmo_mod
-from cargar_datos import Datos
+from cargar_datos import Datos, LIBRE
 from horas import EPS, LibroHoras
-from ritmo import Ritmo
 
 Plan = dict[tuple[str, date], str]
 
@@ -127,14 +126,16 @@ def _solapa(reg: Registro, quien: str, unidad: Unidad) -> bool:
 # --------------------------------------------------------------------------- #
 #  Unidades candidatas
 # --------------------------------------------------------------------------- #
-def _descanso_de(dias: list[date], rit: Ritmo, plan: Plan, trab: str) -> list[date]:
-    """Días de descanso que la plaza arrastra con esos días de trabajo: `ratio` días por cada día
-    cedido, tomados justo detrás. Con ratio 1,00 (noches) un bloque de 7 arrastra 7; con 0,40
-    (semana laboral normal) un día suelto arrastra 0, que es lo correcto."""
-    cuantos = int(round(rit.ratio * len(dias)))
+def _descanso_de(dias: list[date], rigido: bool, datos: Datos, trab: str) -> list[date]:
+    """Días de descanso que la plaza arrastra con esos días de trabajo. Un día suelto cedido en una
+    plaza flexible no arrastra descanso: no se le debe nada más. Un ciclo rígido sí — el descanso
+    que le sigue no se mide, se lee directo de la rotación (`base.turno_patron`): las celdas LIBRE
+    que continúan justo detrás del bloque, tal como las declara el propio patrón."""
+    if not rigido:
+        return []
     salida: list[date] = []
     f = dias[-1] + timedelta(days=1)
-    while len(salida) < cuantos and (trab, f) not in plan:
+    while f <= datos.fin and base.turno_patron(datos, trab, f) == LIBRE:
         salida.append(f)
         f += timedelta(days=1)
     return salida
@@ -161,7 +162,7 @@ def _huerfano_domingo(datos: Datos, plan: Plan, trab: str, dias: list[date]) -> 
     return False
 
 
-def candidatas(datos: Datos, plan: Plan, rit: Ritmo, trab: str, exceso: float,
+def candidatas(datos: Datos, plan: Plan, rigido: bool, trab: str, exceso: float,
                protegidos: set[date]) -> list[Unidad]:
     """Qué se le puede quitar a este trabajador, según lo rígida que sea su plaza."""
     bloques = [b for b in ritmo_mod.bloques(plan, trab)
@@ -171,10 +172,10 @@ def candidatas(datos: Datos, plan: Plan, rit: Ritmo, trab: str, exceso: float,
 
     def unidad(dias: list[date]) -> Unidad:
         return Unidad(dias=dias,
-                      descanso=_descanso_de(dias, rit, plan, trab),
+                      descanso=_descanso_de(dias, rigido, datos, trab),
                       horas=sum(datos.turnos[plan[(trab, f)]].horas for f in dias))
 
-    if rit.rigido:
+    if rigido:
         # No se fracciona: se cede el ciclo entero aunque pase de largo del exceso. Lo que sobre
         # deja al titular por debajo del objetivo, y esa holgura la aprovechan los pasos C y D.
         return [unidad(b) for b in bloques if not _huerfano_domingo(datos, plan, trab, b)]
@@ -358,7 +359,9 @@ def _aplicar_fase1(datos: Datos, plan: Plan, libro: LibroHoras, reg: Registro,
         plan[(cubridor, f)] = turnos[f]
         libro.apunta(cubridor, turnos[f])
 
-    reg.protegidos[cubridor] |= set(unidad.dias)
+    # Se protegen también los días de descanso heredados, no solo los de trabajo: son parte
+    # inseparable del ciclo asumido y ningún paso posterior debe poder asignarle un turno ahí.
+    reg.protegidos[cubridor] |= set(unidad.dias) | set(unidad.descanso)
     reg.compromisos[cubridor].append((unidad.ventana[0], unidad.ventana[-1]))
     reg.cesiones.append(Cesion(
         fase=1, titular=titular, dias=list(unidad.dias), horas=unidad.horas,
@@ -387,8 +390,7 @@ def _ausencias(datos: Datos, titular: str, designadas: dict[str, list[str]]) -> 
     return unidades
 
 
-def fase1(datos: Datos, plan: Plan, libro: LibroHoras, ritmos: dict[str, Ritmo],
-          reg: Registro) -> None:
+def fase1(datos: Datos, plan: Plan, libro: LibroHoras, reg: Registro) -> None:
     """Mantiene atendidas las plazas con cubridor designado, traspasándolas por ciclos completos.
 
     Dos motivos las dejan solas, y se atienden en ese orden: la AUSENCIA del titular (forzado — la
@@ -428,10 +430,10 @@ def fase1(datos: Datos, plan: Plan, libro: LibroHoras, ritmos: dict[str, Ritmo],
     pendientes = sorted((w for w in titulares if libro.exceso(w) > EPS),
                         key=lambda w: -libro.exceso(w))
     for titular in pendientes:                          # 2) cesión por exceso
-        rit = ritmos[ritmo_mod.grupo_de(datos, titular)]
+        rigido = ritmo_mod.es_rigido(datos, titular)
         while libro.exceso(titular) > EPS:
             mejor = None
-            for unidad in candidatas(datos, plan, rit, titular, libro.exceso(titular),
+            for unidad in candidatas(datos, plan, rigido, titular, libro.exceso(titular),
                                      reg.protegidos[titular]):
                 turnos = {f: plan[(titular, f)] for f in unidad.dias}
                 if not all(s in cubridores for s in turnos.values()):
@@ -476,8 +478,7 @@ def _coste_fase2(datos: Datos, plan: Plan, libro: LibroHoras, reg: Registro,
     return (sin_tapar, -_distancia(reg, trab, unidad), -total)
 
 
-def fase2(datos: Datos, plan: Plan, libro: LibroHoras, ritmos: dict[str, Ritmo],
-          reg: Registro) -> None:
+def fase2(datos: Datos, plan: Plan, libro: LibroHoras, reg: Registro) -> None:
     grupos: dict[str, list[str]] = defaultdict(list)
     for w in datos.trabajadores:
         grupos[ritmo_mod.grupo_de(datos, w)].append(w)
@@ -487,13 +488,13 @@ def fase2(datos: Datos, plan: Plan, libro: LibroHoras, ritmos: dict[str, Ritmo],
                         key=lambda w: -libro.exceso(w))
     for trab in pendientes:
         grupo = ritmo_mod.grupo_de(datos, trab)
-        rit = ritmos[grupo]
+        rigido = grupo in datos.config.grupos_rigidos
         while libro.exceso(trab) > EPS:
             mejor = None
             cache: dict = {}                            # válido mientras no se aplique una cesión
             for holgura in range(0, 4):                 # el tope se relaja solo si no cabe
                 tope = topes[grupo] + holgura
-                for unidad in candidatas(datos, plan, rit, trab, libro.exceso(trab),
+                for unidad in candidatas(datos, plan, rigido, trab, libro.exceso(trab),
                                          reg.protegidos[trab]):
                     if any(reg.cedidos_grupo[(grupo, f)] >= tope for f in unidad.dias):
                         continue
@@ -516,7 +517,7 @@ def fase2(datos: Datos, plan: Plan, libro: LibroHoras, ritmos: dict[str, Ritmo],
             reg.cesiones.append(Cesion(
                 fase=2, titular=trab, dias=list(unidad.dias), horas=unidad.horas,
                 cubridor=None, desalojadas=0,
-                motivo="ciclo entero" if rit.rigido else
+                motivo="ciclo entero" if rigido else
                        ("bloque" if len(unidad.dias) > 1 else "día suelto")))
 
 
@@ -524,23 +525,16 @@ def fase2(datos: Datos, plan: Plan, libro: LibroHoras, ritmos: dict[str, Ritmo],
 #  Orquestación e informe
 # --------------------------------------------------------------------------- #
 def ceder(datos: Datos, plan: Plan, libro: LibroHoras,
-          protegidos: dict[str, set[date]] | None = None,
-          ritmos: dict[str, Ritmo] | None = None) -> Registro:
+          protegidos: dict[str, set[date]] | None = None) -> Registro:
     """`protegidos` son días que no se pueden ceder aunque sobren horas — hoy, los fines de semana
     de cuota que el paso A2 le dio a los mixtos: no son exceso, son la equidad que justifica que el
-    mixto salga de su línea.
-
-    `ritmos`, si no se pasa, se mide aquí mismo (comportamiento de siempre) — pipeline.py ya lo
-    calcula en este mismo punto (tras colocar_mixtos) y lo pasa, para no remedirlo tres veces."""
-    if ritmos is None:
-        ritmos = ritmo_mod.medir(datos, plan)
-    ritmo_mod.resumen(ritmos)
+    mixto salga de su línea."""
     reg = Registro()
     for w, dias in (protegidos or {}).items():
         reg.protegidos[w] |= dias
-    fase1(datos, plan, libro, ritmos, reg)
-    fase2(datos, plan, libro, ritmos, reg)
-    _forzar_descanso_finde(datos, plan, libro, reg, ritmos)
+    fase1(datos, plan, libro, reg)
+    fase2(datos, plan, libro, reg)
+    _forzar_descanso_finde(datos, plan, libro, reg)
     return reg
 
 
@@ -558,8 +552,7 @@ def escribir_csv(reg: Registro, ruta: Path) -> None:
                                c.desalojadas, c.motivo])
 
 
-def _forzar_descanso_finde(datos: Datos, plan: Plan, libro: LibroHoras, reg: Registro,
-                           ritmos: dict[str, Ritmo]) -> None:
+def _forzar_descanso_finde(datos: Datos, plan: Plan, libro: LibroHoras, reg: Registro) -> None:
     """Tras fase1+fase2: si una semana de sábado+domingo trabajado que el pipeline SÍ tocó (le
     cedió al menos un día) sigue sin un par consecutivo libre, cede uno más para completarlo —
     aunque cueste una cesión de más de la que pedían solo las horas. Las semanas que nadie tocó se
@@ -577,7 +570,7 @@ def _forzar_descanso_finde(datos: Datos, plan: Plan, libro: LibroHoras, reg: Reg
     afectados = sorted({c.titular for c in reg.cesiones}
                        | {c.cubridor for c in reg.cesiones if c.cubridor})
     for afectado in afectados:
-        if ritmo_mod.es_rigido(datos, ritmos, afectado):
+        if ritmo_mod.es_rigido(datos, afectado):
             continue
         lunes_de_afectado = sorted({lunes_de(f) for (w, f) in plan if w == afectado})
         for lunes in lunes_de_afectado:

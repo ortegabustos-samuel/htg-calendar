@@ -68,7 +68,6 @@ import base, forma, legal
 import ritmo as ritmo_mod
 from cargar_datos import Datos
 from horas import EPS, LibroHoras
-from ritmo import Ritmo
 
 Plan = dict[tuple[str, date], str]
 DECIMAS = 10                    # las horas son floats; el modelo trabaja en décimas de hora
@@ -469,7 +468,8 @@ def _volcar(datos: Datos, plan: Plan, libro: LibroHoras, x: dict, y: dict, z: di
 # --------------------------------------------------------------------------- #
 #  Canje de refuerzos por cobertura real
 # --------------------------------------------------------------------------- #
-def canjear_refuerzos(datos: Datos, plan: Plan, libro: LibroHoras, ritmos: dict[str, Ritmo]) -> int:
+def canjear_refuerzos(datos: Datos, plan: Plan, libro: LibroHoras,
+                      protegidos: dict[str, set[date]] | None = None) -> int:
     """Cierra huecos soltando un REF CAL del propio candidato en OTRA fecha del año.
 
     El caso típico: el 1 de enero falta `VADN006` y hay 31 personas libres, capacitadas y legales
@@ -488,7 +488,12 @@ def canjear_refuerzos(datos: Datos, plan: Plan, libro: LibroHoras, ritmos: dict[
     correturno los hemos puesto nosotros para completarle la jornada, mientras que los de un
     trabajador de patrón se los prescribe `patrones.csv` y forman parte de su rotación. Se prefiere
     gastar los primeros, así que los correturnos van delante en la lista de candidatos.
+
+    `protegidos` son días que ya son de otra persona por diseño (el descanso que un cubridor
+    heredó al asumir un ciclo rígido en el paso B): nunca se le asigna un turno ahí, aunque le
+    sobren horas y sea elegible.
     """
+    protegidos = protegidos or {}
     refuerzos_de: dict[str, list[date]] = defaultdict(list)
     for (w, f), s in plan.items():
         if datos.turnos[s].dem == 0:
@@ -502,7 +507,7 @@ def canjear_refuerzos(datos: Datos, plan: Plan, libro: LibroHoras, ritmos: dict[
     cerrados = 0
     for (s, f) in forma.huecos(datos, plan):
         for w in candidatos:
-            if (w, f) in plan or not datos.elegible(w, s, f)[0]:
+            if (w, f) in plan or f in protegidos.get(w, set()) or not datos.elegible(w, s, f)[0]:
                 continue
             falta = datos.turnos[s].horas - (libro.objetivo(w) - libro.horas(w))
             if falta > 0:
@@ -530,7 +535,7 @@ def canjear_refuerzos(datos: Datos, plan: Plan, libro: LibroHoras, ritmos: dict[
             for g, _ in usados:
                 del plan[(w, g)]
             plan[(w, f)] = s
-            if (not ritmo_mod.es_rigido(datos, ritmos, w)
+            if (not ritmo_mod.es_rigido(datos, w)
                     and not legal.descanso_finde_ok(datos, plan, w, forma.lunes_de(f))):
                 del plan[(w, f)]
                 for g, turno_g in usados:
@@ -545,7 +550,8 @@ def canjear_refuerzos(datos: Datos, plan: Plan, libro: LibroHoras, ritmos: dict[
     return cerrados
 
 
-def canjear_en_cadena(datos: Datos, plan: Plan, libro: LibroHoras, ritmos: dict[str, Ritmo]) -> int:
+def canjear_en_cadena(datos: Datos, plan: Plan, libro: LibroHoras,
+                      protegidos: dict[str, set[date]] | None = None) -> int:
     """Cierra huecos con un canje A TRES BANDAS, sin gastar el refuerzo del propio candidato.
 
     El escalón simple funciona, pero paga con el REF CAL del candidato — y cuando el candidato es un
@@ -574,15 +580,15 @@ def canjear_en_cadena(datos: Datos, plan: Plan, libro: LibroHoras, ritmos: dict[
 
     cerrados = 0
     for (s, f) in forma.huecos(datos, plan):
-        if _cadena(datos, plan, libro, refcal_dia, dias_de, s, f, ritmos):
+        if _cadena(datos, plan, libro, refcal_dia, dias_de, s, f, protegidos or {}):
             cerrados += 1
     return cerrados
 
 
 def _cadena(datos: Datos, plan: Plan, libro: LibroHoras, refcal_dia: dict, dias_de: dict,
-            s: str, f: date, ritmos: dict[str, Ritmo]) -> bool:
+            s: str, f: date, protegidos: dict[str, set[date]]) -> bool:
     for w in datos.trabajadores:
-        if (w, f) in plan or not datos.elegible(w, s, f)[0]:
+        if (w, f) in plan or f in protegidos.get(w, set()) or not datos.elegible(w, s, f)[0]:
             continue
         falta = datos.turnos[s].horas - (libro.objetivo(w) - libro.horas(w))
         if falta <= 0 or not legal.permite(datos, plan, w, f, s):
@@ -612,7 +618,7 @@ def _cadena(datos: Datos, plan: Plan, libro: LibroHoras, refcal_dia: dict, dias_
                     continue
                 plan[(c, g)] = propio
                 plan[(w, f)] = s
-                if (not ritmo_mod.es_rigido(datos, ritmos, w)
+                if (not ritmo_mod.es_rigido(datos, w)
                         and not legal.descanso_finde_ok(datos, plan, w, forma.lunes_de(f))):
                     del plan[(c, g)], plan[(w, f)]
                     plan[(c, g)], plan[(w, g)] = ref_c, turno_w

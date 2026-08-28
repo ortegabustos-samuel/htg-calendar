@@ -100,9 +100,6 @@ def revisar_config(inf: Informe) -> bool:
         inf.error(f"config.toml: horas_max_semana={cfg.horas_max_semana} horas no caben en una semana")
     if not 1 <= cfg.dias_max_semana <= 7:
         inf.error(f"config.toml: dias_max_semana={cfg.dias_max_semana} días está fuera de 1..7")
-    if not 0 < cfg.ratio_rigido <= 1:
-        inf.error(f"config.toml: ratio_rigido={cfg.ratio_rigido} está fuera de (0, 1]: es una "
-                  f"proporción de días de descanso por día de trabajo")
     return not inf.errores
 
 
@@ -413,8 +410,16 @@ def revisar_viabilidad(inf: Informe) -> None:
     d = cargar()
     objetivo = d.config.horas_objetivo
     anio = d.config.anio
-    fechas = d.fechas
+    fechas = d.lista_dias_calendario
     inf.nota(f"horizonte: año {anio} (config.toml), objetivo {objetivo} h")
+
+    # grupos_rigidos es una declaración manual (empresa/convenio, ver ritmo.py): un id mal escrito
+    # o un patrón renombrado lo deja huérfano y la plaza pasaría a tratarse como flexible sin avisar.
+    grupos_validos = set(d.patrones) | {t.tipo for t in d.trabajadores.values()}
+    desconocidos = sorted(set(d.config.grupos_rigidos) - grupos_validos)
+    if desconocidos:
+        inf.error(f"config.toml: grupos_rigidos incluye {desconocidos}, que no es ningún patrón "
+                  f"ni tipo de trabajador conocido")
 
     # Los festivos tienen que ser del año que se resuelve; si no, el cuadrante sale con los
     # festivos de otro año y nada lo delata.

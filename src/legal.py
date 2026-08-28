@@ -187,7 +187,7 @@ def infracciones(datos: Datos, plan: Plan) -> list[str]:
     return fallos
 
 
-def integridad(datos: Datos, plan: Plan, ritmos: dict[str, "ritmo_mod.Ritmo"] | None = None) -> list[str]:
+def integridad(datos: Datos, plan: Plan) -> list[str]:
     """Lo que haría el cuadrante inejecutable, al margen del convenio: alguien asignado estando de
     vacaciones, un turno en un día en que su línea no opera, alguien sin capacidad para la línea que
     hace, o más gente asignada que demanda tiene la plaza. Aquí nunca debería haber nada."""
@@ -207,12 +207,10 @@ def integridad(datos: Datos, plan: Plan, ritmos: dict[str, "ritmo_mod.Ritmo"] | 
         if datos.turnos[s].dem and n > datos.turnos[s].dem:
             fallos.append(f"{s} el {f:%d/%m}: {n} asignados para {datos.turnos[s].dem} de demanda")
 
-    if ritmos is None:
-        ritmos = ritmo_mod.medir(datos, plan)
     vistas: set[tuple[str, date]] = set()
     for (w, f) in plan:
         lunes = f - timedelta(days=f.weekday())
-        if (w, lunes) in vistas or ritmo_mod.es_rigido(datos, ritmos, w):
+        if (w, lunes) in vistas or ritmo_mod.es_rigido(datos, w):
             continue
         vistas.add((w, lunes))
         if not descanso_finde_ok(datos, plan, w, lunes):
@@ -223,8 +221,7 @@ def integridad(datos: Datos, plan: Plan, ritmos: dict[str, "ritmo_mod.Ritmo"] | 
 
 def auditar(datos: Datos, plan: Plan, pactadas_esqueleto: set,
             domingos_esqueleto: set[tuple[str, date]] | None = None,
-            descansos_esqueleto: set[tuple[str, date]] | None = None,
-            ritmos: dict[str, "ritmo_mod.Ritmo"] | None = None) -> None:
+            descansos_esqueleto: set[tuple[str, date]] | None = None) -> None:
     """El repaso legal que se imprime al cerrar cada ejecución.
 
     La legalidad NO se mide contando: se mide por FORMAS. Los patrones incumplen el convenio por
@@ -239,9 +236,7 @@ def auditar(datos: Datos, plan: Plan, pactadas_esqueleto: set,
     """
     domingos_esqueleto = domingos_esqueleto or set()
     descansos_esqueleto = descansos_esqueleto or set()
-    if ritmos is None:
-        ritmos = ritmo_mod.medir(datos, plan)
-    rotos = integridad(datos, plan, ritmos)
+    rotos = integridad(datos, plan)
 
     domingo_actual = {(w, f) for (w, f), s in plan.items() if not domingo_ok(datos, plan, w, f, s)}
     heredados_dom = domingo_actual & domingos_esqueleto
@@ -251,7 +246,7 @@ def auditar(datos: Datos, plan: Plan, pactadas_esqueleto: set,
     vistas: set[tuple[str, date]] = set()
     for (w, f) in plan:
         lunes = f - timedelta(days=f.weekday())
-        if (w, lunes) in vistas or ritmo_mod.es_rigido(datos, ritmos, w):
+        if (w, lunes) in vistas or ritmo_mod.es_rigido(datos, w):
             continue
         vistas.add((w, lunes))
         if not descanso_finde_ok(datos, plan, w, lunes):

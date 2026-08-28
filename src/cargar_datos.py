@@ -66,8 +66,8 @@ class Config:
     descanso_minimo: int = 12               # descanso mínimo entre jornadas (h)              -> C4
     horas_max_semana: int = 48              # máx. horas en cualquier ventana de 7 días       -> C6
     dias_max_semana: int = 6                # máx. días trabajados por semana ISO             -> C5
-    ratio_rigido: float = 0.6               # Parametro a priori que permite saber como gestionar algunos patrones
-                                            # como el caso de UVI y Noches (replantear si añadir a patron como param)
+    grupos_rigidos: tuple[str, ...] = ()    # grupos (patrón o tipo) cuyo descanso no se fracciona:
+                                            # se cede el ciclo entero, nunca un día suelto (ritmo.py)
 
 @dataclass
 class Capacidad:

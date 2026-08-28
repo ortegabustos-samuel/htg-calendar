@@ -189,11 +189,9 @@ def _gana(cuentas: dict[str, Counter], a: str, b: str, media: dict[str, float],
 
 
 def pulir(datos: Datos, plan: Plan, libro: LibroHoras, vueltas: int = 400,
-          pactadas: set | None = None, ritmos: dict[str, "ritmo_mod.Ritmo"] | None = None) -> dict:
+          pactadas: set | None = None) -> dict:
     if pactadas is None:
         pactadas = legal.pactadas(datos, base.construir(datos))
-    if ritmos is None:
-        ritmos = ritmo_mod.medir(datos, base.construir(datos))
     grupos: dict[str, list[str]] = defaultdict(list)
     for w in datos.trabajadores:
         grupos[grupo_de(datos, w)].append(w)
@@ -248,7 +246,7 @@ def pulir(datos: Datos, plan: Plan, libro: LibroHoras, vueltas: int = 400,
         cuentas = _cuentas(datos, plan)
         hechos += 1
 
-    dias = pulir_dias(datos, plan, libro, pactadas=pactadas, ritmos=ritmos)
+    dias = pulir_dias(datos, plan, libro, pactadas=pactadas)
     cuentas = _cuentas(datos, plan)
     final = {g: _desviacion(cuentas, ws) for g, ws in grupos.items()}
     return {"intercambios": hechos, "dias": dias, "inicial": inicial, "final": final}
@@ -265,8 +263,7 @@ def _dias_por_semana(plan: Plan) -> dict[tuple[str, date], list[date]]:
 
 
 def _valido_dia(datos: Datos, plan: Plan, libro: LibroHoras,
-                a: str, da: date, b: str, db: date, pactadas: set,
-                ritmos: dict[str, "ritmo_mod.Ritmo"]) -> bool:
+                a: str, da: date, b: str, db: date, pactadas: set) -> bool:
     """`a` le pasa su día `da` a `b` y se queda con el `db` de `b`. Ambos de la misma semana."""
     sa, sb = plan[(a, da)], plan[(b, db)]
     if (b, da) in plan or (a, db) in plan:
@@ -298,9 +295,9 @@ def _valido_dia(datos: Datos, plan: Plan, libro: LibroHoras,
     rompe_domingo = (not _semana_respeta_domingo(datos, plan, a, lunes)
                       or not _semana_respeta_domingo(datos, plan, b, lunes))
     rompe_descanso = (
-        (not ritmo_mod.es_rigido(datos, ritmos, a)
+        (not ritmo_mod.es_rigido(datos, a)
          and not legal.descanso_finde_ok(datos, plan, a, lunes))
-        or (not ritmo_mod.es_rigido(datos, ritmos, b)
+        or (not ritmo_mod.es_rigido(datos, b)
             and not legal.descanso_finde_ok(datos, plan, b, lunes))
     )
     if rompe_domingo or rompe_descanso or _empeora(datos, plan, a, b, desde, hasta, antes, pactadas):
@@ -327,13 +324,11 @@ def _clase(datos: Datos, plan: Plan, w: str, f: date) -> str | None:
 
 
 def pulir_dias(datos: Datos, plan: Plan, libro: LibroHoras, vueltas: int = 600,
-               pactadas: set | None = None, ritmos: dict[str, "ritmo_mod.Ritmo"] | None = None) -> int:
-    if pactadas is None:
-        pactadas = legal.pactadas(datos, base.construir(datos))
-    if ritmos is None:
-        ritmos = ritmo_mod.medir(datos, base.construir(datos))
+               pactadas: set | None = None) -> int:
     """Afina lo que el intercambio de semana no puede: mueve un día de una clase concreta del que
     más tiene al que menos, dentro de la misma semana ISO."""
+    if pactadas is None:
+        pactadas = legal.pactadas(datos, base.construir(datos))
     grupos: dict[str, list[str]] = defaultdict(list)
     for w in datos.trabajadores:
         grupos[grupo_de(datos, w)].append(w)
@@ -373,7 +368,7 @@ def pulir_dias(datos: Datos, plan: Plan, libro: LibroHoras, vueltas: int = 600,
                             continue                        # no cambiaría el reparto
                         if (a, da, b, db) in descartados:
                             continue
-                        if _valido_dia(datos, plan, libro, a, da, b, db, pactadas, ritmos):
+                        if _valido_dia(datos, plan, libro, a, da, b, db, pactadas):
                             semanal[(a, _lunes(da))].remove(da)
                             semanal[(b, _lunes(db))].remove(db)
                             semanal[(b, _lunes(da))].append(da)
