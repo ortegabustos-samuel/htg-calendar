@@ -57,9 +57,9 @@ def prescrito(datos: Datos, trabajador_id: str, fecha: date) -> str | None:
         turno_id = turno_patron(datos, trabajador_id, fecha)
         return turno_id if (turno_id != LIBRE and turno_id in datos.turnos and datos.opera(turno_id, fecha)) else None
     if trabajador.tipo == "fijo":
-        cap = datos.capacidades.get((trabajador_id, trabajador.linea))
         if not datos.opera(trabajador.linea, fecha):
             return None
+        cap = datos.capacidades.get((trabajador_id, trabajador.linea))
         dia = datos.tipo_dia(fecha, datos.turnos[trabajador.linea].municipio)       #En un principio esto es redundante suponiendo 
         return trabajador.linea if {"LV": cap.lv, "SAB": cap.sab,                   # a fijos solo hacer Lunes-Viernes
                            "DOM": cap.dom, "FEST": cap.fest}[dia] == 1 else None

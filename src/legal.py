@@ -34,8 +34,7 @@ Plan = dict[tuple[str, date], str]
 def descanso_ok(datos: Datos, plan: Plan, trabajador_id: str, fecha: date, turno_id: str,
                 exento_localizado: bool = False) -> bool:
     """C4 — entre el fin de un turno y el inicio del siguiente median al menos
-    `descanso_minimo` horas. Basta mirar el día anterior y el siguiente: ningún turno dura más de
-    24 h, así que no puede chocar con nada más lejano.
+    `descanso_minimo` horas.
 
     `exento_localizado` levanta la regla cuando uno de los dos es una guardia de localización: no
     es presencia, así que ni exige descanso después ni lo consume antes. Va en FALSO por defecto a
@@ -61,14 +60,14 @@ def descanso_ok(datos: Datos, plan: Plan, trabajador_id: str, fecha: date, turno
 
 
 def dias_semana_ok(datos: Datos, plan: Plan, trabajador_id: str, fecha: date) -> bool:
-    """C5 — como mucho `dias_max_semana` días trabajados en la semana ISO en que cae `f`."""
+    """C5 — como mucho `dias_max_semana` días trabajados en la semana ISO en que cae `fecha`."""
     lunes = fecha - timedelta(days=fecha.weekday())
     trabajados = sum(1 for i in range(7) if (trabajador_id, lunes + timedelta(days=i)) in plan)
     return trabajados + 1 <= datos.config.dias_max_semana
 
 
 def horas_semana_ok(datos: Datos, plan: Plan, trabajador_id: str, fecha: date, turno: str) -> bool:
-    """C6 — como mucho `horas_max_semana` horas trabajadas en la semana ISO en que cae `f`."""
+    """C6 — como mucho `horas_max_semana` horas trabajadas en la semana ISO en que cae `fecha`."""
     lunes = fecha - timedelta(days=fecha.weekday())
     horas = sum(datos.turnos[plan[(trabajador_id, lunes + timedelta(days=i))]].horas
                 for i in range(7) if (trabajador_id, lunes + timedelta(days=i)) in plan)
@@ -77,8 +76,7 @@ def horas_semana_ok(datos: Datos, plan: Plan, trabajador_id: str, fecha: date, t
 
 def domingo_ok(datos: Datos, plan: Plan, trabajador_id: str, fecha: date, turno_id: str) -> bool:
     """El domingo solo se trabaja si también se trabaja el sábado de ese mismo fin de semana.
-    No es del convenio (no lleva número de artículo): es una regla de reparto, pero se define
-    aquí porque la consumen los mismos sitios que C4/C5/C6."""
+    No es del convenio"""
     if datos.tipo_dia(fecha, datos.turnos[turno_id].municipio) != "DOM":
         return True
     return (trabajador_id, fecha - timedelta(days=1)) in plan
