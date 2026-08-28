@@ -35,7 +35,7 @@ from datetime import date, timedelta
 from pathlib import Path
 
 import base, legal, ritmo as ritmo_mod
-from cargar_datos import DIAS_LV, Datos
+from cargar_datos import Datos
 from horas import EPS, LibroHoras
 from ritmo import Ritmo
 
@@ -589,14 +589,8 @@ def _forzar_descanso_finde(datos: Datos, plan: Plan, libro: LibroHoras, reg: Reg
             libres = [d for d in dias_semana if (afectado, d) not in plan]
             trabajados = [d for d in dias_semana if (afectado, d) in plan
                          and d not in reg.protegidos.get(afectado, set())]
-            fijos = datos.config.dias_descanso_finde
-            if fijos:
-                idx = {nombre: i for i, nombre in enumerate(DIAS_LV)}
-                dias_fijos = {dias_semana[idx[n]] for n in fijos}
-                candidatos_prioritarios = [d for d in trabajados if d in dias_fijos]
-            else:
-                candidatos_prioritarios = [d for d in trabajados
-                                           if any(abs((d - lb).days) == 1 for lb in libres)]
+            candidatos_prioritarios = [d for d in trabajados
+                                       if any(abs((d - lb).days) == 1 for lb in libres)]
             mejor = None
             for candidato in (candidatos_prioritarios or trabajados):
                 libres_para_cubrir = _libres(datos, plan, libro, plan[(afectado, candidato)],

@@ -27,7 +27,7 @@ from collections import Counter, defaultdict
 from datetime import date, timedelta
 
 import ritmo as ritmo_mod
-from cargar_datos import Datos, DIAS_LV
+from cargar_datos import Datos
 
 Plan = dict[tuple[str, date], str]
 
@@ -84,18 +84,13 @@ def domingo_ok(datos: Datos, plan: Plan, trabajador_id: str, fecha: date, turno_
 
 def descanso_finde_ok(datos: Datos, plan: Plan, trabajador_id: str, lunes: date) -> bool:
     """Si esa semana ISO (`lunes`..`lunes+6`) se trabajan sábado Y domingo, exige un par de días
-    consecutivos libres entre semana: el que fije config.dias_descanso_finde si está fijado, o
-    cualquier par adyacente si no. No es del convenio: es una regla de reparto, como domingo_ok.
-    A diferencia de domingo_ok, no hace falta excepción de festivos: un festivo trabajado entre
-    semana ocupa el día igual que un laborable."""
+    consecutivos libres entre semana. No es del convenio: es una regla de reparto, como
+    domingo_ok. A diferencia de domingo_ok, no hace falta excepción de festivos: un festivo
+    trabajado entre semana ocupa el día igual que un laborable."""
     dias = [lunes + timedelta(days=i) for i in range(7)]
     if (trabajador_id, dias[5]) not in plan or (trabajador_id, dias[6]) not in plan:
         return True
     libres = {d for d in dias[:5] if (trabajador_id, d) not in plan}
-    fijos = datos.config.dias_descanso_finde
-    if fijos:
-        idx = {nombre: i for i, nombre in enumerate(DIAS_LV)}
-        return all(dias[idx[nombre]] in libres for nombre in fijos)
     return any(dias[i] in libres and dias[i + 1] in libres for i in range(4))
 
 

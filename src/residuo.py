@@ -66,7 +66,7 @@ from ortools.sat.python import cp_model
 
 import base, forma, legal
 import ritmo as ritmo_mod
-from cargar_datos import DIAS_LV, Datos
+from cargar_datos import Datos
 from horas import EPS, LibroHoras
 from ritmo import Ritmo
 
@@ -195,23 +195,17 @@ def resolver(datos: Datos, plan: Plan, libro: LibroHoras, rep: forma.Reparto,
                     libre = 0 if (trab, dia) in plan else 1
                 libres_l_v.append(libre)
 
-            fijos = datos.config.dias_descanso_finde
-            if fijos:
-                idx = {nombre: i for i, nombre in enumerate(DIAS_LV)}
-                i1, i2 = sorted(idx[n] for n in fijos)
-                modelo.Add(libres_l_v[i1] + libres_l_v[i2] >= 2)
-            else:
-                pares_z = []
-                for i in range(4):
-                    a, b = libres_l_v[i], libres_l_v[i + 1]
-                    if isinstance(a, int) and isinstance(b, int):
-                        pares_z.append(1 if a and b else 0)
-                        continue
-                    par = modelo.NewBoolVar(f"parfinde_z_{trab}_{dias_semana_trab[i]:%m%d}")
-                    modelo.Add(par <= a)
-                    modelo.Add(par <= b)
-                    pares_z.append(par)
-                modelo.Add(sum(pares_z) >= 1)
+            pares_z = []
+            for i in range(4):
+                a, b = libres_l_v[i], libres_l_v[i + 1]
+                if isinstance(a, int) and isinstance(b, int):
+                    pares_z.append(1 if a and b else 0)
+                    continue
+                par = modelo.NewBoolVar(f"parfinde_z_{trab}_{dias_semana_trab[i]:%m%d}")
+                modelo.Add(par <= a)
+                modelo.Add(par <= b)
+                pares_z.append(par)
+            modelo.Add(sum(pares_z) >= 1)
 
     por_dia: dict[tuple[str, date], list] = defaultdict(list)
     por_plaza: dict[tuple[str, date], list] = defaultdict(list)
@@ -328,19 +322,13 @@ def resolver(datos: Datos, plan: Plan, libro: LibroHoras, rep: forma.Reparto,
                 modelo.Add(sum(dia_vars) + libre == 1)       # C2 ya garantiza como mucho 1 turno/día
                 libres.append(libre)
 
-            fijos = datos.config.dias_descanso_finde
-            if fijos:
-                idx = {nombre: i for i, nombre in enumerate(DIAS_LV)}
-                i1, i2 = sorted(idx[n] for n in fijos)
-                modelo.Add(libres[i1] + libres[i2] >= 2 * ambos_finde)
-            else:
-                pares = []
-                for i in range(4):
-                    par = modelo.NewBoolVar(f"parfinde_{w}_{dias_semana[i]:%m%d}")
-                    modelo.Add(par <= libres[i])
-                    modelo.Add(par <= libres[i + 1])
-                    pares.append(par)
-                modelo.Add(sum(pares) >= ambos_finde)
+            pares = []
+            for i in range(4):
+                par = modelo.NewBoolVar(f"parfinde_{w}_{dias_semana[i]:%m%d}")
+                modelo.Add(par <= libres[i])
+                modelo.Add(par <= libres[i + 1])
+                pares.append(par)
+            modelo.Add(sum(pares) >= ambos_finde)
 
     for w in pool:
         # C9 — jornada anual. Los correturnos llegan a cero, así que su presupuesto es entero.

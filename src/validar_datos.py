@@ -23,7 +23,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from cargar_datos import DATA, DIAS, DIAS_LV, LIBRE, _cargar_config, cargar          # noqa: E402
+from cargar_datos import DATA, DIAS, LIBRE, _cargar_config, cargar          # noqa: E402
 
 # Columnas que cada fichero DEBE traer. Las opcionales (factor_jornada, linea, municipio,
 # fila_inicial, dem) no se exigen: el cargador les da valor por defecto.
@@ -103,14 +103,6 @@ def revisar_config(inf: Informe) -> bool:
     if not 0 < cfg.ratio_rigido <= 1:
         inf.error(f"config.toml: ratio_rigido={cfg.ratio_rigido} está fuera de (0, 1]: es una "
                   f"proporción de días de descanso por día de trabajo")
-    dias = cfg.dias_descanso_finde
-    if dias:
-        indices = sorted(DIAS_LV.index(d) for d in dias if d in DIAS_LV)
-        valido = (len(dias) == 2 and len(set(dias)) == 2 and len(indices) == 2
-                  and indices[1] - indices[0] == 1)
-        if not valido:
-            inf.error(f"config.toml: dias_descanso_finde={dias!r} debe ir vacío o tener "
-                      f"exactamente 2 días de {DIAS_LV}, distintos y consecutivos")
     return not inf.errores
 
 
