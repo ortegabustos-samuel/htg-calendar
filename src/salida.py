@@ -176,11 +176,12 @@ def escribir_excel(datos: Datos, plan: dict[tuple[str, date], str],
 
     HDR = 4
     ws.cell(HDR, 1, "Trabajador").font = negrita
-    ws.cell(HDR, 2, "Tipo").font = negrita
+    ws.cell(HDR, 2, "Nombre").font = negrita
+    ws.cell(HDR, 3, "Tipo").font = negrita
     ndias = len(fechas)
-    COL_D0, COL_DN = 3, 2 + ndias
+    COL_D0, COL_DN = 4, 3 + ndias
     L_D0, L_DN = get_column_letter(COL_D0), get_column_letter(COL_DN)
-    COL_EXTRA = 3 + ndias
+    COL_EXTRA = 4 + ndias
 
     for j, d in enumerate(fechas):
         c = ws.cell(HDR, COL_D0 + j, f"{DIA_INI[d.weekday()]}\n{d:%d/%m}")
@@ -194,15 +195,15 @@ def escribir_excel(datos: Datos, plan: dict[tuple[str, date], str],
     fila_de: dict[str, int] = {}
     titulos: set[int] = set()
     r = HDR + 1
-    for titulo, gente in _bloques(datos):
-        c = ws.cell(r, 1, titulo)
-        c.font = Font(bold=True, size=12)
-        titulos.add(r)
-        r += 1
+    # Un único bloque continuo: sin fila de título ni hueco entre fijos/patrones/mixtos/correturnos.
+    # El orden de `_bloques` se conserva (agrupa por tipo), y la columna Tipo ya dice a qué grupo
+    # pertenece cada fila, así que la separación visual no hacía falta y complicaba el cuadrante.
+    for _, gente in _bloques(datos):
         for trab in gente:
             t = datos.trabajadores[trab]
             ws.cell(r, 1, trab).alignment = izq
-            ws.cell(r, 2, t.patron if t.tipo == "patron" else t.tipo).alignment = izq
+            ws.cell(r, 2, t.nombre).alignment = izq
+            ws.cell(r, 3, t.patron if t.tipo == "patron" else t.tipo).alignment = izq
             for j, d in enumerate(fechas):
                 c = ws.cell(r, COL_D0 + j)
                 c.alignment, c.border = centro, borde
@@ -218,13 +219,13 @@ def escribir_excel(datos: Datos, plan: dict[tuple[str, date], str],
                 c.fill = PatternFill("solid", fgColor=color)
             fila_de[trab] = r
             r += 1
-        r += 1
     W0, W1 = HDR + 1, r - 1
 
     # -- Plazas sin cubrir, apiladas bajo la columna de su día -------------- #
     por_dia: dict[date, list[str]] = defaultdict(list)
     for (s, f), n in faltan.items():
         por_dia[f] += [s] * n
+    r += 1
     ws.cell(r, 1, "SIN CUBRIR").font = negrita
     titulos.add(r)
     base = r + 1
@@ -329,7 +330,7 @@ def escribir_excel(datos: Datos, plan: dict[tuple[str, date], str],
                 c.number_format = "0.0"
 
     _ajustar_anchos(ws, desde_fila=HDR, saltar=titulos | {PF_HDR - 1})
-    ws.freeze_panes = "C5"
+    ws.freeze_panes = "D5"
     ruta = SALIDA / nombre
     wb.save(ruta)
     print(f"\nCuadrante: {ruta.relative_to(RAIZ)}  "

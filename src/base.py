@@ -83,6 +83,8 @@ def construir(datos: Datos) -> dict[tuple[str, date], str]:
 #  Los mixtos: cuasi-fijos con cuota de fin de semana
 # --------------------------------------------------------------------------- #
 FINDE = ("SAB", "DOM", "FEST")
+PATRON_GRANDE = "PAT_GRANDE_VALL"        # única referencia de cuota de findes, sea cual sea el
+                                          # municipio del mixto/correturno (peculiaridad local)
 
 
 def lineas_de(datos: Datos, trabajador_id: str, clase: str) -> list[str]:
@@ -98,34 +100,26 @@ def lineas_de(datos: Datos, trabajador_id: str, clase: str) -> list[str]:
 
 
 def referencia_finde(datos: Datos, plan: dict[tuple[str, date], str]) -> dict[str, Counter]:
-    """Municipio -> sábados/domingos/festivos que hace de media una persona del grupo de patrón MÁS
-    NUMEROSO de ese municipio.
-    """
-    gente: dict[str, int] = Counter()
-    municipio: dict[str, Counter] = defaultdict(Counter)
-    findes: dict[str, Counter] = defaultdict(Counter)
-    for trabajador_id, trabajador in datos.trabajadores.items():
-        if trabajador.tipo == "patron" and trabajador.patron:
-            gente[trabajador.patron] += 1
-    for (trabajador_id, fecha), turno_id in plan.items():
-        trabajador = datos.trabajadores[trabajador_id]
-        if trabajador.tipo != "patron" or not trabajador.patron:
-            continue
-        muni = datos.turnos[turno_id].municipio
-        municipio[trabajador.patron][muni] += 1
-        dia = datos.tipo_dia(fecha, muni)
-        if dia in FINDE:
-            findes[trabajador.patron][dia] += 1
+    """Sábados/domingos/festivos que hace de media una persona de PATRON_GRANDE: la referencia
+    ÚNICA de cuota de findes para mixtos y correturnos, la misma para cualquiera sea cual sea el
+    municipio al que atienda — no la del patrón más numeroso de SU municipio (eso rompía la
+    equidad conjunta que se pule en el paso E), sino siempre la del grande de Valladolid.
 
-    mayor: dict[str, tuple[int, str]] = {}
-    for patron_id, n in gente.items():
-        if not municipio[patron_id]:
+    Se devuelve un dict por municipio (mismo valor repetido) para no tocar a `cuota_finde` ni al
+    nivel 3 de `residuo.py`, que hacen `refs.get(muni)`.
+    """
+    n = sum(1 for t in datos.trabajadores.values() if t.patron == PATRON_GRANDE)
+    if not n:
+        return {}
+    findes: Counter = Counter()
+    for (trabajador_id, fecha), turno_id in plan.items():
+        if datos.trabajadores[trabajador_id].patron != PATRON_GRANDE:
             continue
-        muni = municipio[patron_id].most_common(1)[0][0]
-        if muni not in mayor or n > mayor[muni][0]:
-            mayor[muni] = (n, patron_id)
-    return {muni: Counter({d: round(findes[patron_id][d] / n) for d in FINDE})
-            for muni, (n, patron_id) in mayor.items()}
+        dia = datos.tipo_dia(fecha, datos.turnos[turno_id].municipio)
+        if dia in FINDE:
+            findes[dia] += 1
+    media = Counter({d: round(findes[d] / n) for d in FINDE})
+    return {muni: media for muni in datos.calendario_municipio}
 
 
 def cuota_finde(datos: Datos, trab: str, refs: dict[str, Counter]) -> Counter:

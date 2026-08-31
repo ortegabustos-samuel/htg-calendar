@@ -30,9 +30,9 @@ buscarlo.
                       debe respetarse salvo que sea la única manera de cubrir algo que si no
                       quedaría vacío. Por eso va como COSTE justo debajo de la cobertura: entre dos
                       soluciones que cubren lo mismo, siempre gana la que respeta el descanso.
-  3. EQUIDAD        — sábados, domingos y festivos de cada correturno contra la referencia del
-                      grupo grande de su municipio (la misma que se les aplicó a los mixtos), MÁS
-                      el rango dentro del pool. Sin el rango la métrica es ciega al reparto del
+  3. EQUIDAD        — sábados, domingos y festivos de cada correturno contra la referencia ÚNICA
+                      de PAT_GRANDE_VALL (la misma que se les aplicó a los mixtos, sea cual sea su
+                      municipio), MÁS el rango dentro del pool. Sin el rango la métrica es ciega al reparto del
                       exceso —le da igual dos personas con 19 domingos que cuatro con 12— y además
                       deja al nivel 3 reordenar libremente dentro del empate.
   4. FORMA SEMANAL  — el precio de sacar a alguien de la franja y zona que le fijó el paso C. Es

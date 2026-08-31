@@ -52,6 +52,7 @@ class Trabajador:
     factor_jornada: float = 1.0     # reducción de jornada: escala el objetivo anual. 1.0 = jornada completa
     fila_inicial: int | None = None  # solo tipo=patron: fila de `patrones.csv` que hace en la PRIMERA
                                     # semana del horizonte.
+    nombre: str = ""                # nombre y apellidos, solo para la salida a Excel
 
 
 @dataclass(frozen=True)             #El uso de forzen impide que se modifique el propio objeto Config (logico la configuracion
@@ -266,6 +267,7 @@ def _cargar_trabajadores() -> dict[str, Trabajador]:
                 vacaciones = [(vac1, vac1 + timedelta(days=14)),(vac2, vac2 + timedelta(days=14))],
                 factor_jornada=factor,
                 fila_inicial=fila_inicial,
+                nombre=(fila.get("nombre") or "").strip(),
             )
     return trabajadores
 

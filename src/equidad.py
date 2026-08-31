@@ -17,6 +17,14 @@ Qué hay que igualar, medido sobre Valladolid 2026:
 
 Se atacan los dos: la equidad por construcción del patrón es solo aproximada, y aquí se afina.
 
+**Grupo de equidad de PAT_GRANDE_VALL**: no es solo sus 38. Todo mixto y todo correturno se funde
+en el mismo grupo (`_grupo_equidad`), sea cual sea su municipio — la misma referencia única que ya
+les fija `base.referencia_finde` en los pasos A2 y D. Antes cada tipo se pulía solo entre los
+suyos, así que el desequilibrio de partida del patrón (rango de 5 sábados) solo se repartía entre
+sus 38, aunque un correturno con margen pudiera absorberlo. Fundidos, el intercambio se intenta
+entre cualquier par de los tres; las validaciones de capacidad/legalidad de abajo siguen siendo las
+que deciden qué es viable.
+
 Dos mecanismos, porque uno solo no llega:
 
   * INTERCAMBIO DE SEMANA — dos compañeros se cambian una semana ISO entera. Potente en grupos
@@ -57,6 +65,19 @@ CLASES = ("SAB", "DOM", "FEST")
 
 def _lunes(f: date) -> date:
     return f - timedelta(days=f.weekday())
+
+
+def _grupo_equidad(datos: Datos, w: str) -> str:
+    """Grupo de equidad de sáb/dom/fest para el pulido: igual que `ritmo.grupo_de`, salvo que todo
+    mixto y todo correturno se funde con PAT_GRANDE_VALL (`base.PATRON_GRANDE`) en un solo grupo,
+    sea cual sea su municipio — es la misma referencia única que ya les fija `base.referencia_finde`
+    en los pasos A2 y D, así que aquí solo queda converger los tres al mismo número real. El resto
+    de patrones (UVI, noches, pueblos) y los fijos siguen en sus grupos cerrados de siempre; esto
+    no toca `es_rigido`, que sigue leyendo `grupo_de` puro."""
+    g = grupo_de(datos, w)
+    if g == base.PATRON_GRANDE or datos.trabajadores[w].tipo in ("mixto", "correturno"):
+        return base.PATRON_GRANDE
+    return g
 
 
 def _semanas(datos: Datos, plan: Plan) -> dict[tuple[str, date], list[tuple[date, str]]]:
@@ -194,7 +215,7 @@ def pulir(datos: Datos, plan: Plan, libro: LibroHoras, vueltas: int = 400,
         pactadas = legal.pactadas(datos, base.construir(datos))
     grupos: dict[str, list[str]] = defaultdict(list)
     for w in datos.trabajadores:
-        grupos[grupo_de(datos, w)].append(w)
+        grupos[_grupo_equidad(datos, w)].append(w)
     grupos = {g: sorted(ws) for g, ws in grupos.items() if len(ws) > 1}
 
     cuentas = _cuentas(datos, plan)
@@ -331,7 +352,7 @@ def pulir_dias(datos: Datos, plan: Plan, libro: LibroHoras, vueltas: int = 600,
         pactadas = legal.pactadas(datos, base.construir(datos))
     grupos: dict[str, list[str]] = defaultdict(list)
     for w in datos.trabajadores:
-        grupos[grupo_de(datos, w)].append(w)
+        grupos[_grupo_equidad(datos, w)].append(w)
     grupos = {g: sorted(ws) for g, ws in grupos.items() if len(ws) > 1}
 
     cuentas = _cuentas(datos, plan)
@@ -400,7 +421,7 @@ def resumen(datos: Datos, plan: Plan, info: dict) -> None:
     cuentas = _cuentas(datos, plan)
     grupos: dict[str, list[str]] = defaultdict(list)
     for w in datos.trabajadores:
-        grupos[grupo_de(datos, w)].append(w)
+        grupos[_grupo_equidad(datos, w)].append(w)
 
     print(f"\nPASO E — {info['intercambios']} intercambios de semana "
           f"y {info['dias']} de día suelto")
