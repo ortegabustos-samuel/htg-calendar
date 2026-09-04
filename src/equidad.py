@@ -54,10 +54,8 @@ from collections import Counter, defaultdict
 from datetime import date, timedelta
 
 import base, legal
-import ritmo as ritmo_mod
 from cargar_datos import Datos
 from horas import EPS, LibroHoras
-from ritmo import grupo_de
 
 Plan = dict[tuple[str, date], str]
 CLASES = ("SAB", "DOM", "FEST")
@@ -68,14 +66,12 @@ def _lunes(f: date) -> date:
 
 
 def _grupo_equidad(datos: Datos, w: str) -> str:
-    """Grupo de equidad de sáb/dom/fest para el pulido: igual que `ritmo.grupo_de`, salvo que todo
-    mixto y todo correturno se funde con PAT_GRANDE_VALL (`base.PATRON_GRANDE`) en un solo grupo,
-    sea cual sea su municipio — es la misma referencia única que ya les fija `base.referencia_finde`
-    en los pasos A2 y D, así que aquí solo queda converger los tres al mismo número real. El resto
-    de patrones (UVI, noches, pueblos) y los fijos siguen en sus grupos cerrados de siempre; esto
-    no toca `es_rigido`, que sigue leyendo `grupo_de` puro."""
-    g = grupo_de(datos, w)
-    if g == base.PATRON_GRANDE or datos.trabajadores[w].tipo in ("mixto", "correturno"):
+    """PENDIENTE de la reescritura de equidad.py (fusión con correturno/fijo-con-finde): esto
+    todavía referencia `base.PATRON_GRANDE` y el tipo "mixto", que ya no existen. Se deja tal cual
+    de momento — no compila hasta que rehagamos este archivo."""
+    t = datos.trabajadores[w]
+    g = t.patron if t.tipo == "patron" and t.patron else t.tipo
+    if g == base.PATRON_GRANDE or t.tipo in ("mixto", "correturno"):
         return base.PATRON_GRANDE
     return g
 
@@ -315,10 +311,14 @@ def _valido_dia(datos: Datos, plan: Plan, libro: LibroHoras,
     # pactadas.
     rompe_domingo = (not _semana_respeta_domingo(datos, plan, a, lunes)
                       or not _semana_respeta_domingo(datos, plan, b, lunes))
+    grupo_a = datos.trabajadores[a].patron if (datos.trabajadores[a].tipo == "patron"
+             and datos.trabajadores[a].patron) else datos.trabajadores[a].tipo
+    grupo_b = datos.trabajadores[b].patron if (datos.trabajadores[b].tipo == "patron"
+             and datos.trabajadores[b].patron) else datos.trabajadores[b].tipo
     rompe_descanso = (
-        (not ritmo_mod.es_rigido(datos, a)
+        (grupo_a not in datos.config.grupos_rigidos
          and not legal.descanso_finde_ok(datos, plan, a, lunes))
-        or (not ritmo_mod.es_rigido(datos, b)
+        or (grupo_b not in datos.config.grupos_rigidos
             and not legal.descanso_finde_ok(datos, plan, b, lunes))
     )
     if rompe_domingo or rompe_descanso or _empeora(datos, plan, a, b, desde, hasta, antes, pactadas):
