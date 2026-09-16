@@ -53,7 +53,7 @@ from __future__ import annotations
 from collections import Counter, defaultdict
 from datetime import date, timedelta
 
-import base, legal
+import base, legal, residuo
 from cargar_datos import Datos
 from horas import EPS, LibroHoras
 
@@ -65,15 +65,14 @@ def _lunes(f: date) -> date:
     return f - timedelta(days=f.weekday())
 
 
-def _grupo_equidad(datos: Datos, w: str) -> str:
-    """PENDIENTE de la reescritura de equidad.py (fusión con correturno/fijo-con-finde): esto
-    todavía referencia `base.PATRON_GRANDE` y el tipo "mixto", que ya no existen. Se deja tal cual
-    de momento — no compila hasta que rehagamos este archivo."""
+def _grupo_equidad(datos: Datos, w: str, ex_mixtos: set[str]) -> str:
+    """Mismo grupo fundido que ya usa `residuo._equidad_finde_clase` en los niveles 3-5: el patrón
+    grande de Valladolid, los ex-mixtos (fijos con capacidad de finde) y todos los correturnos. El
+    resto de patrones se agrupan por su propio `patron`."""
     t = datos.trabajadores[w]
-    g = t.patron if t.tipo == "patron" and t.patron else t.tipo
-    if g == base.PATRON_GRANDE or t.tipo in ("mixto", "correturno"):
-        return base.PATRON_GRANDE
-    return g
+    if t.tipo == "correturno" or w in ex_mixtos or t.patron == residuo.PATRON_GRANDE:
+        return residuo.PATRON_GRANDE
+    return t.patron if t.tipo == "patron" and t.patron else t.tipo
 
 
 def _semanas(datos: Datos, plan: Plan) -> dict[tuple[str, date], list[tuple[date, str]]]:
@@ -209,9 +208,10 @@ def pulir(datos: Datos, plan: Plan, libro: LibroHoras, vueltas: int = 400,
           pactadas: set | None = None) -> dict:
     if pactadas is None:
         pactadas = legal.pactadas(datos, base.construir(datos))
+    ex_mixtos = set(residuo.mixtos_con_finde(datos))
     grupos: dict[str, list[str]] = defaultdict(list)
     for w in datos.trabajadores:
-        grupos[_grupo_equidad(datos, w)].append(w)
+        grupos[_grupo_equidad(datos, w, ex_mixtos)].append(w)
     grupos = {g: sorted(ws) for g, ws in grupos.items() if len(ws) > 1}
 
     cuentas = _cuentas(datos, plan)
@@ -350,9 +350,10 @@ def pulir_dias(datos: Datos, plan: Plan, libro: LibroHoras, vueltas: int = 600,
     más tiene al que menos, dentro de la misma semana ISO."""
     if pactadas is None:
         pactadas = legal.pactadas(datos, base.construir(datos))
+    ex_mixtos = set(residuo.mixtos_con_finde(datos))
     grupos: dict[str, list[str]] = defaultdict(list)
     for w in datos.trabajadores:
-        grupos[_grupo_equidad(datos, w)].append(w)
+        grupos[_grupo_equidad(datos, w, ex_mixtos)].append(w)
     grupos = {g: sorted(ws) for g, ws in grupos.items() if len(ws) > 1}
 
     cuentas = _cuentas(datos, plan)
@@ -419,9 +420,10 @@ def pulir_dias(datos: Datos, plan: Plan, libro: LibroHoras, vueltas: int = 600,
 
 def resumen(datos: Datos, plan: Plan, info: dict) -> None:
     cuentas = _cuentas(datos, plan)
+    ex_mixtos = set(residuo.mixtos_con_finde(datos))
     grupos: dict[str, list[str]] = defaultdict(list)
     for w in datos.trabajadores:
-        grupos[_grupo_equidad(datos, w)].append(w)
+        grupos[_grupo_equidad(datos, w, ex_mixtos)].append(w)
 
     print(f"\nPASO E — {info['intercambios']} intercambios de semana "
           f"y {info['dias']} de día suelto")

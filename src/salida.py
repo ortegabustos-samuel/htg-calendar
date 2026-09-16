@@ -1,25 +1,29 @@
 """
-salida.py — El cuadrante a XLSX: rejilla trabajador x dia, recuentos vivos y plan funcional.
+salida.py — El cuadrante a XLSX: rejilla trabajador x dia, comprobante de cobertura y plan
+funcional para el comité.
 
-La hoja es VIVA: los cuatro recuentos de la derecha —sábados, domingos, festivos y horas— son
-FÓRMULAS, no números pegados. Si el planificador escribe una línea en una celda del calendario, los
-cuatro se recalculan solos y con los datos DE ESA LÍNEA: sus horas, y si ese día es festivo según el
-calendario de su municipio (hay municipios con festivos propios, así que un mismo día cuenta para
-unos y no para otros).
+La hoja Cuadrante es VIVA: los cuatro recuentos de la derecha —sábados, domingos, festivos y
+horas— y la tabla COBERTURA DÍA A DÍA de debajo son FÓRMULAS, no números pegados. Si el
+planificador escribe una línea en una celda del calendario, se recalculan solos: los recuentos con
+los datos DE ESA LÍNEA (sus horas, y si ese día es festivo según el calendario de su municipio) y la
+tabla de cobertura con su semáforo —verde cubierto exacto, amarillo sobra gente, rojo falta— de esa
+línea ese día. Así una alteración manual posterior a la generación del cuadrante se ve al momento.
 
-Para que las fórmulas tengan de dónde leer, debajo del calendario va el PLAN FUNCIONAL: una fila por
-línea con sus días de operación, horario, horas, demanda diaria y anual, asignados y sin cubrir. Y
-entre medias la sección SIN CUBRIR, con las plazas que faltan apiladas bajo la columna de su día.
+La hoja Conversión Comité lleva el plan funcional (una fila por línea, con su demanda y su
+"Asignados" en vivo) y una columna Leyenda Comité en blanco para que el comité la rellene, una
+leyenda por turno.
 """
 from __future__ import annotations
 
-from collections import Counter, defaultdict
+from collections import Counter
 from datetime import date
 from pathlib import Path
 
 from openpyxl import Workbook
+from openpyxl.formatting.rule import FormulaRule
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
+from openpyxl.workbook.defined_name import DefinedName
 
 from cargar_datos import Datos
 
@@ -31,7 +35,11 @@ DIA_INI = ["L", "M", "X", "J", "V", "S", "D"]
 # Colores del Excel. El de FESTIVO se aplica CELDA A CELDA, no a la columna entera: un festivo local
 # solo tiñe a quien trabaja en un municipio que se acoge a ese calendario.
 CAT_FILL = {"lv": "FFF2CC", "finde": "F8CBAD", "festivo": "FFC000"}
-FILL_VAC_XL, FILL_HUECO_XL = "FFFF00", "F4B084"
+FILL_VAC_XL = "FFFF00"
+# Semáforo de COBERTURA DÍA A DÍA, por formato condicional (no relleno fijo) para que siga vivo si
+# el planificador retoca el cuadrante después de generarlo: verde asignados = demanda, amarillo
+# asignados > demanda (sobra gente), rojo asignados < demanda (falta gente).
+FILL_COBERTURA_OK, FILL_COBERTURA_EXCESO, FILL_COBERTURA_FALTA = "C6EFCE", "FFEB9C", "FFC7CE"
 
 
 def _municipio_trabajador(datos: Datos) -> dict[str, str]:
@@ -127,19 +135,20 @@ def escribir_excel(datos: Datos, plan: dict[tuple[str, date], str],
                       nombre: str = "calendario.xlsx") -> Path:
     """Vuelca el cuadrante a XLSX.
 
-    La hoja es VIVA: los cuatro recuentos de la derecha —sábados, domingos, festivos y horas— son
-    FÓRMULAS, no números pegados. Si el planificador escribe una línea en una celda del calendario,
-    los cuatro se recalculan solos y con los datos DE ESA LÍNEA: sus horas, y si ese día es festivo
-    según el calendario de su municipio (hay municipios con festivos propios, así que un mismo día
-    cuenta para unos y no para otros).
+    Hoja `Cuadrante`: SOLO la rejilla trabajador x día (con sus cuatro recuentos vivos de la
+    derecha) y, debajo, la tabla COBERTURA DÍA A DÍA — una fila por línea, con fórmulas que muestran
+    "asignados/demanda" de esa línea cada día y un semáforo por formato condicional (verde cubierto
+    exacto, amarillo sobra gente, rojo falta) para poder comprobar, incluso después de retocar el
+    cuadrante a mano, si un día se queda o no cubierto.
 
-    Para que las fórmulas tengan de dónde leer, debajo del calendario va el PLAN FUNCIONAL: una fila
-    por línea con sus días de operación, horario, horas, demanda diaria, demanda anual y cuántos
-    asignados tiene. Y entre medias, la sección SIN CUBRIR: las plazas que faltan, apiladas bajo la
-    columna de su día, para ver la cobertura día a día.
+    Hoja `Conversión Comité`: el PLAN FUNCIONAL —una fila por línea con sus días de operación,
+    horario, horas, demanda diaria, demanda anual y "Asignados" en vivo (fórmula que lee de
+    `Cuadrante`)— más una columna Leyenda Comité en blanco para que el comité la rellene, una
+    leyenda por turno.
 
-    Una hoja `Aux` oculta lleva las banderas por día (sábado, domingo y festivo de cada calendario),
-    que es lo que no cabe en el calendario sin ensuciarlo.
+    Una hoja `Aux` oculta lleva las banderas por día (sábado, domingo y festivo de cada calendario)
+    y la demanda diaria de cada línea (0 los días que no opera); es de donde leen las fórmulas
+    anteriores, y no cabe en las hojas visibles sin ensuciarlas.
 
     Todo día sin turno asignado —descanso de rotación, libranza cedida o simplemente sin decidir— se
     deja como CELDA VACÍA: en el cuadrante que se entrega no hay más marcas que el turno, la V de
@@ -148,6 +157,13 @@ def escribir_excel(datos: Datos, plan: dict[tuple[str, date], str],
     SALIDA.mkdir(parents=True, exist_ok=True)
     fechas = datos.lista_dias_calendario
     wb = Workbook()
+    # Explícito y no confiado al valor por defecto de cada programa: cálculo automático, y
+    # recalcular todo la primera vez que se abre (por si el programa lo dejó a medias al generarlo).
+    # OJO: nada de forceFullCalc/calcOnSave — eso pide recalcular el libro ENTERO en cada pasada, no
+    # solo lo que depende de la celda tocada, y con una hoja de este tamaño se nota mucho, se vuelve
+    # lento editar. calcMode="auto" ya basta para que se refresque solo edición a edición.
+    wb.calculation.calcMode = "auto"
+    wb.calculation.fullCalcOnLoad = True
     ws = wb.active
     ws.title = "Cuadrante"
 
@@ -164,17 +180,19 @@ def escribir_excel(datos: Datos, plan: dict[tuple[str, date], str],
               for s, t in datos.turnos.items() for f in fechas if datos.opera(s, f)}
     n_deficit = sum(faltan.values())
 
+    # Ordenado por CALENDARIO: la fórmula de festivos referencia las líneas de cada calendario como
+    # un RANGO, así que tienen que ocupar filas contiguas en Conversión Comité.
+    fes_cal = _calendarios_festivos(datos)
+    lineas = sorted(datos.turnos, key=lambda s: (_calendario_de(datos, s), s))
+    tramo_cal = {c: [i for i, s in enumerate(lineas) if _calendario_de(datos, s) == c]
+                 for c in fes_cal}
+
     ws.cell(1, 1, f"Cuadrante {fechas[0]:%d/%m/%Y} – {fechas[-1]:%d/%m/%Y}"
             ).font = Font(bold=True, size=14)
     ws.cell(2, 1, f"Cobertura {demanda - n_deficit}/{demanda} "
                   f"({(demanda - n_deficit) / demanda:.1%})  |  sin cubrir {n_deficit}  |  "
                   f"{len(plan)} asignaciones").alignment = izq
-    ws.cell(3, 1, f"Hoja VIVA: los recuentos de la derecha del calendario (sábados, domingos, "
-                  f"festivos y horas) son fórmulas que leen del PLAN FUNCIONAL de abajo. Escribe "
-                  f"una línea en una celda del calendario y se recalculan solos. Objetivo "
-                  f"{datos.config.horas_objetivo} h/año.").alignment = izq
-
-    HDR = 4
+    HDR = 3
     ws.cell(HDR, 1, "Trabajador").font = negrita
     ws.cell(HDR, 2, "Nombre").font = negrita
     ws.cell(HDR, 3, "Tipo").font = negrita
@@ -204,6 +222,10 @@ def escribir_excel(datos: Datos, plan: dict[tuple[str, date], str],
             ws.cell(r, 1, trab).alignment = izq
             ws.cell(r, 2, t.nombre).alignment = izq
             ws.cell(r, 3, t.patron if t.tipo == "patron" else t.tipo).alignment = izq
+            # Columna oculta con el tipo MACRO (fijo/patron/mixto/correturno), sin diluir con el
+            # nombre del patrón como hace la columna Tipo visible: es de aquí de donde separa por
+            # secciones el PDF del comité, y necesita el grupo grueso, no la fila de detalle.
+            ws.cell(r, COL_EXTRA + 4, t.tipo)
             for j, d in enumerate(fechas):
                 c = ws.cell(r, COL_D0 + j)
                 c.alignment, c.border = centro, borde
@@ -220,63 +242,6 @@ def escribir_excel(datos: Datos, plan: dict[tuple[str, date], str],
             fila_de[trab] = r
             r += 1
     W0, W1 = HDR + 1, r - 1
-
-    # -- Plazas sin cubrir, apiladas bajo la columna de su día -------------- #
-    por_dia: dict[date, list[str]] = defaultdict(list)
-    for (s, f), n in faltan.items():
-        por_dia[f] += [s] * n
-    r += 1
-    ws.cell(r, 1, "SIN CUBRIR").font = negrita
-    titulos.add(r)
-    base = r + 1
-    for j, d in enumerate(fechas):
-        for k, s in enumerate(sorted(por_dia.get(d, []))):
-            c = ws.cell(base + k, COL_D0 + j, s)
-            c.alignment, c.border = centro, borde
-            c.fill = PatternFill("solid", fgColor=FILL_HUECO_XL)
-    r = base + max((len(v) for v in por_dia.values()), default=0) + 1
-
-    # -- PLAN FUNCIONAL: la tabla de la que leen las fórmulas ---------------- #
-    fes_cal = _calendarios_festivos(datos)
-    # Ordenado por CALENDARIO: la fórmula de festivos referencia las líneas de cada calendario como
-    # un RANGO, así que tienen que ocupar filas contiguas.
-    lineas = sorted(datos.turnos, key=lambda s: (_calendario_de(datos, s), s))
-    tramo_cal = {c: [i for i, s in enumerate(lineas) if _calendario_de(datos, s) == c]
-                 for c in fes_cal}
-
-    r += 1
-    ws.cell(r, 1, "PLAN FUNCIONAL").font = Font(bold=True, size=12)
-    titulos.add(r)
-    ws.cell(r, 3, "una fila por línea: es de aquí de donde leen las fórmulas de la derecha del "
-                  "calendario (horas, sábados, domingos y festivos)").alignment = izq
-    r += 1
-    PF_HDR = r
-    CAMPOS = ("Línea", "Municipio", "LV", "Sábado", "Domingo", "Festivo", "Entrada", "Salida",
-              "Horas", "Demanda/día", "Demanda anual", "Asignados", "Sin cubrir")
-    for k, titulo in enumerate(CAMPOS):
-        c = ws.cell(PF_HDR, 1 + k, titulo)
-        c.alignment, c.font, c.border = centro, negrita, borde
-
-    PF0 = PF_HDR + 1
-    for i, s in enumerate(lineas):
-        t, fr = datos.turnos[s], PF0 + i
-        opera = sum(1 for d in fechas if datos.opera(s, d))
-        vals = (s, t.municipio, t.lv, t.sab, t.dom, t.fes,
-                f"{t.hora_entrada:%H:%M}", f"{t.hora_salida:%H:%M}", t.horas, t.dem,
-                t.dem * opera,
-                f"=COUNTIF({L_D0}${W0}:{L_DN}${W1},$A{fr})",
-                sum(n for (ss, _), n in faltan.items() if ss == s))
-        for k, v in enumerate(vals):
-            c = ws.cell(fr, 1 + k, v)
-            c.alignment, c.border = (izq if k < 2 else centro), borde
-            if k == 8:
-                c.number_format = "0.00"
-    PF1 = PF0 + len(lineas) - 1
-    # Estas filas caen bajo las columnas de DÍA del calendario, así que quedan fuera del autoajuste:
-    # si no, "Demanda anual" ensancharía la columna del 3 de enero.
-    titulos.update(range(PF_HDR, PF1 + 1))
-    T_ID = f"$A${PF0}:$A${PF1}"
-    T_HORAS = f"$I${PF0}:$I${PF1}"                        # columna 9 = Horas
 
     # -- Hoja Aux (oculta): qué día es sábado, domingo o festivo ------------ #
     #
@@ -302,6 +267,81 @@ def escribir_excel(datos: Datos, plan: dict[tuple[str, date], str],
                 aux.cell(fr, COL_D0 + j, 1 if marca else 0)
     aux.sheet_state = "hidden"
 
+    # -- Cobertura día a día: semáforo vivo por línea y día ------------------ #
+    # El relleno de un formato CONDICIONAL (a diferencia del relleno fijo de la rejilla) sí respeta
+    # el canal alfa: sin "FF" por delante queda transparente y la regla se aplica pero no se ve nada.
+    fill_ok = PatternFill("solid", start_color="FF" + FILL_COBERTURA_OK,end_color="FF" + FILL_COBERTURA_OK)
+    fill_exceso = PatternFill("solid", start_color="FF" + FILL_COBERTURA_EXCESO,end_color="FF" + FILL_COBERTURA_EXCESO)
+    fill_falta = PatternFill("solid", start_color="FF" + FILL_COBERTURA_FALTA,end_color="FF" + FILL_COBERTURA_FALTA)
+
+    r = W1 + 2
+    ws.cell(r, 1, "COBERTURA DÍA A DÍA").font = Font(bold=True, size=12)
+    titulos.add(r)
+    COB0 = r + 1
+
+    # Demanda diaria de cada línea (0 los días que no opera), EN LA MISMA HOJA que el semáforo y
+    # oculta bajo la tabla: el formato condicional no puede fiarse de una referencia a OTRA hoja
+    # (Aux) para su fórmula — es un caso especial que varios motores (no solo Excel) resuelven mal o
+    # no evalúan nunca, a diferencia de una fórmula normal de celda, que sí cruza de hoja sin líos.
+    DEM_ROW: dict[str, int] = {}
+    dem_fila0 = COB0 + len(lineas) + 2
+    for i, s in enumerate(lineas):
+        fr = dem_fila0 + i
+        DEM_ROW[s] = fr
+        t = datos.turnos[s]
+        ws.cell(fr, 1, f"dem {s}")
+        for j, d in enumerate(fechas):
+            ws.cell(fr, COL_D0 + j, t.dem if datos.opera(s, d) else 0)
+        ws.row_dimensions[fr].hidden = True
+    titulos.update(range(dem_fila0, dem_fila0 + len(lineas)))
+
+    for i, s in enumerate(lineas):
+        fr = COB0 + i
+        ws.cell(fr, 1, s).alignment = izq
+        demrow = DEM_ROW[s]
+        for j, d in enumerate(fechas):
+            col = get_column_letter(COL_D0 + j)
+            c = ws.cell(fr, COL_D0 + j)
+            c.alignment, c.border = centro, borde
+            c.value = (f'=IF({col}{demrow}=0,"",'
+                       f'COUNTIF({col}${W0}:{col}${W1},$A{fr})&"/"&{col}{demrow})')
+        rng = f"{L_D0}{fr}:{L_DN}{fr}"
+        cuenta = f"COUNTIF({L_D0}${W0}:{L_D0}${W1},$A${fr})"
+        dem = f"{L_D0}${demrow}"
+        # Verde también los días que la línea NO opera (dem=0): no hay nada que cubrir, así que no
+        # es un problema — y de paso la fila no se queda con huecos en blanco sin más.
+        ws.conditional_formatting.add(
+            rng, FormulaRule(formula=[f"OR({dem}=0,{cuenta}={dem})"], fill=fill_ok))
+        ws.conditional_formatting.add(
+            rng, FormulaRule(formula=[f"AND({dem}<>0,{cuenta}>{dem})"], fill=fill_exceso))
+        ws.conditional_formatting.add(
+            rng, FormulaRule(formula=[f"AND({dem}<>0,{cuenta}<{dem})"], fill=fill_falta))
+
+    # -- Hoja Conversión Comité: plan funcional + leyenda a rellenar por el comité ---------- #
+    ws2 = wb.create_sheet("Conversión Comité")
+    ws2.cell(1, 1, "PLAN FUNCIONAL").font = Font(bold=True, size=12)
+    PF_HDR = 2
+    CAMPOS = ("Línea", "Municipio", "LV", "Sábado", "Domingo", "Festivo", "Entrada", "Salida",
+              "Horas","Leyenda Comité")
+    for k, titulo in enumerate(CAMPOS):
+        c = ws2.cell(PF_HDR, 1 + k, titulo)
+        c.alignment, c.font, c.border = centro, negrita, borde
+
+    PF0 = PF_HDR + 1
+    for i, s in enumerate(lineas):
+        t, fr = datos.turnos[s], PF0 + i
+        opera = sum(1 for d in fechas if datos.opera(s, d))
+        vals = (s, t.municipio, t.lv, t.sab, t.dom, t.fes,
+                f"{t.hora_entrada:%H:%M}", f"{t.hora_salida:%H:%M}", t.horas,None)
+        for k, v in enumerate(vals):
+            c = ws2.cell(fr, 1 + k, v)
+            c.alignment, c.border = (izq if k < 2 else centro), borde
+            if k == 8:
+                c.number_format = "0.00"
+    PF1 = PF0 + len(lineas) - 1
+    T_ID = f"'Conversión Comité'!$A${PF0}:$A${PF1}"
+    T_HORAS = f"'Conversión Comité'!$I${PF0}:$I${PF1}"                    # columna 9 = Horas
+
     # -- Los cuatro recuentos, ya como fórmulas ----------------------------- #
     for trab, fr in fila_de.items():
         D = f"{L_D0}{fr}:{L_DN}{fr}"
@@ -314,7 +354,7 @@ def escribir_excel(datos: Datos, plan: dict[tuple[str, date], str],
         def por_calendario(clase: str) -> str:
             return "=" + "+".join(
                 f"SUMPRODUCT(Aux!${L_D0}${F_CAL[c][clase]}:${L_DN}${F_CAL[c][clase]},"
-                f"COUNTIF($A${PF0 + tramo[0]}:$A${PF0 + tramo[-1]},{D}))"
+                f"COUNTIF('Conversión Comité'!$A${PF0 + tramo[0]}:$A${PF0 + tramo[-1]},{D}))"
                 for c, tramo in tramo_cal.items() if tramo)
 
         formulas = [
@@ -329,8 +369,31 @@ def escribir_excel(datos: Datos, plan: dict[tuple[str, date], str],
             if k == 3:
                 c.number_format = "0.0"
 
-    _ajustar_anchos(ws, desde_fila=HDR, saltar=titulos | {PF_HDR - 1})
+    _ajustar_anchos(ws, desde_fila=HDR, saltar=titulos)
     ws.freeze_panes = "D5"
+    _ajustar_anchos(ws2, desde_fila=1, saltar={2})
+    ws2.freeze_panes = f"A{PF0}"
+
+    # -- Rangos con nombre: para que un lector externo (p.ej. el script del comité que traduce el
+    # cuadrante a PDF) localice las tablas por NOMBRE en vez de tener que buscar celdas por su texto
+    # ("Trabajador", "Línea"...), que es frágil si algún día cambia una etiqueta. ------------------ #
+    # La columna de Leyenda Comité se calcula desde CAMPOS, no se hardcodea la letra: si el día de
+    # mañana se añade o se quita una columna al plan funcional, este rango no se desincroniza solo.
+    col_leyenda = get_column_letter(1 + CAMPOS.index("Leyenda Comité"))
+    for nombre_rango, referencia in {
+        "CuadranteTitulo": "Cuadrante!$A$1",
+        "CuadranteDNI": f"Cuadrante!$A${W0}:$A${W1}",
+        "CuadranteNombre": f"Cuadrante!$B${W0}:$B${W1}",
+        "CuadranteDias": f"Cuadrante!${L_D0}${W0}:${L_DN}${W1}",
+        "CuadranteCabecera": f"Cuadrante!${L_D0}${HDR}:${L_DN}${HDR}",
+        "CuadranteGrupo": f"Cuadrante!${get_column_letter(COL_EXTRA + 4)}${W0}:"
+                           f"${get_column_letter(COL_EXTRA + 4)}${W1}",
+        "ComiteLinea": f"'Conversión Comité'!$A${PF0}:$A${PF1}",
+        "ComiteLeyenda": f"'Conversión Comité'!${col_leyenda}${PF0}:${col_leyenda}${PF1}",
+    }.items():
+        wb.defined_names[nombre_rango] = DefinedName(nombre_rango, attr_text=referencia)
+    ws.column_dimensions[get_column_letter(COL_EXTRA + 4)].hidden = True
+
     ruta = SALIDA / nombre
     wb.save(ruta)
     print(f"\nCuadrante: {ruta.relative_to(RAIZ)}  "

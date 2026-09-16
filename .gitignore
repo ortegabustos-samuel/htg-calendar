@@ -4,3 +4,4 @@ MODELO.md
 /data/*
 __pycache__/
 *.pyc
+.superpowers/

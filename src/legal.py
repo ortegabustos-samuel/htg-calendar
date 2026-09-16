@@ -139,6 +139,25 @@ def formas(datos: Datos, plan: Plan, trabajador_id: str, desde: date, hasta: dat
     return salida
 
 
+def _grupo(datos: Datos, trab: str) -> str:
+    t = datos.trabajadores[trab]
+    return t.patron if t.tipo == "patron" and t.patron else t.tipo
+
+
+def _rigido(datos: Datos, trab: str) -> bool:
+    """La plaza de `trab` no se fracciona al ceder: se cede el ciclo entero, nunca un día suelto."""
+    return _grupo(datos, trab) in datos.config.grupos_rigidos
+
+
+def pactadas(datos: Datos, plan: Plan) -> set:
+    """Las formas de incumplimiento que el base produce por sí mismo: son las que vienen
+    pactadas con los trabajadores y las que, por tanto, se pueden mover de una persona a otra."""
+    salida: set = set()
+    for trab in {trabajador_id for (trabajador_id, _) in plan}:
+        salida |= set(formas(datos, plan, trab, datos.inicio, datos.fin))
+    return salida
+
+
 def infracciones(datos: Datos, plan: Plan) -> list[str]:
     """Lo que incumple un plan ya terminado. No decide nada: es la comprobación que se imprime al
     cerrar cada paso, para no dar por bueno un cuadrante ilegal porque la cobertura salga bien."""
@@ -176,3 +195,104 @@ def infracciones(datos: Datos, plan: Plan) -> list[str]:
             if total > datos.config.horas_max_semana:
                 fallos.append(f"C6 {w} semana del {lunes:%d/%m}: {total:.0f} h")
     return fallos
+
+
+def integridad(datos: Datos, plan: Plan) -> list[str]:
+    """Lo que haría el cuadrante inejecutable, al margen del convenio: alguien asignado estando de
+    vacaciones, un turno en un día en que su línea no opera, alguien sin capacidad para la línea que
+    hace, o más gente asignada que demanda tiene la plaza. Aquí nunca debería haber nada."""
+    cuenta: dict[tuple[str, date], int] = {}
+    fallos: list[str] = []
+    for (w, f), s in plan.items():
+        cuenta[(s, f)] = cuenta.get((s, f), 0) + 1
+        if not datos.disponible(w, f):
+            fallos.append(f"{w} asignado a {s} el {f:%d/%m} estando de vacaciones")
+        elif not datos.opera(s, f):
+            fallos.append(f"{w} hace {s} el {f:%d/%m}, día en que esa línea no opera")
+        elif not datos.elegible(w, s, f)[0]:
+            fallos.append(f"{w} hace {s} el {f:%d/%m} sin capacidad declarada")
+        elif not domingo_ok(datos, plan, w, f, s):
+            fallos.append(f"{w} hace {s} el {f:%d/%m} (domingo) sin el sábado de ese fin de semana")
+    for (s, f), n in cuenta.items():
+        if datos.turnos[s].dem and n > datos.turnos[s].dem:
+            fallos.append(f"{s} el {f:%d/%m}: {n} asignados para {datos.turnos[s].dem} de demanda")
+
+    vistas: set[tuple[str, date]] = set()
+    for (w, f) in plan:
+        lunes = f - timedelta(days=f.weekday())
+        if (w, lunes) in vistas or _rigido(datos, w):
+            continue
+        vistas.add((w, lunes))
+        if not descanso_finde_ok(datos, plan, w, lunes):
+            fallos.append(f"{w} semana del {lunes:%d/%m}: sábado y domingo sin un par de días "
+                          f"consecutivos libres entre semana")
+    return fallos
+
+
+def auditar(datos: Datos, plan: Plan, pactadas_esqueleto: set,
+            domingos_esqueleto: set[tuple[str, date]] | None = None,
+            descansos_esqueleto: set[tuple[str, date]] | None = None) -> None:
+    """El repaso legal que se imprime al cerrar cada ejecución.
+
+    La legalidad NO se mide contando: se mide por FORMAS. Los patrones incumplen el convenio por
+    acuerdo con los trabajadores, así que el cuadrante nace con más de mil incumplimientos que hay
+    que respetar. Lo que importa no es el total, sino cuántos tienen una forma —un par de turnos
+    seguidos, una semana ISO— que el esqueleto NO produce por su cuenta: esos se los ha inventado
+    el pipeline, y son los únicos que hay que mirar.
+
+    domingos_esqueleto y descansos_esqueleto son lo que ya trae el esqueleto puro (Paso A) para
+    cada regla — se toleran igual que las formas pactadas de los patrones y no cuentan como
+    FALLOS nuevos.
+    """
+    domingos_esqueleto = domingos_esqueleto or set()
+    descansos_esqueleto = descansos_esqueleto or set()
+    rotos = integridad(datos, plan)
+
+    domingo_actual = {(w, f) for (w, f), s in plan.items() if not domingo_ok(datos, plan, w, f, s)}
+    heredados_dom = domingo_actual & domingos_esqueleto
+    nuevos_domingo = domingo_actual - domingos_esqueleto
+
+    descanso_actual: set[tuple[str, date]] = set()
+    vistas: set[tuple[str, date]] = set()
+    for (w, f) in plan:
+        lunes = f - timedelta(days=f.weekday())
+        if (w, lunes) in vistas or _rigido(datos, w):
+            continue
+        vistas.add((w, lunes))
+        if not descanso_finde_ok(datos, plan, w, lunes):
+            descanso_actual.add((w, lunes))
+    heredados_desc = descanso_actual & descansos_esqueleto
+    nuevos_descanso = descanso_actual - descansos_esqueleto
+
+    otros = [r for r in rotos if "sin el sábado" not in r and "consecutivos libres" not in r]
+    graves = len(otros) + len(nuevos_domingo) + len(nuevos_descanso)
+    if graves == 0:
+        extra_bits = []
+        if heredados_dom:
+            extra_bits.append(f"{len(heredados_dom)} domingo(s) heredado(s) del esqueleto")
+        if heredados_desc:
+            extra_bits.append(f"{len(heredados_desc)} semana(s) sin descanso consecutivo "
+                              f"heredada(s) del esqueleto")
+        extra = f" ({', '.join(extra_bits)}, tolerados)" if extra_bits else ""
+        print(f"\nAUDITORÍA — integridad: correcta{extra}")
+    else:
+        if otros:
+            ejemplo = otros[0]
+        elif nuevos_domingo:
+            w, f = next(iter(nuevos_domingo))
+            ejemplo = f"{w} el {f:%d/%m}: domingo NUEVO sin el sábado de ese fin de semana"
+        else:
+            w, lunes = next(iter(nuevos_descanso))
+            ejemplo = f"{w} semana del {lunes:%d/%m}: NUEVA sin par de días consecutivos libres"
+        print(f"\nAUDITORÍA — integridad: *** {graves} FALLOS: {ejemplo} ***")
+
+    total: Counter = Counter()
+    for trab in {w for (w, _) in plan}:
+        total += formas(datos, plan, trab, datos.inicio, datos.fin)
+    inventadas = Counter({k: n for k, n in total.items() if k not in pactadas_esqueleto})
+    casos = sum(total.values())
+    print(f"  incumplimientos: {casos} en total · {casos - sum(inventadas.values())} pactados "
+          f"(los produce el propio patrón) · {sum(inventadas.values())} introducidos por el pipeline")
+    if inventadas:
+        print("    por tipo: " + " · ".join(
+            f"{t}: {n}" for t, n in sorted(Counter(k[0] for k in inventadas.elements()).items())))

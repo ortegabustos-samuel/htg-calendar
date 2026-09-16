@@ -12,6 +12,16 @@ RADIO_SEPARACION = 7   # días de margen alrededor de cada cesión de un titular
                        # ceder otra: sin esto, sus propias cesiones sueltas se apilan en la misma
                        # semana porque la disponibilidad de un día a otro apenas cambia y nada
                        # penaliza coger el día de al lado (el hueco solo se mira día a día).
+PESO_CARGA = 0.5       # penalización blanda por día de `carga_semana`: sin esto, cada titular
+                       # elige su "mejor momento" mirando solo su propio pool, y muchas cesiones
+                       # de gente distinta acaban aterrizando en las mismas semanas — correturno
+                       # se ve forzado a fijarse ahí para taparlas y pierde la holgura que
+                       # necesita para repartir sáb/dom/fest con equidad. No bloquea nunca una
+                       # ventana: solo la hace perder frente a otra con menos carga ya acumulada.
+
+
+def _lunes(f: date) -> date:
+    return f - timedelta(days=f.weekday())
 
 
 def _designados(datos: Datos) -> dict[str, list[str]]:
@@ -120,11 +130,15 @@ def _cubrir_vacaciones(datos: Datos, plan: Plan, libro: LibroHoras, ocupado: set
 def _mejor_periodo(datos: Datos, plan: Plan, titular: str, pool: set[str], cubridores: list[str],
                    tam: int, alinear_lunes: bool, usados: set[date],
                    turnos_del_dia: dict[date, list[str]], ocupado: set[tuple[str, date]],
-                   elegibles_por_turno: dict[str, set[str]]) -> tuple[date, date, str] | None:
+                   elegibles_por_turno: dict[str, set[str]],
+                   carga_semana: dict[date, int]) -> tuple[date, date, str] | None:
     """(inicio, fin, cubridor) del período con más margen para asumir la cesión: gente de `pool`
     (quien podría cubrir esto) que está libre en la ventana, menos los huecos que ya haya
     abiertos ahí en turnos que comparten ese mismo pool de cobertura — para que cesiones
-    independientes no coincidan en el mismo momento salvo que sobre gente capaz para todas."""
+    independientes no coincidan en el mismo momento salvo que sobre gente capaz para todas.
+    `carga_semana` penaliza además, blando, las semanas donde YA se ha cedido mucho (de
+    cualquier titular, no solo de este pool): sin eso, cada cesión se decide mirando solo su
+    propio margen y muchas acaban concentradas en las mismas semanas."""
     candidatos = []
     for inicio in datos.lista_dias_calendario:
         if alinear_lunes and inicio.weekday() != 0:
@@ -144,7 +158,8 @@ def _mejor_periodo(datos: Datos, plan: Plan, titular: str, pool: set[str], cubri
         disponibles = sum(1 for w in pool if all(datos.disponible(w, d) for d in ventana))
         huecos = sum(1 for f in ventana for turno in turnos_del_dia.get(f, [])
                     if (turno, f) not in ocupado and elegibles_por_turno.get(turno, set()) & pool)
-        candidatos.append((disponibles - huecos, inicio, fin, cubridor))
+        carga = sum(carga_semana.get(_lunes(d), 0) for d in ventana)
+        candidatos.append((disponibles - huecos - PESO_CARGA * carga, inicio, fin, cubridor))
     if not candidatos:
         return None
     _, inicio, fin, cubridor = max(candidatos)
@@ -154,10 +169,11 @@ def _mejor_periodo(datos: Datos, plan: Plan, titular: str, pool: set[str], cubri
 def _mejor_periodo_libre(datos: Datos, titular: str, pool: set[str], tam: int, alinear_lunes: bool,
                          usados: set[date], turnos_del_dia: dict[date, list[str]],
                          ocupado: set[tuple[str, date]],
-                         elegibles_por_turno: dict[str, set[str]]) -> tuple[date, date] | None:
+                         elegibles_por_turno: dict[str, set[str]],
+                         carga_semana: dict[date, int]) -> tuple[date, date] | None:
     """Como `_mejor_periodo`, pero sin cubridor propio a quien traspasar: solo hace falta que
     exista margen real (gente de `pool` libre, con hueco de sobra) para dejar la plaza vacía —
-    la cubrirá correturno más adelante en el paso D."""
+    la cubrirá correturno más adelante en el paso D. Mismo penalti blando de `carga_semana`."""
     candidatos = []
     for inicio in datos.lista_dias_calendario:
         if alinear_lunes and inicio.weekday() != 0:
@@ -175,7 +191,8 @@ def _mejor_periodo_libre(datos: Datos, titular: str, pool: set[str], tam: int, a
             continue                                    # nadie que pudiera llegar a cubrirlo
         huecos = sum(1 for f in ventana for turno in turnos_del_dia.get(f, [])
                     if (turno, f) not in ocupado and elegibles_por_turno.get(turno, set()) & pool)
-        candidatos.append((disponibles - huecos, inicio, fin))
+        carga = sum(carga_semana.get(_lunes(d), 0) for d in ventana)
+        candidatos.append((disponibles - huecos - PESO_CARGA * carga, inicio, fin))
     if not candidatos:
         return None
     _, inicio, fin = max(candidatos)
@@ -184,7 +201,7 @@ def _mejor_periodo_libre(datos: Datos, titular: str, pool: set[str], tam: int, a
 
 def _cubrir_exceso_pool(datos: Datos, plan: Plan, libro: LibroHoras, ocupado: set[tuple[str, date]],
                         turnos_del_dia: dict[date, list[str]], elegibles_por_turno: dict[str, set[str]],
-                        pool: set[str], titular: str) -> None:
+                        pool: set[str], titular: str, carga_semana: dict[date, int]) -> None:
     """Como `_cubrir_exceso`, pero para titulares sin cubridor propio: la plaza se deja vacía en
     vez de traspasarla a alguien ahora, para no adelantarle al paso D una decisión que es suya."""
     t = datos.trabajadores[titular]
@@ -194,7 +211,7 @@ def _cubrir_exceso_pool(datos: Datos, plan: Plan, libro: LibroHoras, ocupado: se
     usados: set[date] = set()
     while libro.exceso(titular) > EPS:
         periodo = _mejor_periodo_libre(datos, titular, pool, tam, rigido, usados,
-                                       turnos_del_dia, ocupado, elegibles_por_turno)
+                                       turnos_del_dia, ocupado, elegibles_por_turno, carga_semana)
         if periodo is None:
             print(f"  aviso  {titular} se queda en {libro.horas(titular):.0f} h "
                   f"({libro.exceso(titular):+.0f}): no queda período con margen para dejarlo vacío")
@@ -203,13 +220,15 @@ def _cubrir_exceso_pool(datos: Datos, plan: Plan, libro: LibroHoras, ocupado: se
         for i in range((fin - inicio).days + 1):
             f = inicio + timedelta(days=i)
             _soltar(plan, libro, ocupado, titular, f)
+            carga_semana[_lunes(f)] += 1
         for i in range(-RADIO_SEPARACION, (fin - inicio).days + 1 + RADIO_SEPARACION):
             usados.add(inicio + timedelta(days=i))
 
 
 def _cubrir_exceso(datos: Datos, plan: Plan, libro: LibroHoras, ocupado: set[tuple[str, date]],
                    turnos_del_dia: dict[date, list[str]], elegibles_por_turno: dict[str, set[str]],
-                   pool: set[str], titular: str, cubridores: list[str]) -> None:
+                   pool: set[str], titular: str, cubridores: list[str],
+                   carga_semana: dict[date, int]) -> None:
     """Cesión electiva: día suelto por defecto. Si el grupo del titular es rígido
     (`config.grupos_rigidos`), se cede el ciclo completo del patrón (tantas semanas como filas
     tenga, alineado a lunes) tal cual lo prescribe, trabajo y descanso."""
@@ -220,7 +239,7 @@ def _cubrir_exceso(datos: Datos, plan: Plan, libro: LibroHoras, ocupado: set[tup
     usados: set[date] = set()
     while libro.exceso(titular) > EPS:
         periodo = _mejor_periodo(datos, plan, titular, pool, cubridores, tam, rigido, usados,
-                                 turnos_del_dia, ocupado, elegibles_por_turno)
+                                 turnos_del_dia, ocupado, elegibles_por_turno, carga_semana)
         if periodo is None:
             print(f"  aviso  {titular} se queda en {libro.horas(titular):.0f} h "
                   f"({libro.exceso(titular):+.0f}): no queda período con cubridor libre")
@@ -233,6 +252,7 @@ def _cubrir_exceso(datos: Datos, plan: Plan, libro: LibroHoras, ocupado: set[tup
             _soltar(plan, libro, ocupado, cubridor, f)
             if turno_titular is not None:
                 _asignar(plan, libro, ocupado, cubridor, f, turno_titular)
+            carga_semana[_lunes(f)] += 1
         for i in range(-RADIO_SEPARACION, tam + RADIO_SEPARACION):
             usados.add(inicio + timedelta(days=i))
 
@@ -247,13 +267,18 @@ def ceder(datos: Datos, plan: Plan, libro: LibroHoras) -> None:
     for turno, f in ocupado:
         turnos_del_dia[f].append(turno)
 
+    # Compartido por TODAS las cesiones del año, sean de qué titular sean: sin esto, cada una se
+    # decide mirando solo su propio pool y muchas acaban aterrizando en las mismas semanas.
+    carga_semana: dict[date, int] = defaultdict(int)
+
     tocados: set[str] = set()
     for turno_id, cubridores in designados.items():
         for titular in _titulares_de(datos, turno_id):
             tocados.add(titular)
             _cubrir_vacaciones(datos, plan, libro, ocupado, titular, cubridores)
             _cubrir_exceso(datos, plan, libro, ocupado, turnos_del_dia, elegibles_por_turno,
-                          elegibles_por_turno.get(turno_id, set(cubridores)), titular, cubridores)
+                          elegibles_por_turno.get(turno_id, set(cubridores)), titular, cubridores,
+                          carga_semana)
 
     # El resto de la plantilla no tiene un cubridor propio: se deja la plaza vacía cuando hay
     # margen en el pool de correturno, y la cubre paso D — aquí no se le asigna nadie todavía.
@@ -262,4 +287,4 @@ def ceder(datos: Datos, plan: Plan, libro: LibroHoras) -> None:
         if titular in tocados or datos.trabajadores[titular].tipo == "correturno":
             continue
         _cubrir_exceso_pool(datos, plan, libro, ocupado, turnos_del_dia, elegibles_por_turno,
-                            pool_correturno, titular)
+                            pool_correturno, titular, carga_semana)

@@ -20,7 +20,7 @@ from __future__ import annotations
 import argparse
 import sys
 import salida
-import base, horas, libranzas, residuo
+import base, horas, legal, libranzas, residuo, equidad
 from cargar_datos import cargar
 from datetime import date, timedelta
 from pathlib import Path
@@ -66,10 +66,8 @@ def main() -> int:
     residuo.resumen(datos, plan, libro)
 
     # -- Paso E ------------------------------------------------------------- #
-    # PENDIENTE: equidad.py todavía referencia `base.PATRON_GRANDE` y el tipo "mixto", que ya no
-    # existen. Es una tarea aparte; hasta que se rehaga, el paso E queda fuera del pipeline.
-    # info = equidad.pulir(datos, plan, libro)
-    # equidad.resumen(datos, plan, info)
+    info = equidad.pulir(datos, plan, libro)
+    equidad.resumen(datos, plan, info)
 
     salida.escribir_excel(datos, plan)
     return 0

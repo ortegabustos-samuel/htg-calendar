@@ -106,9 +106,8 @@ def pool_correturno(datos: Datos) -> list[str]:
 
 
 def mixtos_con_finde(datos: Datos) -> list[str]:
-    """Los antiguos "mixtos": FIJOS que además declaran capacidad de sábado, domingo o festivo en
-    `capacidades.csv` (con `v == 0`, es decir como capacidad propia y no como cubridor designado),
-    aparte de la fila L-V de su línea titular. El paso A ya no les pinta findes: son de este paso.
+    """
+    Aquellos trabajadores que tienen fijo una linea lv pero ademas hacen findes
     """
     salida = []
     for w, t in datos.trabajadores.items():
@@ -178,15 +177,15 @@ def _soltar_semanas(datos: Datos, plan: Plan, libro: LibroHoras, mixtos: list[st
 def resolver(datos: Datos, plan: Plan, libro: LibroHoras, segundos: int = 300, hilos: int = 8,
              log: bool = False, descanso_finde: bool = True) -> dict:
     """Resuelve el paso D sobre `plan`/`libro`, que modifica in place."""
-    corre = pool_correturno(datos)
+    correturnos = pool_correturno(datos)
     mixtos = mixtos_con_finde(datos)
-    pool = sorted(set(corre) | set(mixtos))
+    pool = sorted(set(correturnos) | set(mixtos))
     es_mixto = set(mixtos)
 
     cupo = _soltar_semanas(datos, plan, libro, mixtos, Counter(huecos(datos, plan)))
     faltan = Counter(huecos(datos, plan))
     lineas = sorted({s for s, _ in faltan})
-    print(f"  huecos a repartir: {sum(faltan.values())} · pool: {len(corre)} correturnos "
+    print(f"  huecos a repartir: {sum(faltan.values())} · pool: {len(correturnos)} correturnos "
           f"+ {len(mixtos)} fijos con finde · {len(cupo)} semanas soltadas")
 
     modelo = cp_model.CpModel()
@@ -307,7 +306,7 @@ def resolver(datos: Datos, plan: Plan, libro: LibroHoras, segundos: int = 300, h
 
     # -- Niveles 3-5: equidad de sábado, domingo y festivo, EN ESE ORDEN ------ #
     for i, clase in enumerate(FINDE):
-        obj = _equidad_finde_clase(modelo, datos, plan, x, por_trab, corre, mixtos, clase)
+        obj = _equidad_finde_clase(modelo, datos, plan, x, por_trab, correturnos, mixtos, clase)
         if obj is None:
             continue
         _sembrar(modelo, x, solucion)
@@ -318,7 +317,7 @@ def resolver(datos: Datos, plan: Plan, libro: LibroHoras, segundos: int = 300, h
             solucion = sol
 
     # -- Nivel 6: equidad de horas REALES entre correturnos ------------------- #
-    obj6 = _equidad_horas(modelo, datos, x, por_trab, corre, libro)
+    obj6 = _equidad_horas(modelo, datos, x, por_trab, correturnos, libro)
     if obj6 is not None:
         _sembrar(modelo, x, solucion)
         valor, sol = _optimizar(modelo, obj6, False, segundos, hilos, log, "6 equidad de horas")
@@ -426,7 +425,7 @@ def _reparto(modelo, cuentas: list, techo: int, etiqueta: str) -> list:
     return terminos
 
 
-def _equidad_horas(modelo, datos: Datos, x: dict, por_trab: dict, corre: list[str],
+def _equidad_horas(modelo, datos: Datos, x: dict, por_trab: dict, correturnos: list[str],
                    libro: LibroHoras):
     """Nivel 6 — que la demanda REAL se reparta por igual entre los correturnos.
 
@@ -435,11 +434,11 @@ def _equidad_horas(modelo, datos: Datos, x: dict, por_trab: dict, corre: list[st
     poca cobertura real y haya que completarle la jornada con refuerzos de calendario, que no
     cubren nada, mientras otro se lleva toda la demanda.
     """
-    if len(corre) < 2:
+    if len(correturnos) < 2:
         return None
-    techo = _decimas(max(libro.objetivo(w) for w in corre))
+    techo = _decimas(max(libro.objetivo(w) for w in correturnos))
     cuentas = []
-    for w in corre:
+    for w in correturnos:
         h = modelo.NewIntVar(0, techo, f"h_{w}")
         modelo.Add(h == sum(_decimas(datos.turnos[s].horas) * x[(w, f, s)]
                             for f, s in por_trab.get(w, ())))
@@ -476,7 +475,7 @@ def _horas_mixtos(modelo, datos: Datos, x: dict, por_trab: dict, mixtos: list[st
 
 
 def _equidad_finde_clase(modelo, datos: Datos, plan: Plan, x: dict, por_trab: dict,
-                         corre: list[str], mixtos: list[str], clase: str):
+                         correturnos: list[str], mixtos: list[str], clase: str):
     """Niveles 3-5 — sábado, domingo y festivo, cada uno IGUALADO POR SEPARADO (una llamada por
     clase, en orden de prioridad) en un pool FUSIONADO de tres grupos: el patrón grande de
     Valladolid, los ex-mixtos y los correturnos.
@@ -492,7 +491,7 @@ def _equidad_finde_clase(modelo, datos: Datos, plan: Plan, x: dict, por_trab: di
     en cualquier valor, por bajo que fuese.
     """
     grandes = [w for w, t in datos.trabajadores.items() if t.patron == PATRON_GRANDE]
-    fusion = sorted(set(corre) | set(mixtos) | set(grandes))
+    fusion = sorted(set(correturnos) | set(mixtos) | set(grandes))
     if len(fusion) < 2:
         return None
 
