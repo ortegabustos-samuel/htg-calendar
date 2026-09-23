@@ -8,14 +8,10 @@ Pinta lo que los datos YA prescriben, y nada más:
                  y cada trabajador arranca en la fila que declara `fila_inicial` en
                  trabajadores.csv — eso es lo que da continuidad con el cuadrante del año anterior
                  (ver `cargar_datos.offsets_patron`).
-  * FIJO       — su `linea`, los días en que su capacidad la cubre (L-V por definición, salvo que
-                 capacidades.csv declare otra cosa).
-  * MIXTO      — es un cuasi-fijo, no un correturno con menos capacidades, y sus capacidades ya
-                 declaran las dos naturalezas: unas líneas con `lv=1` (operan 248 días, o sea de
-                 lunes a viernes) de las que es titular de hecho, y otras con `sab/dom/fest=1` a
-                 las que sale puntualmente. Ocupa las primeras y saca su CUOTA de fines de semana
-                 en las segundas (ver `colocar_mixtos`). Va en una segunda pasada porque depende de
-                 qué dejan sin cubrir los patrones.
+  * FIJO       — su `linea` titular, solo de lunes a viernes. Si además tiene capacidad de finde
+                 declarada en capacidades.csv (el caso de los antiguos "mixtos"), ese fin de semana
+                 no lo decide este paso: lo decide el paso D junto a correturno y patrón grande
+                 (ver `residuo.py`), así que aquí ni se mira.
   * CORRETURNO — nada. Es el único pool rodante de verdad, y su semana la decide el paso C.
 
 Importante mencionar que dias como vacaciones o festivos ni siquiera se contemplan como disponibles  
@@ -25,14 +21,11 @@ todas las etapas y el que consume la vista de Excel.
 """
 from __future__ import annotations
 
-from collections import Counter, defaultdict
-from datetime import date, timedelta
-
-import legal
-from cargar_datos import DIAS, LIBRE, Datos
+from datetime import date
+from cargar_datos import DESCANSOS, DIAS, DO, LIBRE, Datos
 
 def turno_patron(datos: Datos, trabajador_id: str, fecha: date) -> str:
-    """Celda que la rotación prescribe al trabajador el día fecha: un id de turno, `LIBRE`
+    """Celda que la rotación prescribe al trabajador el día fecha: un id de turno, `LIBRE` o `DO`.
     Ojo: prescribir un turno no significa que se trabaje la línea
     puede no operar ese día y el trabajador puede estar de vacaciones."""
 
@@ -42,6 +35,20 @@ def turno_patron(datos: Datos, trabajador_id: str, fecha: date) -> str:
     semanas = (fecha - datos.primer_lunes).days // 7
     fila = filas[(offset + semanas) % len(filas)]
     return fila[DIAS[fecha.weekday()]]
+
+
+def descanso_prescrito(datos: Datos, trabajador_id: str, fecha: date) -> str | None:
+    """`DO` si la rotación marca ese día como descanso CON ETIQUETA, None en cualquier otro caso
+    (incluido el `LIBRE` de toda la vida, que no lleva etiqueta, y quien no tiene patrón).
+
+    Se consulta desde dos sitios: la salida, para el descanso propio de cada trabajador, y
+    `libranzas`, para que el cubridor que asume un bloque herede también su descanso etiquetado.
+    """
+    trabajador = datos.trabajadores[trabajador_id]
+    if trabajador.tipo != "patron" or not trabajador.patron:
+        return None
+    celda = turno_patron(datos, trabajador_id, fecha)
+    return celda if celda == DO else None
 
 
 def prescrito(datos: Datos, trabajador_id: str, fecha: date) -> str | None:
@@ -55,14 +62,20 @@ def prescrito(datos: Datos, trabajador_id: str, fecha: date) -> str | None:
     trabajador = datos.trabajadores[trabajador_id]
     if trabajador.tipo == "patron":
         turno_id = turno_patron(datos, trabajador_id, fecha)
+        # DO se prescribe como tal: no es trabajo, pero OCUPA el día y tiene que llegar al final
+        # sin que nadie lo edite. Devolverlo aquí es lo que hace que entre en el plan y que un
+        # cubridor lo herede junto con los turnos del bloque, sin código especial en el traspaso.
+        if turno_id == DO:
+            return DO
         return turno_id if (turno_id != LIBRE and turno_id in datos.turnos and datos.opera(turno_id, fecha)) else None
     if trabajador.tipo == "fijo":
         if not datos.opera(trabajador.linea, fecha):
             return None
+        dia = datos.tipo_dia(fecha, datos.turnos[trabajador.linea].municipio)
+        if dia != "LV":
+            return None
         cap = datos.capacidades.get((trabajador_id, trabajador.linea))
-        dia = datos.tipo_dia(fecha, datos.turnos[trabajador.linea].municipio)       #En un principio esto es redundante suponiendo 
-        return trabajador.linea if {"LV": cap.lv, "SAB": cap.sab,                   # a fijos solo hacer Lunes-Viernes
-                           "DOM": cap.dom, "FEST": cap.fest}[dia] == 1 else None
+        return trabajador.linea if cap and cap.lv == 1 else None
     return None
 
 
@@ -77,207 +90,3 @@ def construir(datos: Datos) -> dict[tuple[str, date], str]:
             if turno_id is not None:
                 plan[(trabajador_id, dia)] = turno_id
     return plan
-
-
-# --------------------------------------------------------------------------- #
-#  Los mixtos: cuasi-fijos con cuota de fin de semana
-# --------------------------------------------------------------------------- #
-FINDE = ("SAB", "DOM", "FEST")
-PATRON_GRANDE = "PAT_GRANDE_VALL"        # única referencia de cuota de findes, sea cual sea el
-                                          # municipio del mixto/correturno (peculiaridad local)
-
-
-def lineas_de(datos: Datos, trabajador_id: str, clase: str) -> list[str]:
-    """Líneas del trabajador de una clase: 'lv' o 'finde'. Sale de los flags de capacidades.csv,
-    que es donde el planificador ya separó las dos naturalezas del mixto."""
-    salida = []
-    for (trabajador_id_cap, turno_id), cap in datos.capacidades.items():
-        if trabajador_id != trabajador_id_cap or turno_id not in datos.turnos:
-            continue
-        if (cap.lv == 1) if clase == "lv" else bool(cap.sab or cap.dom or cap.fest):
-            salida.append(turno_id)
-    return sorted(salida)
-
-
-def referencia_finde(datos: Datos, plan: dict[tuple[str, date], str]) -> dict[str, Counter]:
-    """Sábados/domingos/festivos que hace de media una persona de PATRON_GRANDE: la referencia
-    ÚNICA de cuota de findes para mixtos y correturnos, la misma para cualquiera sea cual sea el
-    municipio al que atienda — no la del patrón más numeroso de SU municipio (eso rompía la
-    equidad conjunta que se pule en el paso E), sino siempre la del grande de Valladolid.
-
-    Se devuelve un dict por municipio (mismo valor repetido) para no tocar a `cuota_finde` ni al
-    nivel 3 de `residuo.py`, que hacen `refs.get(muni)`.
-    """
-    n = sum(1 for t in datos.trabajadores.values() if t.patron == PATRON_GRANDE)
-    if not n:
-        return {}
-    findes: Counter = Counter()
-    for (trabajador_id, fecha), turno_id in plan.items():
-        if datos.trabajadores[trabajador_id].patron != PATRON_GRANDE:
-            continue
-        dia = datos.tipo_dia(fecha, datos.turnos[turno_id].municipio)
-        if dia in FINDE:
-            findes[dia] += 1
-    media = Counter({d: round(findes[d] / n) for d in FINDE})
-    return {muni: media for muni in datos.calendario_municipio}
-
-
-def cuota_finde(datos: Datos, trab: str, refs: dict[str, Counter]) -> Counter:
-    """Cuota de este mixto: la del municipio donde hace sus fines de semana."""
-    suyas = lineas_de(datos, trab, "finde")
-    if not suyas:
-        return Counter()
-    muni = Counter(datos.turnos[s].municipio for s in suyas).most_common(1)[0][0]
-    return refs.get(muni, Counter())
-
-
-def _libre(datos: Datos, cubiertas: Counter, turno_id: str, fecha: date) -> bool:
-    return cubiertas[(turno_id, fecha)] < datos.turnos[turno_id].dem
-
-
-def _elegir_linea(datos: Datos, plan: dict[tuple[str, date], str], cubiertas: Counter, trab: str,
-                  fecha: date, lineas: list[str], clases: tuple[str, ...],
-                  anterior: str | None) -> str | None:
-    """De sus líneas descubiertas ese día: la que hacía ayer (continuidad); si no, la que menos
-    gente más puede hacer, que es la más difícil de tapar por otro.
-    """
-    posibles = [turno_id for turno_id in lineas
-                if datos.tipo_dia(fecha, datos.turnos[turno_id].municipio) in clases
-                and datos.elegible(trab, turno_id, fecha) == (True, False)
-                and _libre(datos, cubiertas, turno_id, fecha)
-                and legal.permite(datos, plan, trab, fecha, turno_id)]
-    if not posibles:
-        return None
-    if anterior in posibles:
-        return anterior
-    return min(posibles, key=lambda s: (sum(1 for (_, ss) in datos.capacidades if ss == s), s))
-
-
-def _uniformes(dias: list[date], cuantos: int) -> list[date]:
-    """`cuantos` días repartidos lo más uniformemente posible a lo largo de la lista. Es lo que
-    hace que los fines de semana caigan espaciados por el año y no en bloque."""
-    if cuantos <= 0 or not dias:
-        return []
-    if cuantos >= len(dias):
-        return list(dias)
-    paso = len(dias) / cuantos
-    return [dias[min(len(dias) - 1, int(i * paso + paso / 2))] for i in range(cuantos)]
-
-
-def _soltar_dia_lv(datos: Datos, plan: dict[tuple[str, date], str], libro,
-                   cubiertas: Counter, trab: str, f: date) -> tuple[date, str] | None:
-    """Libra un día entre semana de la MISMA semana ISO para hacer sitio al de finde.
-
-    Es literalmente lo que hace el planificador a mano: se libra un día entre semana para hacer un
-    sábado. Deja las horas neutras y evita pasarse del tope de días por semana (cinco de L-V más el
-    sábado ya son seis, y con el domingo siete).
-
-    Si esta semana ya se soltó otro día (p.ej. al conceder el sábado, antes de conceder el
-    domingo), se prioriza el día ADYACENTE a él: sábado+domingo trabajados exigen un par de días
-    consecutivos libres entre semana (`descanso_finde_ok`), y como SAB se procesa antes que DOM
-    en `colocar_mixtos`, esta es la segunda de las dos llamadas que arma ese par.
-
-    CUÁL se suelta si no hay una semana ya empezada es solo una elección provisional —la línea que
-    más gente puede tapar—, porque en este paso los correturnos todavía no están colocados y no
-    hay forma de saber quién estará libre. La decisión de verdad la toma el paso D, que ve la
-    semana entera: la devolvemos marcada como flexible y allí se elige el día mirando quién puede
-    cubrir el hueco que deja. Devuelve (día soltado, línea) o None si no había ninguno.
-    """
-    lunes = f - timedelta(days=f.weekday())
-    suyos = [lunes + timedelta(days=i) for i in range(5) if (trab, lunes + timedelta(days=i)) in plan]
-    if not suyos:
-        return None
-    ya_libre = [lunes + timedelta(days=i) for i in range(5)
-                if (trab, lunes + timedelta(days=i)) not in plan]
-    adyacentes = [d for d in suyos if any(abs((d - libre).days) == 1 for libre in ya_libre)]
-    candidatos = adyacentes or suyos
-    peor = max(candidatos,
-              key=lambda g: sum(1 for (_, ss) in datos.capacidades if ss == plan[(trab, g)]))
-    s = plan.pop((trab, peor))
-    libro.borra(trab, s)
-    cubiertas[(s, peor)] -= 1
-    return peor, s
-
-
-def colocar_mixtos(datos: Datos, plan: dict[tuple[str, date], str], libro):
-    """Segunda pasada del base: coloca a los mixtos sobre lo que los patrones dejan libre.
-
-    Devuelve dos cosas:
-      * `protegidos` — los días de fin de semana que son CUOTA. El paso B no debe cederlos: no son
-        exceso, son la equidad que justifica que el mixto salga de su línea.
-      * `flexibles` — (mixto, lunes, día soltado, línea) por cada semana en que se le quitó un día
-        entre semana para hacer el finde. Cuál se suelta lo reabre el paso D.
-    """
-    cubiertas: Counter = Counter()
-    for (_, fecha), turno_id in plan.items():
-        cubiertas[(turno_id, fecha)] += 1
-    refs = referencia_finde(datos, plan)
-    protegidos: dict[str, set[date]] = defaultdict(set)
-    flexibles: list[tuple[str, date, date, str]] = []
-
-    mixtos = [trabajador_id for trabajador_id, trabajador in datos.trabajadores.items() if trabajador.tipo == "mixto"]
-    # Los más atados primero: quien solo puede hacer una línea no tiene con qué negociar.
-    mixtos.sort(key=lambda trabajador_id: (len(lineas_de(datos, trabajador_id, "lv")), trabajador_id))
-
-    for trabajador_id in mixtos:
-        lv = lineas_de(datos, trabajador_id, "lv")
-        anterior: str | None = None
-        for fecha in datos.lista_dias_calendario:                          # 1) ocupa su línea de lunes a viernes
-            if not datos.disponible(trabajador_id, fecha) or (trabajador_id, fecha) in plan:
-                continue
-            turno_id = _elegir_linea(datos, plan, cubiertas, trabajador_id, fecha, lv, ("LV",), anterior)
-            anterior = turno_id
-            if turno_id is None:
-                continue
-            plan[(trabajador_id, fecha)] = turno_id
-            libro.apunta(trabajador_id, turno_id)
-            cubiertas[(turno_id, fecha)] += 1
-
-        findes = lineas_de(datos, trabajador_id, "finde")   # 2) su cuota, repartida por el año
-        cuota = cuota_finde(datos, trabajador_id, refs)
-        for clase in FINDE:
-            candidatos = [fecha for fecha in datos.lista_dias_calendario
-                          if datos.disponible(trabajador_id, fecha)
-                          and (trabajador_id, fecha) not in plan
-                          and (clase != "DOM"
-                               or (trabajador_id, fecha - timedelta(days=1)) in plan)
-                          and any(datos.tipo_dia(fecha, datos.turnos[s].municipio) == clase
-                                  and datos.elegible(trabajador_id, s, fecha) == (True, False)
-                                  and _libre(datos, cubiertas, s, fecha) for s in findes)]
-            for fecha in _uniformes(candidatos, cuota.get(clase, 0)):
-                turno_id = _elegir_linea(datos, plan, cubiertas, trabajador_id, fecha, findes,
-                                         (clase,), None)
-                if turno_id is None:
-                    continue
-                soltado = _soltar_dia_lv(datos, plan, libro, cubiertas, trabajador_id, fecha)
-                if soltado is None:
-                    continue
-                plan[(trabajador_id, fecha)] = turno_id
-                libro.apunta(trabajador_id, turno_id)
-                cubiertas[(turno_id, fecha)] += 1
-                protegidos[trabajador_id].add(fecha)
-                flexibles.append((trabajador_id, fecha - timedelta(days=fecha.weekday()),
-                                  soltado[0], soltado[1]))
-    return protegidos, flexibles
-
-
-def resumen_mixtos(datos: Datos, plan: dict[tuple[str, date], str], libro) -> None:
-    refs = referencia_finde(datos, plan)
-    print("\nPASO A2 — mixtos como cuasi-fijos, con cuota de fin de semana")
-    print("  referencia de equidad: "
-          + " · ".join(f"{m} {c['SAB']}S/{c['DOM']}D/{c['FEST']}F" for m, c in sorted(refs.items())))
-    print(f"\n{'mixto':<12} {'lineas LV':>9} {'dias':>6} {'L-V':>5} {'sab':>5} {'dom':>5} "
-          f"{'fest':>5} {'horas':>7}   cuota")
-    print("-" * 74)
-    for w, t in sorted(datos.trabajadores.items()):
-        if t.tipo != "mixto":
-            continue
-        dias: Counter = Counter()
-        for (ww, f), s in plan.items():
-            if ww == w:
-                dias[datos.tipo_dia(f, datos.turnos[s].municipio)] += 1
-        c = cuota_finde(datos, w, refs)
-        print(f"{w:<12} {len(lineas_de(datos, w, 'lv')):>9} {sum(dias.values()):>6} "
-              f"{dias['LV']:>5} {dias['SAB']:>5} {dias['DOM']:>5} {dias['FEST']:>5} "
-              f"{libro.horas(w):>7.0f}   {c['SAB']}S/{c['DOM']}D/{c['FEST']}F")
-    print("-" * 74)

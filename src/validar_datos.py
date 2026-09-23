@@ -23,7 +23,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from cargar_datos import DATA, DIAS, LIBRE, _cargar_config, cargar          # noqa: E402
+from cargar_datos import DATA, DESCANSOS, DIAS, LIBRE, _cargar_config, cargar   # noqa: E402
 
 # Columnas que cada fichero DEBE traer. Las opcionales (factor_jornada, linea, municipio,
 # fila_inicial, dem) no se exigen: el cargador les da valor por defecto.
@@ -46,7 +46,7 @@ CLAVES = {
     "patrones.csv": ("patron", "fila"),
     "calendarios_municipio.csv": ("municipio",),
 }
-TIPOS_TRAB = ("fijo", "patron", "mixto", "correturno")
+TIPOS_TRAB = ("fijo", "patron", "correturno")
 
 
 class Informe:
@@ -188,9 +188,10 @@ def revisar_referencias(crudo: dict[str, list[dict]], inf: Informe) -> None:
     for r in crudo["patrones.csv"]:
         for dia in DIAS:
             v = r[dia]
-            if v and v != LIBRE and v not in turnos:
+            if v and v not in DESCANSOS and v not in turnos:
                 inf.error(f"patrones: {r['patron']} fila {r['fila']} {dia}='{v}' no es un turno "
-                          f"ni LIBRE — el cargador lo descarta y ese día quedará sin prescribir")
+                          f"ni un descanso ({', '.join(sorted(DESCANSOS))}) — el cargador lo "
+                          f"descarta y ese día quedará sin prescribir")
 
     for r in crudo["trabajadores.csv"]:
         w = r["id_trab"]
@@ -348,7 +349,7 @@ def revisar_contrato(crudo: dict[str, list[dict]], inf: Informe) -> None:
     en_patron: dict[str, set[str]] = defaultdict(set)
     for r in crudo["patrones.csv"]:
         for dia in DIAS:
-            if r[dia] and r[dia] != LIBRE:
+            if r[dia] and r[dia] not in DESCANSOS:
                 en_patron[r["patron"]].add(r[dia])
 
     # Marcar un día que la línea no opera no rompe nada (`elegible` mira `opera` primero), pero
@@ -379,7 +380,12 @@ def revisar_contrato(crudo: dict[str, list[dict]], inf: Informe) -> None:
             if dias[c] == "1" and turnos[s][k] == "0":
                 dia_muerto[(s, c)].append(w)
         tipo = t["tipo"].strip()
-        if tipo == "fijo" and (t.get("linea") or "").strip() == s:
+        # Solo es redundante si la fila es EXACTAMENTE lo que `_anadir_capacidad_fijo` derivaría
+        # solo (lv=1, nada más): un fijo con capacidad de finde (ex-mixto) puede llevar sab/dom/fest
+        # a 1 en la misma fila de su línea titular, y eso sí aporta algo que no se deriva.
+        es_derivada = (dias["lv"] == "1" and dias["sab"] == "0" and dias["dom"] == "0"
+                      and dias["fest"] == "0" and v == 0)
+        if tipo == "fijo" and (t.get("linea") or "").strip() == s and es_derivada:
             inf.aviso(f"capacidades ({w},{s}): redundante, es la línea del fijo y ya se deriva")
         elif tipo == "patron" and s in en_patron.get((t.get("patron") or "").strip(), set()):
             inf.aviso(f"capacidades ({w},{s}): redundante, ese turno ya está en su patrón")
@@ -413,7 +419,7 @@ def revisar_viabilidad(inf: Informe) -> None:
     fechas = d.lista_dias_calendario
     inf.nota(f"horizonte: año {anio} (config.toml), objetivo {objetivo} h")
 
-    # grupos_rigidos es una declaración manual (empresa/convenio, ver ritmo.py): un id mal escrito
+    # grupos_rigidos es una declaración manual (empresa/convenio, ver libranzas.py): un id mal escrito
     # o un patrón renombrado lo deja huérfano y la plaza pasaría a tratarse como flexible sin avisar.
     grupos_validos = set(d.patrones) | {t.tipo for t in d.trabajadores.values()}
     desconocidos = sorted(set(d.config.grupos_rigidos) - grupos_validos)

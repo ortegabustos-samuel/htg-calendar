@@ -26,8 +26,7 @@ from __future__ import annotations
 from collections import Counter, defaultdict
 from datetime import date, timedelta
 
-import ritmo as ritmo_mod
-from cargar_datos import Datos
+from cargar_datos import DESCANSOS, Datos, turno_de
 
 Plan = dict[tuple[str, date], str]
 
@@ -46,13 +45,13 @@ def descanso_ok(datos: Datos, plan: Plan, trabajador_id: str, fecha: date, turno
     inicio, fin = datos.intervalo(turno_id, fecha)
 
     ayer = fecha - timedelta(days=1)
-    previo = plan.get((trabajador_id, ayer))
+    previo = turno_de(plan, trabajador_id, ayer)     # un DO no es turno: no impone descanso previo
     if (previo is not None and not (exento or (exento_localizado and datos.localizado(previo)))
             and inicio - datos.intervalo(previo, ayer)[1] < minimo):
         return False
 
     manana = fecha + timedelta(days=1)
-    posterior = plan.get((trabajador_id, manana))
+    posterior = turno_de(plan, trabajador_id, manana)
     if (posterior is not None and not (exento or (exento_localizado and datos.localizado(posterior)))
             and datos.intervalo(posterior, manana)[0] - fin < minimo):
         return False
@@ -62,15 +61,17 @@ def descanso_ok(datos: Datos, plan: Plan, trabajador_id: str, fecha: date, turno
 def dias_semana_ok(datos: Datos, plan: Plan, trabajador_id: str, fecha: date) -> bool:
     """C5 — como mucho `dias_max_semana` días trabajados en la semana ISO en que cae `fecha`."""
     lunes = fecha - timedelta(days=fecha.weekday())
-    trabajados = sum(1 for i in range(7) if (trabajador_id, lunes + timedelta(days=i)) in plan)
+    # Un DO ocupa el día pero no es jornada: no cuenta para el tope de días de la semana.
+    trabajados = sum(1 for i in range(7)
+                     if turno_de(plan, trabajador_id, lunes + timedelta(days=i)) is not None)
     return trabajados + 1 <= datos.config.dias_max_semana
 
 
 def horas_semana_ok(datos: Datos, plan: Plan, trabajador_id: str, fecha: date, turno: str) -> bool:
     """C6 — como mucho `horas_max_semana` horas trabajadas en la semana ISO en que cae `fecha`."""
     lunes = fecha - timedelta(days=fecha.weekday())
-    horas = sum(datos.turnos[plan[(trabajador_id, lunes + timedelta(days=i))]].horas
-                for i in range(7) if (trabajador_id, lunes + timedelta(days=i)) in plan)
+    turnos_semana = (turno_de(plan, trabajador_id, lunes + timedelta(days=i)) for i in range(7))
+    horas = sum(datos.turnos[s].horas for s in turnos_semana if s is not None)
     return horas + datos.turnos[turno].horas <= datos.config.horas_max_semana
 
 
@@ -79,7 +80,7 @@ def domingo_ok(datos: Datos, plan: Plan, trabajador_id: str, fecha: date, turno_
     No es del convenio"""
     if datos.tipo_dia(fecha, datos.turnos[turno_id].municipio) != "DOM":
         return True
-    return (trabajador_id, fecha - timedelta(days=1)) in plan
+    return turno_de(plan, trabajador_id, fecha - timedelta(days=1)) is not None
 
 
 def descanso_finde_ok(datos: Datos, plan: Plan, trabajador_id: str, lunes: date) -> bool:
@@ -88,9 +89,10 @@ def descanso_finde_ok(datos: Datos, plan: Plan, trabajador_id: str, lunes: date)
     domingo_ok. A diferencia de domingo_ok, no hace falta excepción de festivos: un festivo
     trabajado entre semana ocupa el día igual que un laborable."""
     dias = [lunes + timedelta(days=i) for i in range(7)]
-    if (trabajador_id, dias[5]) not in plan or (trabajador_id, dias[6]) not in plan:
+    if (turno_de(plan, trabajador_id, dias[5]) is None
+            or turno_de(plan, trabajador_id, dias[6]) is None):
         return True
-    libres = {d for d in dias[:5] if (trabajador_id, d) not in plan}
+    libres = {d for d in dias[:5] if turno_de(plan, trabajador_id, d) is None}
     return any(dias[i] in libres and dias[i + 1] in libres for i in range(4))
 
 
@@ -105,14 +107,6 @@ def permite(datos: Datos, plan: Plan, trabjador_id: str, fecha: date, turno_id: 
             and domingo_ok(datos, plan, trabjador_id, fecha, turno_id))
 
 
-def pactadas(datos: Datos, plan: Plan) -> set:
-    """Las formas de incumplimiento que el base produce por sí mismo: son las que vienen
-    pactadas con los trabajadores y las que, por tanto, se pueden mover de una persona a otra."""
-    salida: set = set()
-    for trab in {trabajador_id for (trabajador_id, _) in plan}:
-        salida |= set(formas(datos, plan, trab, datos.inicio, datos.fin))
-    return salida
-
 
 def formas(datos: Datos, plan: Plan, trabajador_id: str, desde: date, hasta: date) -> Counter:
     """(tipo, forma) -> nº de casos de ese trabajador en el tramo. La FORMA es la secuencia de
@@ -122,7 +116,7 @@ def formas(datos: Datos, plan: Plan, trabajador_id: str, desde: date, hasta: dat
     f = desde - timedelta(days=8)
     fin = hasta + timedelta(days=8)
     while f <= fin:
-        s = plan.get((trabajador_id, f))
+        s = turno_de(plan, trabajador_id, f)     # los DO no son formas: no son turnos
         if s is not None:
             dias[f] = s
         f += timedelta(days=1)
@@ -148,12 +142,33 @@ def formas(datos: Datos, plan: Plan, trabajador_id: str, desde: date, hasta: dat
     return salida
 
 
+def _grupo(datos: Datos, trab: str) -> str:
+    t = datos.trabajadores[trab]
+    return t.patron if t.tipo == "patron" and t.patron else t.tipo
+
+
+def _rigido(datos: Datos, trab: str) -> bool:
+    """La plaza de `trab` no se fracciona al ceder: se cede el ciclo entero, nunca un día suelto."""
+    return _grupo(datos, trab) in datos.config.grupos_rigidos
+
+
+def pactadas(datos: Datos, plan: Plan) -> set:
+    """Las formas de incumplimiento que el base produce por sí mismo: son las que vienen
+    pactadas con los trabajadores y las que, por tanto, se pueden mover de una persona a otra."""
+    salida: set = set()
+    for trab in {trabajador_id for (trabajador_id, _) in plan}:
+        salida |= set(formas(datos, plan, trab, datos.inicio, datos.fin))
+    return salida
+
+
 def infracciones(datos: Datos, plan: Plan) -> list[str]:
     """Lo que incumple un plan ya terminado. No decide nada: es la comprobación que se imprime al
     cerrar cada paso, para no dar por bueno un cuadrante ilegal porque la cobertura salga bien."""
     fallos: list[str] = []
     por_trab: dict[str, list[date]] = {}
-    for (w, f) in plan:
+    for (w, f), s in plan.items():
+        if s in DESCANSOS:          # un DO ocupa el día pero no es jornada: no se audita
+            continue
         por_trab.setdefault(w, []).append(f)
 
     minimo = timedelta(hours=datos.config.descanso_minimo)
@@ -194,6 +209,8 @@ def integridad(datos: Datos, plan: Plan) -> list[str]:
     cuenta: dict[tuple[str, date], int] = {}
     fallos: list[str] = []
     for (w, f), s in plan.items():
+        if s in DESCANSOS:          # no ocupa plaza de ninguna línea: no hay integridad que mirar
+            continue
         cuenta[(s, f)] = cuenta.get((s, f), 0) + 1
         if not datos.disponible(w, f):
             fallos.append(f"{w} asignado a {s} el {f:%d/%m} estando de vacaciones")
@@ -210,7 +227,7 @@ def integridad(datos: Datos, plan: Plan) -> list[str]:
     vistas: set[tuple[str, date]] = set()
     for (w, f) in plan:
         lunes = f - timedelta(days=f.weekday())
-        if (w, lunes) in vistas or ritmo_mod.es_rigido(datos, w):
+        if (w, lunes) in vistas or _rigido(datos, w):
             continue
         vistas.add((w, lunes))
         if not descanso_finde_ok(datos, plan, w, lunes):
@@ -246,7 +263,7 @@ def auditar(datos: Datos, plan: Plan, pactadas_esqueleto: set,
     vistas: set[tuple[str, date]] = set()
     for (w, f) in plan:
         lunes = f - timedelta(days=f.weekday())
-        if (w, lunes) in vistas or ritmo_mod.es_rigido(datos, w):
+        if (w, lunes) in vistas or _rigido(datos, w):
             continue
         vistas.add((w, lunes))
         if not descanso_finde_ok(datos, plan, w, lunes):

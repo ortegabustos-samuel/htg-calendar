@@ -17,13 +17,37 @@ from dataclasses import dataclass, field, fields
 from datetime import date, datetime, timedelta , time
 from pathlib import Path
 import csv
+import os
 import tomllib
 
 RAIZ = Path(__file__).resolve().parents[1]
-DATA = RAIZ / "data" / "input"
+# La interfaz (interfaz/app.py) apunta aquí la carpeta de cada escenario; sin ella, data/input.
+DATA = Path(os.environ.get("HT_DATOS") or RAIZ / "data" / "input")
 
-DIAS = ["lun", "mar", "mie", "jue", "vie", "sab", "dom"]   # patrones.csv; índice = weekday()
+DIAS = ["Lunes", "Martes", "Miercoles", "Jueves", "Viernes", "Sabado", "Domingo"]  # patrones.csv; índice = weekday()
 LIBRE = "LIBRE"
+# DO (descanso obligatorio): el descanso que da por ley un turno de 24 h, hoy solo en los patrones
+# de UVI. Para la PLANIFICACIÓN es exactamente un LIBRE —no se trabaja, no computa horas, no ocupa
+# plaza—; la única diferencia es que en el cuadrante sale con su etiqueta en vez de en blanco.
+DO = "DO"
+DESCANSOS = frozenset({LIBRE, DO})      # celdas de patrón que significan "ese día no se trabaja"
+
+
+def turno_de(plan, trabajador_id, fecha):
+    """El TURNO DE TRABAJO que hace ese día, o None si lo que tiene es un descanso.
+
+    El plan lleva también los descansos etiquetados (DO). Eso es deliberado y tiene dos efectos
+    que NO hay que confundir:
+
+      * OCUPA el día, igual que un turno. Por eso se mete en el plan: así el solver, las cesiones
+        y los traspasos lo respetan sin tener que saber qué es, y un DO heredado llega intacto al
+        final. Para esa pregunta se sigue usando `(trab, fecha) in plan`, que ya lo blinda.
+      * NO es trabajo: no computa horas, no ocupa plaza de ninguna línea y no cuenta para los
+        topes del convenio. Para esa pregunta se usa ESTA función, que devuelve el mismo `None`
+        que se recibía cuando el día venía vacío.
+    """
+    valor = plan.get((trabajador_id, fecha))
+    return None if valor in DESCANSOS else valor
 
 # --------------------------------------------------------------------------- #
 #  Estructuras del dominio
@@ -45,30 +69,30 @@ class Turno:
 @dataclass
 class Trabajador:
     id: str                         #Nif único
-    tipo: str                       # fijo | patron | correturno | mixto
+    nombre: str                     # nombre y apellidos, solo para la salida a Excel
+    tipo: str                       # fijo | patron | correturno
     patron: str | None              # id del patrón (solo tipo=patron)
     vacaciones: list[tuple[date, date]] #Lista con tupla (inicio_vacaciones,fin_vacaciones)
     linea: str | None = None        # id del turno que cubre un FIJO (solo tipo=fijo)
+    municipio: str = ""             # zona a la que pertenece: define con quien compite en equidad
     factor_jornada: float = 1.0     # reducción de jornada: escala el objetivo anual. 1.0 = jornada completa
     fila_inicial: int | None = None  # solo tipo=patron: fila de `patrones.csv` que hace en la PRIMERA
                                     # semana del horizonte.
-    nombre: str = ""                # nombre y apellidos, solo para la salida a Excel
 
 
-@dataclass(frozen=True)             #El uso de forzen impide que se modifique el propio objeto Config (logico la configuracion
-                                    # no deberia modificarse)
+@dataclass(frozen=True)             #El uso de forzen impide que se modifique el propio objeto Config (logico la configuracion no deberia modificarse)
 class Config:
     """
     Parámetros de la INSTANCIA (`config.toml`): qué año se resuelve y bajo qué convenio.
     `anio` es obligatorio en config.toml: el horizonte lo declaran los datos, no se deduce.
     """
     anio: int                    # Anio sobre el que estamos haciendo el calendario
-    horas_objetivo: int = 1776   # jornada anual objetivo (h): techo de todo lo que no sea cubrir
-    descanso_minimo: int = 12               # descanso mínimo entre jornadas (h)              -> C4
-    horas_max_semana: int = 48              # máx. horas en cualquier ventana de 7 días       -> C6
-    dias_max_semana: int = 6                # máx. días trabajados por semana ISO             -> C5
+    horas_objetivo: int   # jornada anual objetivo (h): techo de todo lo que no sea cubrir
+    descanso_minimo: int                # descanso mínimo entre jornadas (h)              -> C4
+    horas_max_semana: int             # máx. horas en cualquier ventana de 7 días       -> C6
+    dias_max_semana: int                # máx. días trabajados por semana ISO             -> C5
     grupos_rigidos: tuple[str, ...] = ()    # grupos (patrón o tipo) cuyo descanso no se fracciona:
-                                            # se cede el ciclo entero, nunca un día suelto (ritmo.py)
+                                            # se cede el ciclo entero, nunca un día suelto (libranzas.py)
 
 @dataclass
 class Capacidad:
@@ -149,8 +173,7 @@ class Datos:
         return inicio, fin
 
     def franja(self, turno_id: str) -> str:
-        """Tramo del día en que se trabaja: mañana | tarde | noche
-        """
+        """Tramo del día en que se trabaja: mañana | tarde | noche"""
         turno = self.turnos[turno_id]
         if turno.hora_salida <= turno.hora_entrada:              # cruza medianoche
             return "noche"
@@ -206,10 +229,6 @@ def _cargar_turnos() -> dict[str, Turno]:
             hora_entrada = datetime.strptime(fila["hora_entrada"].strip(),"%H:%M").time()
             hora_salida = datetime.strptime(fila["hora_salida"].strip(),"%H:%M").time()
             horas = float(fila["horas_computadas"].strip())
-            # dem: columna OPCIONAL (sparse) — solo se rellena cuando la demanda es >1; vacía -> 1.
-            # OJO: `fila.get("dem", 1)` NO vale para esto: en una fila más corta que la cabecera,
-            # DictReader mete la clave igualmente con valor None (no la deja ausente), así que el
-            # default de `.get()` nunca se dispara y `int(None)` revienta.
             crudo_dem = (fila.get("dem") or "").strip()
             turnos[fila["id_turno"]] = Turno(
                 id=fila["id_turno"],
@@ -264,6 +283,7 @@ def _cargar_trabajadores() -> dict[str, Trabajador]:
                 tipo=fila["tipo"],
                 patron=fila.get("patron",None),
                 linea=(fila.get("linea") or "").strip() or None,   # columna OPCIONAL, solo para fijos
+                municipio=(fila.get("municipio") or "").strip(),
                 vacaciones = [(vac1, vac1 + timedelta(days=14)),(vac2, vac2 + timedelta(days=14))],
                 factor_jornada=factor,
                 fila_inicial=fila_inicial,
@@ -473,7 +493,6 @@ def cargar() -> Datos:
     # Correturnos: pueden con cualquier línea, así que se derivan todas; en las que tienen cubridor
     # designado entran como último recurso. Va DESPUÉS para ver los órdenes ya declarados.
     _anadir_capacidades_correturno(trabajadores, turnos, capacidades)
-    # Grupo de equidad: cada patrón, su propio grupo cerrado; mixtos/correturnos en el pool general.
     return Datos(
         turnos=turnos,
         trabajadores=trabajadores,
