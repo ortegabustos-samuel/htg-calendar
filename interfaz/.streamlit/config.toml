@@ -1,0 +1,12 @@
+# Configuración de la interfaz (se aplica al ejecutar interfaz/app.py desde cualquier carpeta).
+
+[server]
+# Solo este equipo: los datos llevan DNI.
+address = "localhost"
+
+[browser]
+gatherUsageStats = false
+
+[client]
+# Oculta el menú de desarrollador: quien la usa no necesita "Rerun", "Deploy"…
+toolbarMode = "minimal"

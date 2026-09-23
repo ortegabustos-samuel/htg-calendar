@@ -5,3 +5,4 @@ MODELO.md
 __pycache__/
 *.pyc
 .superpowers/
+/escenarios/*
