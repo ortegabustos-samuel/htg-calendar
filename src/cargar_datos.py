@@ -17,13 +17,37 @@ from dataclasses import dataclass, field, fields
 from datetime import date, datetime, timedelta , time
 from pathlib import Path
 import csv
+import os
 import tomllib
 
 RAIZ = Path(__file__).resolve().parents[1]
-DATA = RAIZ / "data" / "input"
+# La interfaz (interfaz/app.py) apunta aquí la carpeta de cada escenario; sin ella, data/input.
+DATA = Path(os.environ.get("HT_DATOS") or RAIZ / "data" / "input")
 
-DIAS = ["lun", "mar", "mie", "jue", "vie", "sab", "dom"]   # patrones.csv; índice = weekday()
+DIAS = ["Lunes", "Martes", "Miercoles", "Jueves", "Viernes", "Sabado", "Domingo"]  # patrones.csv; índice = weekday()
 LIBRE = "LIBRE"
+# DO (descanso obligatorio): el descanso que da por ley un turno de 24 h, hoy solo en los patrones
+# de UVI. Para la PLANIFICACIÓN es exactamente un LIBRE —no se trabaja, no computa horas, no ocupa
+# plaza—; la única diferencia es que en el cuadrante sale con su etiqueta en vez de en blanco.
+DO = "DO"
+DESCANSOS = frozenset({LIBRE, DO})      # celdas de patrón que significan "ese día no se trabaja"
+
+
+def turno_de(plan, trabajador_id, fecha):
+    """El TURNO DE TRABAJO que hace ese día, o None si lo que tiene es un descanso.
+
+    El plan lleva también los descansos etiquetados (DO). Eso es deliberado y tiene dos efectos
+    que NO hay que confundir:
+
+      * OCUPA el día, igual que un turno. Por eso se mete en el plan: así el solver, las cesiones
+        y los traspasos lo respetan sin tener que saber qué es, y un DO heredado llega intacto al
+        final. Para esa pregunta se sigue usando `(trab, fecha) in plan`, que ya lo blinda.
+      * NO es trabajo: no computa horas, no ocupa plaza de ninguna línea y no cuenta para los
+        topes del convenio. Para esa pregunta se usa ESTA función, que devuelve el mismo `None`
+        que se recibía cuando el día venía vacío.
+    """
+    valor = plan.get((trabajador_id, fecha))
+    return None if valor in DESCANSOS else valor
 
 # --------------------------------------------------------------------------- #
 #  Estructuras del dominio
@@ -50,6 +74,7 @@ class Trabajador:
     patron: str | None              # id del patrón (solo tipo=patron)
     vacaciones: list[tuple[date, date]] #Lista con tupla (inicio_vacaciones,fin_vacaciones)
     linea: str | None = None        # id del turno que cubre un FIJO (solo tipo=fijo)
+    municipio: str = ""             # zona a la que pertenece: define con quien compite en equidad
     factor_jornada: float = 1.0     # reducción de jornada: escala el objetivo anual. 1.0 = jornada completa
     fila_inicial: int | None = None  # solo tipo=patron: fila de `patrones.csv` que hace en la PRIMERA
                                     # semana del horizonte.
@@ -258,6 +283,7 @@ def _cargar_trabajadores() -> dict[str, Trabajador]:
                 tipo=fila["tipo"],
                 patron=fila.get("patron",None),
                 linea=(fila.get("linea") or "").strip() or None,   # columna OPCIONAL, solo para fijos
+                municipio=(fila.get("municipio") or "").strip(),
                 vacaciones = [(vac1, vac1 + timedelta(days=14)),(vac2, vac2 + timedelta(days=14))],
                 factor_jornada=factor,
                 fila_inicial=fila_inicial,

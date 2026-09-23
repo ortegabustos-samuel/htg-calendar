@@ -22,10 +22,10 @@ todas las etapas y el que consume la vista de Excel.
 from __future__ import annotations
 
 from datetime import date
-from cargar_datos import DIAS, LIBRE, Datos
+from cargar_datos import DESCANSOS, DIAS, DO, LIBRE, Datos
 
 def turno_patron(datos: Datos, trabajador_id: str, fecha: date) -> str:
-    """Celda que la rotación prescribe al trabajador el día fecha: un id de turno, `LIBRE`
+    """Celda que la rotación prescribe al trabajador el día fecha: un id de turno, `LIBRE` o `DO`.
     Ojo: prescribir un turno no significa que se trabaje la línea
     puede no operar ese día y el trabajador puede estar de vacaciones."""
 
@@ -35,6 +35,20 @@ def turno_patron(datos: Datos, trabajador_id: str, fecha: date) -> str:
     semanas = (fecha - datos.primer_lunes).days // 7
     fila = filas[(offset + semanas) % len(filas)]
     return fila[DIAS[fecha.weekday()]]
+
+
+def descanso_prescrito(datos: Datos, trabajador_id: str, fecha: date) -> str | None:
+    """`DO` si la rotación marca ese día como descanso CON ETIQUETA, None en cualquier otro caso
+    (incluido el `LIBRE` de toda la vida, que no lleva etiqueta, y quien no tiene patrón).
+
+    Se consulta desde dos sitios: la salida, para el descanso propio de cada trabajador, y
+    `libranzas`, para que el cubridor que asume un bloque herede también su descanso etiquetado.
+    """
+    trabajador = datos.trabajadores[trabajador_id]
+    if trabajador.tipo != "patron" or not trabajador.patron:
+        return None
+    celda = turno_patron(datos, trabajador_id, fecha)
+    return celda if celda == DO else None
 
 
 def prescrito(datos: Datos, trabajador_id: str, fecha: date) -> str | None:
@@ -48,6 +62,11 @@ def prescrito(datos: Datos, trabajador_id: str, fecha: date) -> str | None:
     trabajador = datos.trabajadores[trabajador_id]
     if trabajador.tipo == "patron":
         turno_id = turno_patron(datos, trabajador_id, fecha)
+        # DO se prescribe como tal: no es trabajo, pero OCUPA el día y tiene que llegar al final
+        # sin que nadie lo edite. Devolverlo aquí es lo que hace que entre en el plan y que un
+        # cubridor lo herede junto con los turnos del bloque, sin código especial en el traspaso.
+        if turno_id == DO:
+            return DO
         return turno_id if (turno_id != LIBRE and turno_id in datos.turnos and datos.opera(turno_id, fecha)) else None
     if trabajador.tipo == "fijo":
         if not datos.opera(trabajador.linea, fecha):

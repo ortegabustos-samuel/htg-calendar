@@ -18,7 +18,7 @@ from collections import defaultdict
 from datetime import date
 from pathlib import Path
 
-from cargar_datos import Datos
+from cargar_datos import DESCANSOS, Datos
 
 EPS = 1e-9          # las horas son floats leídos del CSV: comparar con holgura, no con ==
 
@@ -54,10 +54,17 @@ class LibroHoras:
         return self._horas[trabajador_id] + self.datos.turnos[turno].horas <= self.objetivo(trabajador_id) + EPS
 
     # -- movimientos -------------------------------------------------------- #
+    # Los descansos etiquetados (DO) viajan dentro del plan porque ocupan el día, pero no son
+    # trabajo: aquí se ignoran, igual que se ignoraba un día vacío. Es el único sitio del libro
+    # que necesita saberlo, y así `desde_plan` puede recorrer el plan entero sin filtrar.
     def apunta(self, trabajador_id: str, turno_id: str) -> None:
+        if turno_id in DESCANSOS:
+            return
         self._horas[trabajador_id] += self.datos.turnos[turno_id].horas
 
     def borra(self, trabajador_id: str, turno_id: str) -> None:
+        if turno_id in DESCANSOS:
+            return
         self._horas[trabajador_id] -= self.datos.turnos[turno_id].horas
 
 

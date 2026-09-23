@@ -20,7 +20,7 @@ from __future__ import annotations
 import argparse
 import sys
 import salida
-import base, horas, legal, libranzas, residuo, equidad
+import base, horas, legal, libranzas, findes, modelo
 from cargar_datos import cargar
 from datetime import date, timedelta
 from pathlib import Path
@@ -47,28 +47,19 @@ def main() -> int:
 
     # -- Paso Base ------------------------------------------------------------- #
     plan = base.construir(datos)
+    libranzas.cubrir_vacaciones(datos, plan)
     libro = horas.LibroHoras.desde_plan(datos, plan)
+
+    # -- Paso F ------------------------------------------------------------- #
+    findes.repartir(datos, plan, libro)
 
     # -- Paso B ------------------------------------------------------------- #
     libranzas.ceder(datos, plan, libro)
 
     # -- Paso D ------------------------------------------------------------- #
-    residuo.resolver(datos, plan, libro, segundos=a.segundos, hilos=a.hilos, log=a.log)
-    # El canje va ANTES del relleno de refuerzos, no después: recién salido del CP-SAT, muchos
-    # correturnos todavía tienen holgura genuina sin gastar en relleno (el modelo no encontró más
-    # demanda real que darles), así que gran parte de lo que cierra aquí es una asignación directa
-    # contra presupuesto libre, sin tocar ningún refuerzo. Si fuera después del relleno, esa
-    # holgura ya estaría ocupada y todo pasaría a depender de deshacerla primero.
-    optimo = residuo.optimizar_canje(datos, plan, libro, segundos=min(60, a.segundos), hilos=a.hilos)
-    print(f"  huecos cerrados con intercambios: {optimo}")
-    n = residuo.rellenar_refuerzos(datos, plan, libro)
-    print(f"  refuerzos de calendario para completar jornada: {n}")
-    residuo.resumen(datos, plan, libro)
-
-    # -- Paso E ------------------------------------------------------------- #
-    info = equidad.pulir(datos, plan, libro)
-    equidad.resumen(datos, plan, info)
-
+    modelo.resolver(datos, plan, libro, segundos=a.segundos, hilos=a.hilos, log=a.log)
+    #Relleno de refuerzos
+    modelo.cambiar_refuerzos(datos, plan, libro, hilos=a.hilos)
     salida.escribir_excel(datos, plan)
     return 0
 

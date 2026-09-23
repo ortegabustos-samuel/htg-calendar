@@ -23,7 +23,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from cargar_datos import DATA, DIAS, LIBRE, _cargar_config, cargar          # noqa: E402
+from cargar_datos import DATA, DESCANSOS, DIAS, LIBRE, _cargar_config, cargar   # noqa: E402
 
 # Columnas que cada fichero DEBE traer. Las opcionales (factor_jornada, linea, municipio,
 # fila_inicial, dem) no se exigen: el cargador les da valor por defecto.
@@ -188,9 +188,10 @@ def revisar_referencias(crudo: dict[str, list[dict]], inf: Informe) -> None:
     for r in crudo["patrones.csv"]:
         for dia in DIAS:
             v = r[dia]
-            if v and v != LIBRE and v not in turnos:
+            if v and v not in DESCANSOS and v not in turnos:
                 inf.error(f"patrones: {r['patron']} fila {r['fila']} {dia}='{v}' no es un turno "
-                          f"ni LIBRE — el cargador lo descarta y ese día quedará sin prescribir")
+                          f"ni un descanso ({', '.join(sorted(DESCANSOS))}) — el cargador lo "
+                          f"descarta y ese día quedará sin prescribir")
 
     for r in crudo["trabajadores.csv"]:
         w = r["id_trab"]
@@ -348,7 +349,7 @@ def revisar_contrato(crudo: dict[str, list[dict]], inf: Informe) -> None:
     en_patron: dict[str, set[str]] = defaultdict(set)
     for r in crudo["patrones.csv"]:
         for dia in DIAS:
-            if r[dia] and r[dia] != LIBRE:
+            if r[dia] and r[dia] not in DESCANSOS:
                 en_patron[r["patron"]].add(r[dia])
 
     # Marcar un día que la línea no opera no rompe nada (`elegible` mira `opera` primero), pero
