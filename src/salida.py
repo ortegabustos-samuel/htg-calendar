@@ -553,6 +553,8 @@ def escribir_excel(datos: Datos, plan: dict[tuple[str, date], str],
 
     ruta = SALIDA / nombre
     wb.save(ruta)
-    print(f"\nCuadrante: {ruta.relative_to(RAIZ)}  "
+    # La carpeta de salida puede estar fuera del proyecto (la elige la interfaz vía HT_SALIDA).
+    visible = ruta.relative_to(RAIZ) if ruta.is_relative_to(RAIZ) else ruta
+    print(f"\nCuadrante: {visible}  "
           f"(asignaciones={len(plan)}, sin cubrir={n_deficit})")
     return ruta
