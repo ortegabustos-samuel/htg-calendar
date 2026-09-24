@@ -152,6 +152,30 @@ def patrones_declarados(escenario: str) -> list[str]:
         return sorted({f.get("patron", "") for f in csv.DictReader(fh)} - {"", None})
 
 
+def estado_datos(escenario: str) -> dict[str, str | None]:
+    """{fichero: None si está listo, o qué le falta}. Solo mira que los datos EXISTAN (el fichero
+    está y tiene contenido); si son correctos no se comprueba aquí."""
+    entrada = carpeta_entrada(escenario)
+    estado: dict[str, str | None] = {}
+    ruta = entrada / "config.toml"
+    if not ruta.is_file():
+        estado["config.toml"] = "no existe"
+    else:
+        try:
+            estado["config.toml"] = None if "anio" in leer_config(ruta.read_bytes()) else "sin año"
+        except ValueError:
+            estado["config.toml"] = "no se puede leer"
+    for nombre in CSVS:
+        ruta = entrada / nombre
+        if not ruta.is_file():
+            estado[nombre] = "no existe"
+            continue
+        with open(ruta, encoding="utf-8-sig", newline="") as fh:
+            filas = sum(1 for f in csv.reader(fh) if any(c.strip() for c in f)) - 1
+        estado[nombre] = None if filas > 0 else "sin filas"
+    return estado
+
+
 # --------------------------------------------------------------------------- #
 #  CSV
 # --------------------------------------------------------------------------- #

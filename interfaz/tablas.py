@@ -268,12 +268,15 @@ def pagina(nombre: str) -> None:
     for aviso in avisos:
         st.warning(aviso, icon=":material/warning:")
 
-    # La tabla de partida se lee del disco UNA vez y se guarda en la sesión. El editor recuerda
-    # los cambios como diferencias sobre ella; si en cada ejecución se le pasara lo recién
-    # guardado, las filas añadidas se aplicarían otra vez encima y saldrían duplicadas. Solo se
-    # relee al importar un fichero (cambia nonce).
+    # La tabla de partida se guarda en la sesión mientras el editor está en pantalla: el editor
+    # recuerda los cambios como diferencias sobre ella, y si en cada ejecución se le pasara lo
+    # recién guardado las filas añadidas se aplicarían otra vez encima y saldrían duplicadas.
+    # Pero en cuanto el editor se monta de nuevo (primera vez, o al volver de otra página:
+    # Streamlit borra el estado de un widget que deja de dibujarse, y con él las diferencias) la
+    # partida se RELEE del disco. Si no, se mostraría la tabla de cuando se abrió la página por
+    # primera vez y el guardado automático la escribiría encima de lo editado después.
     clave = f"editor_{nombre}_{escenario}_{ss.nonce}"
-    if f"base_{clave}" not in ss:
+    if clave not in ss or f"base_{clave}" not in ss:
         base = _tabla(nombre, escenario)
         ss[f"base_{clave}"] = base
         ss[f"guardado_{clave}"] = fx.filas_limpias(nombre, a_csv(nombre, base))
@@ -283,7 +286,11 @@ def pagina(nombre: str) -> None:
     editado = st.data_editor(ss[f"base_{clave}"], num_rows="dynamic", hide_index=True,
                              column_config=config, key=clave)
     filas = fx.filas_limpias(nombre, a_csv(nombre, editado))
-    if filas != ss[f"guardado_{clave}"]:
+    # Segunda barrera: sin ediciones del usuario en el editor no se escribe nunca, aunque la
+    # comparación diga otra cosa. Así ningún desajuste de estado puede pisar el fichero.
+    cambios = ss.get(clave) or {}
+    editado_por_usuario = any(cambios.get(k) for k in ("edited_rows", "added_rows", "deleted_rows"))
+    if editado_por_usuario and filas != ss[f"guardado_{clave}"]:
         try:
             fx.guardar_filas(escenario, nombre, filas)
         except OSError as e:

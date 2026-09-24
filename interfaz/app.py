@@ -5,6 +5,7 @@ Punto de entrada: selector de escenario en la barra lateral y el menú de págin
   Inicio      — estado del escenario e importar varios ficheros a la vez
   Parámetros  — config.toml como formulario
   Datos       — una página por CSV (app_pages/), en orden de dependencia
+  Resultado   — generar el cuadrante: ejecuta el pipeline con barra de progreso
 
 Uso:  interfaz/lanzar.sh      (o: streamlit run interfaz/app.py)
 """
@@ -54,6 +55,8 @@ if ss["escenario"]:
                                   icon=":material/tune:")],
         "Datos": [st.Page(f"app_pages/{Path(nombre).stem}.py", title=titulo, icon=icono)
                   for nombre, (titulo, icono) in tablas.PAGINAS.items()],
+        "Resultado": [st.Page("app_pages/generar.py", title="Generar cuadrante",
+                              icon=":material/play_circle:")],
     }
 else:
     paginas = [inicio]                  # sin escenario no hay nada que editar
