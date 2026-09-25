@@ -26,7 +26,6 @@ leyenda por turno.
 from __future__ import annotations
 
 import os
-from collections import Counter
 from datetime import date
 from pathlib import Path
 
@@ -73,26 +72,19 @@ FILL_COBERTURA_OK, FILL_COBERTURA_EXCESO, FILL_COBERTURA_FALTA = "C6EFCE", "FFEB
 DS, DF = "DS", "DF"
 FILL_DESCANSO = {DS: "D9E1F2", DF: "E4DFEC", DO: "D9D9D9"}
 
+# PROVISIONAL, para validar la equidad a ojo: con VER_FRANJAS cada turno se pinta por la franja
+# de su línea (`Datos.franja`) en vez de por el tipo de día, y los findes y festivos van en
+# negrita. El tipo de día se sigue leyendo en la cabecera de la columna. Se quitará.
+VER_FRANJAS = True
+FILL_FRANJA = {"mañana": "9BC2E6", "tarde": "F4B084", "partido": "A9D08E",
+               "noche": "7030A0", "localizado": "B4A7D6"}
+
 
 def _municipio_trabajador(datos: Datos) -> dict[str, str]:
-    """Municipio de referencia de cada trabajador, para saber qué festivos le afectan. No es un dato
-    de `trabajadores.csv`: el municipio vive en los TURNOS, así que se deduce de las líneas que hace
-    —la de su patrón si lo tiene, la suya si es fijo, o sus capacidades— quedándose con la más
-    frecuente. Solo se usa para PINTAR el calendario; cuando el trabajador tiene turno asignado ese
-    día se usa el municipio de ese turno, que es exacto."""
-    muni: dict[str, str] = {}
-    for w, t in datos.trabajadores.items():
-        lineas: list[str] = []
-        if t.tipo == "patron" and t.patron:
-            lineas = [s for fila in datos.patrones.get(t.patron, []) for s in fila.values()
-                      if s and s in datos.turnos]
-        elif t.tipo == "fijo" and t.linea:
-            lineas = [t.linea]
-        if not lineas:
-            lineas = [s for (ww, s) in datos.capacidades if ww == w and s in datos.turnos]
-        cuenta = Counter(datos.turnos[s].municipio for s in lineas)
-        muni[w] = cuenta.most_common(1)[0][0] if cuenta else "Valladolid"
-    return muni
+    """Municipio de referencia de cada trabajador, para saber qué festivos le afectan: el que
+    declara en `trabajadores.csv`. Solo se usa para PINTAR el calendario; cuando el trabajador tiene
+    turno asignado ese día se usa el municipio de ese turno, que es exacto."""
+    return {w: t.municipio or "Valladolid" for w, t in datos.trabajadores.items()}
 
 
 def _categoria(datos: Datos, d: date, municipio: str | None = None) -> str:
@@ -145,16 +137,28 @@ def _calendario_de(datos: Datos, turno: str) -> str:
     return datos.calendario_municipio.get(t.municipio, t.municipio)
 
 
+TIPOS = ("fijo", "patron", "correturno")
+
+
 def _bloques(datos: Datos) -> list[tuple[str, list[str]]]:
-    """Orden simple de filas para el cuadrante: fijos, patrones (agrupados por patrón), mixtos,
-    correturnos. Sin la lógica de "dedicados"/pueblos de `_bloques` (esa usa `turno.prioridad`,
-    que no existe en el modelo de datos)."""
-    def sel(tipo: str) -> list[str]:
-        return sorted((w for w, t in datos.trabajadores.items() if t.tipo == tipo),
-                      key=lambda w: (datos.trabajadores[w].patron or "", w))
-    bloques = [("FIJOS", sel("fijo")), ("PATRONES", sel("patron")),
-               ("MIXTOS", sel("mixto")), ("CORRETURNOS", sel("correturno"))]
-    return [(tit, g) for tit, g in bloques if g]
+    """Orden de filas para VALIDAR a ojo: por municipio (el de más plantilla primero) y dentro de
+    cada uno por tipo de trabajador. Provisional, mientras se valida el modelo de fijos."""
+    tamano: dict[str, int] = {}
+    grupos: dict[tuple[str, str], list[str]] = {}
+    for w, t in datos.trabajadores.items():
+        grupos.setdefault((t.municipio, t.tipo), []).append(w)
+        tamano[t.municipio] = tamano.get(t.municipio, 0) + 1
+    orden = sorted(grupos, key=lambda g: (-tamano[g[0]], g[0],
+                                          TIPOS.index(g[1]) if g[1] in TIPOS else len(TIPOS)))
+    return [(f"{m} · {tipo}", sorted(grupos[(m, tipo)],
+                                     key=lambda w: (datos.trabajadores[w].patron or "", w)))
+            for m, tipo in orden]
+
+
+def _rotulo(datos: Datos, trab: str) -> str:
+    """Nombre con municipio y tipo al lado, para validar. Provisional."""
+    t = datos.trabajadores[trab]
+    return f"{t.nombre} ({t.municipio}, {t.tipo})"
 
 
 def _meses(fechas: list[date]) -> list[tuple[str, str, int, int]]:
@@ -354,7 +358,7 @@ def escribir_excel(datos: Datos, plan: dict[tuple[str, date], str],
     for _, gente in _bloques(datos):
         for trab in gente:
             t = datos.trabajadores[trab]
-            ws.cell(r, COL_NOMBRE, t.nombre).alignment = izq
+            ws.cell(r, COL_NOMBRE, _rotulo(datos, trab)).alignment = izq
             for j, d in enumerate(fechas):
                 c = ws.cell(r, COL_D0 + j)
                 c.alignment, c.border = centro, borde
@@ -377,6 +381,11 @@ def escribir_excel(datos: Datos, plan: dict[tuple[str, date], str],
                     # libra, con el municipio de referencia del trabajador.
                     m = datos.turnos[turno].municipio if turno else muni[trab]
                     c.value, color = turno, CAT_FILL[_categoria(datos, d, m)]
+                    if VER_FRANJAS and turno in datos.turnos:
+                        franja = datos.franja(turno)
+                        color = FILL_FRANJA[franja]
+                        c.font = Font(bold=_categoria(datos, d, m) != "lv",
+                                      color="FFFFFF" if franja == "noche" else "000000")
                 c.fill = PatternFill("solid", fgColor=color)
             fila_de[trab] = r
             r += 1
@@ -517,7 +526,7 @@ def escribir_excel(datos: Datos, plan: dict[tuple[str, date], str],
     # El nombre es ahora la ÚNICA identificación de la fila, así que se sale del tope general de
     # anchura: cortado no identifica a nadie.
     ws.column_dimensions[get_column_letter(COL_NOMBRE)].width = min(
-        36, max(len(datos.trabajadores[w].nombre) for w in fila_de) + 2)
+        56, max(len(_rotulo(datos, w)) for w in fila_de) + 2)
     ws.freeze_panes = f"{L_D0}{W0}"
     _ajustar_anchos(ws2, desde_fila=1, saltar={2})
     ws2.freeze_panes = f"A{PF0}"

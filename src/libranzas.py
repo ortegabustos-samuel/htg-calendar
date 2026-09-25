@@ -1,7 +1,7 @@
 from datetime import timedelta
 
 import base
-from cargar_datos import DESCANSOS, DO
+from cargar_datos import DESCANSOS
 from horas import EPS
 
 SEPARACION_MINIMA = 15   # dias de vida normal que se le deja a un cubridor entre dos
@@ -12,8 +12,7 @@ SEPARACION_MINIMA = 15   # dias de vida normal que se le deja a un cubridor entr
 def es_rigido(datos, trabajador_id):
     """ Si su grupo cede bloques enteros o admite dias sueltos"""
     trabajador = datos.trabajadores[trabajador_id]
-    grupo = trabajador.patron if trabajador.tipo == "patron" else trabajador.tipo
-    return grupo in datos.config.grupos_rigidos
+    return trabajador.tipo == "patron"          # solo quedan patrones reales: noches y UVI
 
 def bloque_desde(datos, trabajador_id, fecha):
     """
@@ -21,12 +20,12 @@ def bloque_desde(datos, trabajador_id, fecha):
     es decir se busca una tirada desde el primer dia de trabajo hasta el siguiente
     incluyendo los descansos pertinentes
     """
-    # OJO: aquí "trabaja" tiene que excluir el DO. `prescrito` lo devuelve porque el DO ocupa el
-    # día, pero es descanso: si contara como racha, un patrón que solo tiene turnos y DO —el de
-    # UVI, que no lleva ni un LIBRE— no terminaría la racha nunca, el bloque se comería el resto
-    # del año y esos trabajadores dejarían de poder ceder su exceso de horas.
+    # OJO: aquí "trabaja" tiene que excluir los descansos (DS, DO). `prescrito` los devuelve
+    # porque ocupan el día, pero si contaran como racha el bloque no terminaría nunca, se comería
+    # el resto del año y esos trabajadores dejarían de poder ceder su exceso de horas.
     def trabaja(dia):
-        return base.prescrito(datos, trabajador_id, dia) not in (None, DO)
+        turno = base.prescrito(datos, trabajador_id, dia)
+        return turno is not None and turno not in DESCANSOS
 
     if not trabaja(fecha):
         return None                 # Ese dia no se trabaja
@@ -62,8 +61,8 @@ def candidatos_de_cesion(datos, plan, trabajador_id, especiales):
 
     for fecha in datos.lista_dias_calendario:
         turno = base.prescrito(datos,trabajador_id,fecha)
-        if turno is None or turno == DO:
-            continue                # un descanso obligatorio no es cedible: ya es descanso
+        if turno is None or turno in DESCANSOS:
+            continue                # un descanso no es cedible: ya es descanso
         if turno in especiales:
             continue
         if datos.tipo_dia(fecha,datos.turnos[turno].municipio) != "LV":
@@ -90,12 +89,34 @@ def distancia_bloque(dias_candidatos, comprometido):
             distancias.append(abs((fecha - ocupado).days))
     return min(distancias)
 
-def holgura_media(dias, libres, huecos):
+def pool_de(datos, municipio):
+    """La plantilla que absorbe en el modelo lo que se cede: fijos y correturnos del municipio."""
+    return [trabajador_id for trabajador_id, trabajador in datos.trabajadores.items()
+            if trabajador.tipo in ("fijo", "correturno") and trabajador.municipio == municipio]
+
+def demanda_del_pool(datos, municipio, especiales):
+    """Plazas por dia de las lineas que cubre el pool del municipio: con demanda, sin cubridor
+    designado (esas solo las hace el cubridor) y fuera de los patrones (esas las pinta el
+    esqueleto)."""
+    de_patron = {celda for filas in datos.patrones.values() for fila in filas for celda in fila.values()}
+    lineas = [turno_id for turno_id, turno in datos.turnos.items()
+              if turno.municipio == municipio and turno.dem > 0
+              and turno_id not in especiales and turno_id not in de_patron]
+    return {fecha: sum(datos.turnos[s].dem for s in lineas if datos.opera(s, fecha))
+            for fecha in datos.lista_dias_calendario}, set(lineas)
+
+def holgura(datos, plan, fecha, pool, demanda):
+    """Cuanto sitio le queda al pool ese dia: lo que da la gente disponible y sin nada en el plan,
+    menos las plazas que tiene que cubrir. Cada persona da de media jornada/(8*365) dias de
+    trabajo por dia natural (unos 0,6): nadie trabaja los siete. Solo sirve para comparar dias."""
+    ritmo = datos.config.horas_objetivo / (8 * 365)
+    libres = sum(1 for trabajador_id in pool
+                 if datos.disponible(trabajador_id, fecha) and (trabajador_id, fecha) not in plan)
+    return libres * ritmo - demanda[fecha]
+
+def holgura_media(datos, plan, dias, pool, demanda):
     """Cuanto sitio hay de media en los dias de un bloque"""
-    total = 0
-    for fecha in dias:
-        total += libres[fecha] - huecos[fecha]
-    return total / len(dias)
+    return sum(holgura(datos, plan, fecha, pool, demanda) for fecha in dias) / len(dias)
 
 def soltar(plan, libro, trabajador_id, fecha):
     """le quita lo del dia y descuenta horas en el plan.
@@ -115,13 +136,13 @@ def asignar(plan, libro, trabajador_id, fecha, turno_id):
     plan[(trabajador_id,fecha)] = turno_id
     libro.apunta(trabajador_id,turno_id)
 
-def ceder_traspasando(datos, plan, libro, titular, cubridores, libres, huecos):
+def ceder_traspasando(datos, plan, libro, titular, cubridores, pool, demanda):
     """Cede un bloque o dia que requiera un titular especial.
 
-    La puntuacion es una tupla: primero si el bloque cae donde hay sitio, y
-    solo en caso de empate se desempata por lo lejos que quede de lo que el
-    cubridor ya tiene encima. Asi no hace falta inventarse un peso entre dos
-    magnitudes que no se parecen en nada.
+    La puntuacion es una tupla: primero si el bloque cae donde el pool tiene sitio para
+    absorber al cubridor que se va, y solo en caso de empate se desempata por lo lejos
+    que quede de lo que el cubridor ya tiene encima. Asi no hace falta inventarse un
+    peso entre dos magnitudes que no se parecen en nada.
     """
     mejor_dias = None
     mejor_cubridor = None
@@ -131,7 +152,7 @@ def ceder_traspasando(datos, plan, libro, titular, cubridores, libres, huecos):
         cubridor = elegir_cubridor(datos, plan, cubridores,dias)
         if cubridor is None:
             continue
-        puntos = (holgura_media(dias, libres, huecos) >= 0,
+        puntos = (holgura_media(datos, plan, dias, pool, demanda) >= 0,
                   distancia_bloque(dias, dias_comprometido(datos, plan, cubridor)))
         if mejor_puntos is None or puntos > mejor_puntos:
             mejor_puntos = puntos
@@ -141,81 +162,41 @@ def ceder_traspasando(datos, plan, libro, titular, cubridores, libres, huecos):
     if mejor_dias is None:
         return False
 
+    # El cubridor deja el pool esos dias: lo que el habria cubierto lo absorbe el modelo con el
+    # resto de la plantilla, y la holgura lo ve porque ya esta ocupado en el plan.
     for fecha in mejor_dias:
         turno = base.prescrito(datos,titular,fecha)
-        tenia = plan.get((mejor_cubridor, fecha))   # lo que el cubridor iba a hacer ese dia
         soltar(plan,libro,titular,fecha)
         soltar(plan,libro,mejor_cubridor, fecha)
         if turno is not None:
             asignar(plan, libro, mejor_cubridor,fecha, turno)
-        if tenia is not None:
-            huecos[fecha] += 1                      # la plaza que el cubridor acaba de dejar
     return True
 
-def ceder_liberando(datos, plan, libro, trabajador_id, especiales, libres, huecos):
+def ceder_liberando(datos, plan, libro, trabajador_id, especiales, pool, demanda, lineas_pool):
     """Cede un dia suelto y deja la plaza vacia para que la recoja el modelo.
 
-    Se elige el dia con mas holgura: correturnos que hay menos plazas que ya
-    estan sin cubrir. No se le asigna nadie: quien la coja lo decide el paso
-    siguiente, que tiene mas informacion que nosotros.
+    Se elige el dia en que el pool del municipio tiene mas holgura. No se le asigna
+    nadie: quien la coja lo decide el modelo, que tiene mas informacion que nosotros.
     """
     mejor_fecha = None
     mejor_holgura = None
 
     for dias in candidatos_de_cesion(datos, plan, trabajador_id, especiales):
         fecha = dias[0]                 # la rama flexible devuelve dias sueltos
-        holgura = libres[fecha] - huecos[fecha]
-        if mejor_holgura is None or holgura > mejor_holgura:
-            mejor_holgura = holgura
+        sitio = holgura(datos, plan, fecha, pool, demanda)
+        if mejor_holgura is None or sitio > mejor_holgura:
+            mejor_holgura = sitio
             mejor_fecha = fecha
 
     if mejor_fecha is None:
         return False
 
+    turno = plan.get((trabajador_id, mejor_fecha))
     soltar(plan, libro, trabajador_id, mejor_fecha)
-    huecos[mejor_fecha] += 1            # ese dia queda un poco peor para el siguiente
+    if turno in lineas_pool:
+        demanda[mejor_fecha] += 1       # plaza nueva para el pool: ese dia queda peor para el siguiente
     return True
 
-
-def correturnos_libres_por_dia(datos):
-    """Cuantos correturnos hay cada dia para saber la holgura
-    de una cesion
-    """
-    libres = {}
-    for fecha in datos.lista_dias_calendario:
-        n = 0
-        for trabajador_id, trabajador in datos.trabajadores.items():
-            if trabajador.tipo != "correturno":
-                continue
-            if datos.disponible(trabajador_id, fecha):
-                n += 1
-        libres[fecha] = n
-    return libres
-
-def huecos_por_dia(datos, plan, especiales):
-    """
-    Con este metodo medimos cuantas plazas estan sin cubrir ahora, para ello
-    no cuentan ni las que no tienen demanda ni las que son especiales y requieren
-    alguien especifico paara cubrir
-    """
-    ocupadas = set()
-    for (trabajador_id, fecha), turno_id in plan.items():
-        ocupadas.add((turno_id, fecha))
-
-    huecos = {}
-    for fecha in datos.lista_dias_calendario:
-        n = 0
-        for turno_id in datos.turnos:
-            if turno_id in especiales:
-                continue
-            if datos.turnos[turno_id].dem == 0:
-                continue
-            if not datos.opera(turno_id, fecha):
-                continue
-            if (turno_id, fecha) not in ocupadas:
-                n += 1
-        huecos[fecha] = n
-    return huecos
 
 def cubridores_especiales(datos):
     """ Cubridores para aquellos turnos que solo puede hacer
@@ -332,15 +313,19 @@ def cubrir_ausencia_titular(datos, plan, titular, cubridores, inicio, fin):
             plan.pop((cubridor, fecha), None)
             turno = base.prescrito(datos, titular, fecha)
             if turno is not None:
-                plan[(cubridor, fecha)] = turno #Si descansaba heredara None tambien
+                plan[(cubridor, fecha)] = turno #Si descansaba heredara el descanso tambien
 
 def cubrir_vacaciones(datos, plan):
     """
-    Paso de cubrir las vacaciones especificas que requieren un cobertor especial
+    Paso de cubrir las vacaciones especificas que requieren un cobertor especial.
+    Solo de titulares de patron: el cubridor hereda su ciclo. La linea especial de un fijo
+    (H) la cubre su cubridor dentro del modelo de titulares.
     """
     ausencias = []
     for turno_id, cubridores in cubridores_especiales(datos).items():
         for titular in titulares_de(datos, turno_id):
+            if datos.trabajadores[titular].tipo != "patron":
+                continue
             for inicio, fin in datos.trabajadores[titular].vacaciones:
                 ausencias.append((inicio, fin, titular, cubridores))
     ausencias.sort()
@@ -349,34 +334,45 @@ def cubrir_vacaciones(datos, plan):
         cubrir_ausencia_titular(datos, plan, titular, cubridores, inicio, fin)
 
 def ceder(datos, plan, libro):
-    """ Paso de cesiones por exceso de horas en el calendario, modificamos plan y libro de horas"""
-    especiales = cubridores_especiales(datos)
-    libres = correturnos_libres_por_dia(datos)
-    huecos = huecos_por_dia(datos, plan, especiales)
+    """ Paso de cesiones por exceso de horas en el calendario, modificamos plan y libro de horas.
 
-    # Primero vamos a solucionar aquellas lineas con un cubridor especifico
+    Solo cede quien ya tiene algo en el plan, que a estas alturas son los patrones: fijos y
+    correturnos no tienen nada todavia y el techo de su jornada lo pone el modelo. Lo que se
+    cede lo absorbe el pool del municipio del titular (fijos y correturnos) dentro del modelo,
+    asi que es su holgura la que decide donde se cede.
+    """
+    especiales = cubridores_especiales(datos)
+    pools, demandas = {}, {}
+    def del_municipio(trabajador_id):
+        municipio = datos.trabajadores[trabajador_id].municipio
+        if municipio not in pools:
+            pools[municipio] = pool_de(datos, municipio)
+            demandas[municipio] = demanda_del_pool(datos, municipio, especiales)
+        return pools[municipio], demandas[municipio]
+
+    # Primero las lineas con un cubridor designado: el cubridor hereda el bloque
     titulares_especiales = []
     for turno_id, cubridores in especiales.items():
         for titular in titulares_de(datos, turno_id):
+            if datos.trabajadores[titular].tipo != "patron":
+                continue            # un fijo no tiene nada en el plan que ceder
             titulares_especiales.append(titular)
+            pool, (demanda, _) = del_municipio(titular)
             while libro.exceso(titular) > EPS:
-                if not ceder_traspasando(datos, plan, libro, titular, cubridores, libres, huecos):
+                if not ceder_traspasando(datos, plan, libro, titular, cubridores, pool, demanda):
                     break
 
-    #Ahora el resto de la plantilla ya asignada
-    resto = []
-    for trabajador_id, trabajador in datos.trabajadores.items():
-        if trabajador_id in titulares_especiales:
-            continue
-        if trabajador.tipo == "correturno":
-            continue
-        resto.append(trabajador_id)
+    # Ahora el resto de patrones: sueltan dias y la plaza queda para el modelo
+    resto = [trabajador_id for trabajador_id, trabajador in datos.trabajadores.items()
+             if trabajador.tipo == "patron" and trabajador_id not in titulares_especiales]
     while True:
-        pendientes = []
-        for trabajador_id in resto:
-            if libro.exceso(trabajador_id) > EPS:
-                pendientes.append(trabajador_id)
+        pendientes = [trabajador_id for trabajador_id in resto if libro.exceso(trabajador_id) > EPS]
         if not pendientes:
             break
+        cedido = False
         for trabajador_id in pendientes:
-            ceder_liberando(datos, plan, libro, trabajador_id, especiales, libres, huecos)
+            pool, (demanda, lineas_pool) = del_municipio(trabajador_id)
+            cedido |= ceder_liberando(datos, plan, libro, trabajador_id, especiales,
+                                      pool, demanda, lineas_pool)
+        if not cedido:
+            break                   # nadie puede ceder ya nada: sin esto el bucle no acaba

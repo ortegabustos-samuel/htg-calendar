@@ -142,14 +142,10 @@ def formas(datos: Datos, plan: Plan, trabajador_id: str, desde: date, hasta: dat
     return salida
 
 
-def _grupo(datos: Datos, trab: str) -> str:
-    t = datos.trabajadores[trab]
-    return t.patron if t.tipo == "patron" and t.patron else t.tipo
-
-
 def _rigido(datos: Datos, trab: str) -> bool:
-    """La plaza de `trab` no se fracciona al ceder: se cede el ciclo entero, nunca un día suelto."""
-    return _grupo(datos, trab) in datos.config.grupos_rigidos
+    """La plaza de `trab` no se fracciona al ceder: se cede el ciclo entero, nunca un día suelto.
+    Solo quedan patrones reales (noches y UVI), y todos lo son."""
+    return datos.trabajadores[trab].tipo == "patron"
 
 
 def pactadas(datos: Datos, plan: Plan) -> set:
@@ -178,7 +174,7 @@ def infracciones(datos: Datos, plan: Plan) -> list[str]:
 
         for f in fechas:                                        # C4
             sig = f + timedelta(days=1)
-            if (w, sig) in plan:
+            if turno_de(plan, w, sig) is not None:          # un DO al día siguiente no es turno
                 hueco = datos.intervalo(plan[(w, sig)], sig)[0] - datos.intervalo(plan[(w, f)], f)[1]
                 if hueco < minimo:
                     # Se etiqueta aparte cuando hay una guardia de LOCALIZACIÓN de por medio: no es

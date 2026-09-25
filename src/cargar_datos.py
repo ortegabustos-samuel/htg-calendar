@@ -25,12 +25,9 @@ RAIZ = Path(__file__).resolve().parents[1]
 DATA = Path(os.environ.get("HT_DATOS") or RAIZ / "data" / "input")
 
 DIAS = ["Lunes", "Martes", "Miercoles", "Jueves", "Viernes", "Sabado", "Domingo"]  # patrones.csv; índice = weekday()
-LIBRE = "LIBRE"
-# DO (descanso obligatorio): el descanso que da por ley un turno de 24 h, hoy solo en los patrones
-# de UVI. Para la PLANIFICACIÓN es exactamente un LIBRE —no se trabaja, no computa horas, no ocupa
-# plaza—; la única diferencia es que en el cuadrante sale con su etiqueta en vez de en blanco.
+DS = "DS"
 DO = "DO"
-DESCANSOS = frozenset({LIBRE, DO})      # celdas de patrón que significan "ese día no se trabaja"
+DESCANSOS = frozenset({DS, DO})      # celdas de patrón que significan "ese día no se trabaja"
 
 
 def turno_de(plan, trabajador_id, fecha):
@@ -71,9 +68,8 @@ class Trabajador:
     id: str                         #Nif único
     nombre: str                     # nombre y apellidos, solo para la salida a Excel
     tipo: str                       # fijo | patron | correturno
-    patron: str | None              # id del patrón (solo tipo=patron)
+    patron: str | None              # id del patrón (solo tipo=patron: noches y UVI)
     vacaciones: list[tuple[date, date]] #Lista con tupla (inicio_vacaciones,fin_vacaciones)
-    linea: str | None = None        # id del turno que cubre un FIJO (solo tipo=fijo)
     municipio: str = ""             # zona a la que pertenece: define con quien compite en equidad
     factor_jornada: float = 1.0     # reducción de jornada: escala el objetivo anual. 1.0 = jornada completa
     fila_inicial: int | None = None  # solo tipo=patron: fila de `patrones.csv` que hace en la PRIMERA
@@ -91,8 +87,6 @@ class Config:
     descanso_minimo: int                # descanso mínimo entre jornadas (h)              -> C4
     horas_max_semana: int             # máx. horas en cualquier ventana de 7 días       -> C6
     dias_max_semana: int                # máx. días trabajados por semana ISO             -> C5
-    grupos_rigidos: tuple[str, ...] = ()    # grupos (patrón o tipo) cuyo descanso no se fracciona:
-                                            # se cede el ciclo entero, nunca un día suelto (libranzas.py)
 
 @dataclass
 class Capacidad:
@@ -116,7 +110,7 @@ class Datos:
     calendario_municipio: dict[str, str]           # municipio -> calendario de festivos
     festivos: dict[str, set[date]]                 # ambito(calendario) -> fechas
     capacidades: dict[tuple[str, str], Capacidad]  # (id_trab, id_turno) -> flags
-    patrones: dict[str, list[dict[str, str]]]      # patron -> [ {weekday: turno|LIBRE} ]
+    patrones: dict[str, list[dict[str, str]]]      # patron -> [ {weekday: turno|DS} ]
     offsets: dict[str, int] = field(default_factory=dict)  # trabajador de patrón -> fila de arranque
                                                    # (ver `offsets_patron`). Lo deriva `cargar()`.
     config: Config = field(default_factory=Config)  # año y parámetros del convenio (config.toml)
@@ -173,13 +167,19 @@ class Datos:
         return inicio, fin
 
     def franja(self, turno_id: str) -> str:
-        """Tramo del día en que se trabaja: mañana | tarde | noche"""
+        """Tramo del día en que se trabaja: mañana | partido | tarde | noche | localizado. Es la
+        unidad de estabilidad semanal de un titular: toda la semana en la misma franja.
+
+        El partido es el que dura más de reloj de lo que computa (10 h con 2 de interrupción), y
+        un turno que entra de tarde sigue siendo de tarde aunque acabe a medianoche."""
         turno = self.turnos[turno_id]
-        if turno.hora_salida <= turno.hora_entrada:              # cruza medianoche
+        if self.localizado(turno_id):
+            return "localizado"
+        if turno.hora_entrada.hour >= 21:
             return "noche"
-        if turno.hora_entrada.hour < 13:
-            return "mañana"
-        return "tarde" if turno.hora_entrada.hour < 22 else "noche"
+        if self.duracion(turno_id) > turno.horas:
+            return "partido"
+        return "mañana" if turno.hora_entrada.hour < 13 else "tarde"
 
     def localizado(self, turno_id: str) -> bool:
         """Guardia de LOCALIZACIÓN: 24 h de reloj (entrada = salida) que computan 8. No es
@@ -281,8 +281,7 @@ def _cargar_trabajadores() -> dict[str, Trabajador]:
             trabajadores[fila["id_trab"]] = Trabajador(
                 id=fila["id_trab"],
                 tipo=fila["tipo"],
-                patron=fila.get("patron",None),
-                linea=(fila.get("linea") or "").strip() or None,   # columna OPCIONAL, solo para fijos
+                patron=(fila.get("patron") or "").strip() or None,
                 municipio=(fila.get("municipio") or "").strip(),
                 vacaciones = [(vac1, vac1 + timedelta(days=14)),(vac2, vac2 + timedelta(days=14))],
                 factor_jornada=factor,
@@ -385,11 +384,11 @@ def _anadir_capacidades_patron(
     Deriva las capacidades de los trabajadores de patron a partir de la estructura del patrón y
     las introduce en el conjunto de capacidades.
     """
-    # Turnos (excluye LIBRE y cualquier celda vacía) que rota cada patrón.
+    # Turnos (excluye DS y cualquier celda vacía) que rota cada patrón.
     turnos_por_patron: dict[str, set[str]] = {}
     for patron_id, filas_patron in patrones.items():
         rotados = {turno for fila in filas_patron for turno in fila.values()
-                   if turno and turno != LIBRE and turno in turnos}
+                   if turno and turno not in DESCANSOS and turno in turnos}
         turnos_por_patron[patron_id] = rotados
 
     anadidas = 0
@@ -403,25 +402,37 @@ def _anadir_capacidades_patron(
     return anadidas
 
 
-def _anadir_capacidad_fijo(
+def _anadir_capacidades_fijo(
     trabajadores: dict[str, Trabajador],
     turnos: dict[str, Turno],
     capacidades: dict[tuple[str, str], Capacidad],
+    patrones: dict[str, list[dict[str, str]]],
 ) -> int:
-    """Deriva la capacidad de los FIJOS a partir de su `linea` (declarada en trabajadores.csv), igual
-    que las de patrón se derivan de patrones.csv."""
+    """Un FIJO sin nada declarado puede hacer cualquier línea con demanda de su municipio, salvo
+    las de cobertura especial (alguien con v>=1) y las que cubre un patrón. Lo que declare en
+    capacidades.csv vale sea del municipio que sea: así se cubre un pueblo sin plantilla propia.
+
+    Si en capacidades.csv tiene alguna fila con un flag lv/sab/dom/fest, SOLO puede lo declarado y
+    no se deriva nada: es el caso del fijo con una línea L-V. Las filas solo-v (flags a 0) son
+    cobertura excepcional: se quedan como vienen y no restringen. Devuelve el nº de capacidades
+    añadidas."""
+    especiales = {turno for (_, turno), cap in capacidades.items() if cap.v >= 1}
+    de_patron = {celda for filas in patrones.values() for fila in filas for celda in fila.values()}
+    con_filas_restrictivas = {trab for (trab, _), cap in capacidades.items()
+                              if cap.lv or cap.sab or cap.dom or cap.fest}
+
     anadidas = 0
     for trabajador_id, trabajador in trabajadores.items():
-        if trabajador.tipo != "fijo":
+        if trabajador.tipo != "fijo" or trabajador_id in con_filas_restrictivas:
             continue
-        if not trabajador.linea:
-            raise ValueError(f"El fijo {trabajador_id} no declara `linea` en trabajadores.csv "
-                             f"(columna obligatoria para tipo=fijo)")
-        if trabajador.linea not in turnos:
-            raise ValueError(f"El fijo {trabajador_id} declara la línea '{trabajador.linea}', que no existe en turnos.csv")
-        if (trabajador_id, trabajador.linea) not in capacidades:                 # respeta lo que ya venga del CSV
-            capacidades[(trabajador_id, trabajador.linea)] = Capacidad(lv=1, sab=0, dom=0, fest=0, v=0) # Suponemos fijos trabajan lunes-viernes
-            anadidas += 1
+        for turno_id, turno in turnos.items():
+            if turno.dem <= 0 or turno_id in especiales or turno_id in de_patron:
+                continue
+            if turno.municipio != trabajador.municipio:
+                continue
+            if (trabajador_id, turno_id) not in capacidades:
+                capacidades[(trabajador_id, turno_id)] = Capacidad(lv=1, sab=1, dom=1, fest=1, v=0)
+                anadidas += 1
     return anadidas
 
 
@@ -488,8 +499,10 @@ def cargar() -> Datos:
     # Capacidades de los trabajadores de patrón: derivadas de la estructura del patrón (no están en
     # capacidades.csv porque esa info ya vive en patrones.csv).
     _anadir_capacidades_patron(trabajadores, patrones, turnos, capacidades)
-    # Capacidad de los fijos: derivada de su `linea` (trabajadores.csv), L-V por definición.
-    _anadir_capacidad_fijo(trabajadores, turnos, capacidades)
+    config = _cargar_config()
+    # Fijos sin nada declarado: todo su municipio menos lo especial y
+    # lo de patrón. Los que declaran filas se quedan con lo declarado.
+    _anadir_capacidades_fijo(trabajadores, turnos, capacidades, patrones)
     # Correturnos: pueden con cualquier línea, así que se derivan todas; en las que tienen cubridor
     # designado entran como último recurso. Va DESPUÉS para ver los órdenes ya declarados.
     _anadir_capacidades_correturno(trabajadores, turnos, capacidades)
@@ -505,5 +518,5 @@ def cargar() -> Datos:
         offsets=offsets_patron(trabajadores, patrones),
         # Año y parámetros del convenio (config.toml). Única fuente: todas las etapas, la salida
         # y el validador leen de aquí.
-        config=_cargar_config(),
+        config=config,
     )

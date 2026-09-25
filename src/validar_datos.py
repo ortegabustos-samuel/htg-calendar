@@ -25,7 +25,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from cargar_datos import DATA, DESCANSOS, DIAS, LIBRE, _cargar_config, cargar   # noqa: E402
 
-# Columnas que cada fichero DEBE traer. Las opcionales (factor_jornada, linea, municipio,
+# Columnas que cada fichero DEBE traer. Las opcionales (factor_jornada, patron, municipio,
 # fila_inicial, dem) no se exigen: el cargador les da valor por defecto.
 OBLIGATORIAS = {
     "turnos.csv": ["id_turno", "municipio", "lv", "sabado", "domingo", "festivo",
@@ -197,8 +197,6 @@ def revisar_referencias(crudo: dict[str, list[dict]], inf: Informe) -> None:
         w = r["id_trab"]
         if (r.get("patron") or "").strip() and r["patron"] not in patrones:
             inf.error(f"trabajadores: {w} declara el patrón '{r['patron']}', que no existe")
-        if (r.get("linea") or "").strip() and r["linea"] not in turnos:
-            inf.error(f"trabajadores: {w} declara la línea '{r['linea']}', que no existe")
         muni = (r.get("municipio") or "").strip()
         if muni and muni not in municipios:
             inf.aviso(f"trabajadores: {w} es de '{muni}', que no está en calendarios_municipio.csv "
@@ -228,13 +226,8 @@ def revisar_contrato(crudo: dict[str, list[dict]], inf: Informe) -> None:
         tipo = r["tipo"].strip()
         if tipo not in TIPOS_TRAB:
             inf.error(f"trabajadores: {w} tiene tipo '{tipo}'; se espera uno de {TIPOS_TRAB}")
-        if tipo == "fijo" and not (r.get("linea") or "").strip():
-            inf.error(f"trabajadores: el fijo {w} no declara `linea`; su plaza se deriva de ahí "
-                      f"y sin ella no tiene ninguna capacidad")
         if tipo == "patron" and not (r.get("patron") or "").strip():
             inf.error(f"trabajadores: {w} es de patrón pero no dice cuál")
-        if tipo != "fijo" and (r.get("linea") or "").strip():
-            inf.aviso(f"trabajadores: {w} no es fijo pero declara `linea`; se ignora")
         if tipo != "patron" and (r.get("patron") or "").strip():
             inf.aviso(f"trabajadores: {w} no es de patrón pero declara `patron`; se ignora")
 
@@ -419,13 +412,13 @@ def revisar_viabilidad(inf: Informe) -> None:
     fechas = d.lista_dias_calendario
     inf.nota(f"horizonte: año {anio} (config.toml), objetivo {objetivo} h")
 
-    # grupos_rigidos es una declaración manual (empresa/convenio, ver libranzas.py): un id mal escrito
-    # o un patrón renombrado lo deja huérfano y la plaza pasaría a tratarse como flexible sin avisar.
-    grupos_validos = set(d.patrones) | {t.tipo for t in d.trabajadores.values()}
-    desconocidos = sorted(set(d.config.grupos_rigidos) - grupos_validos)
-    if desconocidos:
-        inf.error(f"config.toml: grupos_rigidos incluye {desconocidos}, que no es ningún patrón "
-                  f"ni tipo de trabajador conocido")
+    # Una sede mal escrita no rompe nada visible: sus rotativos se quedarían en su municipio sin
+    # avisar y las líneas de los pueblos sin plantilla propia (Peñafiel) saldrían sin cubrir.
+    municipios = {t.municipio for t in d.turnos.values()}
+    if d.config.sede and d.config.sede not in municipios:
+        inf.error(f"config.toml: sede='{d.config.sede}' no es ningún municipio de turnos.csv")
+    elif not d.config.sede and any(t.tipo == "rotativo" for t in d.trabajadores.values()):
+        inf.aviso("config.toml: sin `sede`, ningún rotativo sale de su municipio")
 
     # Los festivos tienen que ser del año que se resuelve; si no, el cuadrante sale con los
     # festivos de otro año y nada lo delata.

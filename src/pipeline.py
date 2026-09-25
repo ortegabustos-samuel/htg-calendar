@@ -3,24 +3,25 @@ pipeline.py — Punto de entrada del generador.
 
 Pasos.
 
-  A. Base         — patrones rotados y fijos en su línea L-V; vacaciones como ausencia
-  B. Libranzas    — ceder el exceso de horas, traspasando las plazas con cubridor designado
-  D. Residuo      — el ÚNICO CP-SAT anual: turno de cada correturno y finde de los ex-mixtos
-  E. Equidad      — iguala findes y festivos dentro de cada grupo
-
-El antiguo paso C (`forma.py`, franja y zona semanal del pool) ya no existe: su función se ha
-fundido dentro del propio CP-SAT del paso D, como nivel 4 del objetivo.
+  A. Base         — patrones reales (noches y UVI); vacaciones como ausencia
+  B. Libranzas    — los patrones ceden su exceso de horas a sus cubridores designados
+  S. Findes       — sábados, domingos y festivos repartidos como turnos, con cobertura antes que
+                    equidad por pool (findes.py)
+  F. Fijos        — CP-SAT anual de lunes a viernes: zona semanal y días de fijos y correturnos
+                    (los correturnos en el pool de su municipio, con la jornada de los fijos por
+                    delante), luego la línea (fijos.py)
 
 Uso:
     python3 src/pipeline.py
     python3 src/pipeline.py --segundos 300 --hilos 16
+    python3 src/pipeline.py --solo-findes        # para tras el reparto de findes, para validarlo
 """
 from __future__ import annotations
 
 import argparse
 import sys
 import salida
-import base, horas, legal, libranzas, findes, modelo
+import base, findes, fijos, horas, legal, libranzas
 from cargar_datos import cargar
 from datetime import date, timedelta
 from pathlib import Path
@@ -28,22 +29,23 @@ from pathlib import Path
 RAIZ = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 SALIDA = RAIZ / "data" / "output"
-PASOS = 7
+PASOS = 6
 
 
 def paso(n: int, texto: str) -> None:
-    """Marca de avance `[n/7] texto`. La interfaz (interfaz/ejecucion.py) la lee para la barra de
+    """Marca de avance `[n/6] texto`. La interfaz (interfaz/ejecucion.py) la lee para la barra de
     progreso; en la terminal sirve para saber por dónde va."""
     print(f"[{n}/{PASOS}] {texto}", flush=True)
 
 
 def main() -> int:
     p = argparse.ArgumentParser(description="Genera el cuadrante anual")
-    p.add_argument("--segundos", type=int, default=300,
-                   help="tiempo de solver por NIVEL del paso D. Son cinco niveles, así que el "
-                        "paso D tarda como mucho cinco veces esto")
+    p.add_argument("--segundos", type=int, default=120,
+                   help="tiempo de solver por NIVEL de cada CP-SAT (fijos y correturnos)")
     p.add_argument("--hilos", type=int, default=8, help="hilos del solver")
     p.add_argument("--log", action="store_true", help="log detallado del solver")
+    p.add_argument("--solo-findes", action="store_true",
+                   help="para tras el reparto de sábados, domingos y festivos y escribe el Excel")
     a = p.parse_args()
 
     paso(1, "Cargando datos")
@@ -53,27 +55,33 @@ def main() -> int:
           f"objetivo {datos.config.horas_objetivo} h/año")
     print(f"Rotación anclada al lunes {datos.primer_lunes:%d/%m/%Y}")
 
-    # -- Paso Base ------------------------------------------------------------- #
-    paso(2, "Esqueleto: patrones, fijos y vacaciones")
+    # -- Paso A ------------------------------------------------------------- #
+    paso(2, "Esqueleto: patrones reales y vacaciones")
     plan = base.construir(datos)
     libranzas.cubrir_vacaciones(datos, plan)
     libro = horas.LibroHoras.desde_plan(datos, plan)
 
-    # -- Paso F ------------------------------------------------------------- #
-    paso(3, "Reparto de fines de semana y festivos")
-    findes.repartir(datos, plan, libro)
-
     # -- Paso B ------------------------------------------------------------- #
-    paso(4, "Libranzas: ceder el exceso de horas")
+    paso(3, "Libranzas de los patrones")
     libranzas.ceder(datos, plan, libro)
 
-    # -- Paso D ------------------------------------------------------------- #
-    paso(5, "Solver anual (3 niveles)")
-    modelo.resolver(datos, plan, libro, segundos=a.segundos, hilos=a.hilos, log=a.log)
-    #Relleno de refuerzos
-    paso(6, "Refuerzos de calendario")
-    modelo.cambiar_refuerzos(datos, plan, libro, hilos=a.hilos)
-    paso(7, "Escribiendo el Excel")
+    # -- Paso S ------------------------------------------------------------- #
+    paso(4, "Sábados, domingos y festivos")
+    findes.repartir(datos, plan, libro, segundos=a.segundos, hilos=a.hilos, log=a.log)
+    if a.solo_findes:
+        paso(6, "Escribiendo el Excel")
+        salida.escribir_excel(datos, plan)
+        return 0
+
+    # -- Paso F ------------------------------------------------------------- #
+    paso(5, "Fijos y correturnos: lunes a viernes")
+    fijos.resolver(datos, plan, libro, segundos=a.segundos, hilos=a.hilos, log=a.log)
+    del_pool = {(w, f): s for (w, f), s in plan.items() if w in set(fijos.pool(datos))}
+    rotos = legal.integridad(datos, del_pool) + legal.infracciones(datos, del_pool)
+    print(f"  integridad y convenio de fijos y correturnos: {len(rotos)} incidencias"
+          + (f" (p.ej. {rotos[0]})" if rotos else ""))
+
+    paso(6, "Escribiendo el Excel")
     salida.escribir_excel(datos, plan)
     return 0
 
