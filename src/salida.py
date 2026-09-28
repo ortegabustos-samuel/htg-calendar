@@ -75,7 +75,7 @@ FILL_DESCANSO = {DS: "D9E1F2", DF: "E4DFEC", DO: "D9D9D9"}
 # PROVISIONAL, para validar la equidad a ojo: con VER_FRANJAS cada turno se pinta por la franja
 # de su línea (`Datos.franja`) en vez de por el tipo de día, y los findes y festivos van en
 # negrita. El tipo de día se sigue leyendo en la cabecera de la columna. Se quitará.
-VER_FRANJAS = True
+VER_FRANJAS = False
 FILL_FRANJA = {"mañana": "9BC2E6", "tarde": "F4B084", "partido": "A9D08E",
                "noche": "7030A0", "localizado": "B4A7D6"}
 

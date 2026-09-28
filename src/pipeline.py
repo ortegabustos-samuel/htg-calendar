@@ -14,7 +14,6 @@ Pasos.
 Uso:
     python3 src/pipeline.py
     python3 src/pipeline.py --segundos 300 --hilos 16
-    python3 src/pipeline.py --solo-findes        # para tras el reparto de findes, para validarlo
 """
 from __future__ import annotations
 
@@ -44,8 +43,6 @@ def main() -> int:
                    help="tiempo de solver por NIVEL de cada CP-SAT (fijos y correturnos)")
     p.add_argument("--hilos", type=int, default=8, help="hilos del solver")
     p.add_argument("--log", action="store_true", help="log detallado del solver")
-    p.add_argument("--solo-findes", action="store_true",
-                   help="para tras el reparto de sábados, domingos y festivos y escribe el Excel")
     a = p.parse_args()
 
     paso(1, "Cargando datos")
@@ -56,7 +53,7 @@ def main() -> int:
     print(f"Rotación anclada al lunes {datos.primer_lunes:%d/%m/%Y}")
 
     # -- Paso A ------------------------------------------------------------- #
-    paso(2, "Esqueleto: patrones reales y vacaciones")
+    paso(2, "Esqueleto: patrones y vacaciones")
     plan = base.construir(datos)
     libranzas.cubrir_vacaciones(datos, plan)
     libro = horas.LibroHoras.desde_plan(datos, plan)
@@ -68,10 +65,6 @@ def main() -> int:
     # -- Paso S ------------------------------------------------------------- #
     paso(4, "Sábados, domingos y festivos")
     findes.repartir(datos, plan, libro, segundos=a.segundos, hilos=a.hilos, log=a.log)
-    if a.solo_findes:
-        paso(6, "Escribiendo el Excel")
-        salida.escribir_excel(datos, plan)
-        return 0
 
     # -- Paso F ------------------------------------------------------------- #
     paso(5, "Fijos y correturnos: lunes a viernes")
