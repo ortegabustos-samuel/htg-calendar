@@ -27,7 +27,8 @@ DATA = Path(os.environ.get("HT_DATOS") or RAIZ / "data" / "input")
 DIAS = ["Lunes", "Martes", "Miercoles", "Jueves", "Viernes", "Sabado", "Domingo"]  # patrones.csv; índice = weekday()
 DS = "DS"
 DO = "DO"
-DESCANSOS = frozenset({DS, DO})      # celdas de patrón que significan "ese día no se trabaja"
+DF = "DF"                            # descanso por festivo trabajado: no viene de patrón, lo pone fijos.py
+DESCANSOS = frozenset({DS, DO, DF})  # celdas del plan que significan "ese día no se trabaja"
 
 
 def turno_de(plan, trabajador_id, fecha):

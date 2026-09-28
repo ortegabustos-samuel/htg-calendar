@@ -20,9 +20,9 @@ from __future__ import annotations
 import argparse
 import sys
 import salida
-import base, findes, fijos, horas, legal, libranzas
+import base, findes, fijos, horas, legal, libranzas, modelo
 from cargar_datos import cargar
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 RAIZ = Path(__file__).resolve().parents[1]
@@ -34,7 +34,7 @@ PASOS = 6
 def paso(n: int, texto: str) -> None:
     """Marca de avance `[n/6] texto`. La interfaz (interfaz/ejecucion.py) la lee para la barra de
     progreso; en la terminal sirve para saber por dónde va."""
-    print(f"[{n}/{PASOS}] {texto}", flush=True)
+    print(f"[{n}/{PASOS}] {texto}  ({datetime.now():%H:%M})", flush=True)
 
 
 def main() -> int:
@@ -43,7 +43,10 @@ def main() -> int:
                    help="tiempo de solver por NIVEL de cada CP-SAT (fijos y correturnos)")
     p.add_argument("--hilos", type=int, default=8, help="hilos del solver")
     p.add_argument("--log", action="store_true", help="log detallado del solver")
+    p.add_argument("--siembra", choices=("completa", "decision"), default="completa",
+                   help="qué se siembra entre niveles: todo lo ya clavado, o solo las decisiones")
     a = p.parse_args()
+    modelo.SIEMBRA = a.siembra
 
     paso(1, "Cargando datos")
     datos = cargar()

@@ -33,7 +33,7 @@ from ortools.sat.python import cp_model
 
 from cargar_datos import DESCANSOS, turno_de
 from fijos import descansa, descanso_con_lo_fijo, faltan, lineas_de_fijos, pool
-from modelo import decimas, lunes_de, optimizar, reparto, sembrar
+from modelo import decimas, lexicografico, lunes_de, nivel, reparto
 
 # Los festivos van primero: un sábado festivo tiene que estar ya repartido cuando llega su
 # domingo, o domingo_ok no deja a nadie hacerlo.
@@ -102,24 +102,13 @@ def reparto_de(datos, plan, libro, clase, segundos, hilos, log):
               <= decimas(libro.objetivo(w) - libro.horas(w)))
 
     # -- Niveles ------------------------------------------------------------ #
-    cubiertas = sum(x.values())
-    niveles = [("1 cobertura", cubiertas, True),
-               ("2 equidad", equidad(m, datos, plan, clase, por_trab), False)]
+    niveles = [nivel(m, "1 cobertura", lambda: sum(x.values()), True),
+               nivel(m, "2 equidad", lambda: equidad(m, datos, plan, clase, por_trab), False)]
     if clase == "DOM":
         repite = [v for (w, f, s), v in x.items() if plan.get((w, f - timedelta(days=1))) == s]
         if repite:
-            niveles.append(("3 misma línea que el sábado", sum(repite), True))
-
-    sol = None
-    for etiqueta, objetivo, maximizar in niveles:
-        if objetivo is None:
-            continue
-        sembrar(m, x, sol)
-        valor, nueva = optimizar(m, objetivo, maximizar, segundos, hilos, log, f"  {etiqueta}")
-        if valor is None:
-            break
-        m.Add(objetivo >= valor if maximizar else objetivo <= valor)
-        sol = nueva
+            niveles.append(nivel(m, "3 misma línea que el sábado", lambda: sum(repite), True))
+    sol = lexicografico(m, niveles, segundos, hilos, log, sangria="  ", decision=list(x.values()))
     if sol is None:
         print("    *** sin solución ***")
         return

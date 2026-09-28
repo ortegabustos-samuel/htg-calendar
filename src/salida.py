@@ -35,7 +35,7 @@ from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 from openpyxl.workbook.defined_name import DefinedName
 
-from cargar_datos import DESCANSOS, DO, Datos, turno_de
+from cargar_datos import DESCANSOS, DF, DO, DS, Datos
 
 RAIZ = Path(__file__).resolve().parents[1]
 SALIDA = Path(os.environ.get("HT_SALIDA") or RAIZ / "data" / "output")   # la interfaz la cambia por escenario
@@ -63,13 +63,11 @@ FILL_VAC_XL = "FFFF00"
 # asignados > demanda (sobra gente), rojo asignados < demanda (falta gente).
 FILL_COBERTURA_OK, FILL_COBERTURA_EXCESO, FILL_COBERTURA_FALTA = "C6EFCE", "FFEB9C", "FFC7CE"
 
-# Las tres clases de descanso que se rotulan en el cuadrante. Provisionales: el estilo está pensado
-# para distinguirlas de un vistazo (y del color de categoría del día), no para ser definitivo.
-#   DS — descanso semanal: hasta 2 días de descanso por semana ISO.
-#   DF — descanso festivo: uno por cada festivo trabajado, en el primer día libre posterior.
-#   DO — descanso obligatorio: el que da un turno de 24 h. NO se calcula aquí, viene en el plan
-#        desde el patrón y se hereda con el bloque; aquí solo se pinta.
-DS, DF = "DS", "DF"
+# Las tres clases de descanso que se rotulan en el cuadrante. Ninguna se calcula aquí: todas vienen
+# en el plan y aquí solo se pintan. El estilo es provisional, para distinguirlas de un vistazo.
+#   DS — descanso semanal: dos por semana ISO, nunca en festivo (del patrón, o de fijos.py).
+#   DF — descanso por festivo trabajado, en las semanas siguientes (fijos.py).
+#   DO — descanso obligatorio: el que da un turno de 24 h, del patrón o heredado con el bloque.
 FILL_DESCANSO = {DS: "D9E1F2", DF: "E4DFEC", DO: "D9D9D9"}
 
 # PROVISIONAL, para validar la equidad a ojo: con VER_FRANJAS cada turno se pinta por la franja
@@ -127,9 +125,9 @@ def _ajustar_anchos(ws, desde_fila: int = 1, saltar: set[int] | None = None,
 def _calendarios_festivos(datos: Datos) -> dict[str, set[date]]:
     """calendario -> fechas festivas EFECTIVAS (las comunes más las suyas). Es lo que mira
     `Datos.es_festivo`, resuelto de una vez para poder volcarlo como banderas por día."""
-    comun = datos.festivos.get("Nacional", set())
-    cals = {datos.calendario_municipio.get(t.municipio, t.municipio) for t in datos.turnos.values()}
-    return {c: comun | datos.festivos.get(c, set()) for c in sorted(cals)}
+    nacionales = datos.festivos.get("Nacional", set())
+    municipio = {datos.calendario_municipio.get(t.municipio, t.municipio) for t in datos.turnos.values()}
+    return {municipio: nacionales.union(datos.calendario_municipio.get(municipio,set()))} #Union festivos nacionales y municipio
 
 
 def _calendario_de(datos: Datos, turno: str) -> str:
@@ -187,66 +185,6 @@ def _cobertura(plan: dict[tuple[str, date], str]) -> dict[tuple[str, date], int]
     return contador
 
 
-def _etiquetas_descanso(datos: Datos, plan: dict[tuple[str, date], str]) -> dict[tuple[str, date], str]:
-    """(trabajador, fecha) -> DS | DF, para los días que el cuadrante deja libres.
-
-    No decide NADA de la planificación: reparte nombres sobre los descansos que ya hay.
-
-      * DS — hasta DOS por semana ISO. Si esa semana hay una pareja de días seguidos se cogen
-        esos, que es como se da el descanso semanal de verdad; si no los hay, se cogen los
-        sueltos que tenga, hasta dos.
-      * DF — uno por cada festivo trabajado, en el día libre más próximo que no sea ya DS:
-        primero se busca hacia delante y, si no queda año por delante, hacia atrás. Solo se
-        quedan sin colocar si esa persona no tiene NINGÚN día libre suelto (el caso de UVI, con
-        todos sus descansos marcados DO por el patrón).
-
-    El DO no se toca: ya viene en el plan desde el patrón (y heredado por el cubridor cuando
-    asume un bloque de 24 h), así que ni se calcula ni se pisa.
-    """
-    etiquetas: dict[tuple[str, date], str] = {}
-    fechas = datos.lista_dias_calendario
-
-    for trabajador_id in datos.trabajadores:
-        libres = [f for f in fechas
-                  if datos.disponible(trabajador_id, f)
-                  and (trabajador_id, f) not in plan]     # el DO sí está en el plan: queda fuera
-
-        # -- DS: hasta dos por semana ISO, prefiriendo la pareja consecutiva ------------------ #
-        por_semana: dict[tuple[int, int], list[date]] = {}
-        for f in libres:
-            por_semana.setdefault(f.isocalendar()[:2], []).append(f)
-
-        ds: set[date] = set()
-        for dias_libres in por_semana.values():
-            pareja = next(((a, b) for a, b in zip(dias_libres, dias_libres[1:])
-                           if (b - a).days == 1), None)
-            elegidos = list(pareja) if pareja else dias_libres[:2]
-            ds.update(elegidos)
-
-        for f in ds:
-            etiquetas[(trabajador_id, f)] = DS
-
-        # -- DF: uno por festivo trabajado, en el primer libre posterior que no sea DS -------- #
-        sobrantes = [f for f in libres if f not in ds]
-        festivos_trabajados = [f for f in fechas
-                               if (s := turno_de(plan, trabajador_id, f)) is not None
-                               and datos.tipo_dia(f, datos.turnos[s].municipio) == "FEST"]
-        for festivo in festivos_trabajados:
-            # El día libre más próximo POSTERIOR, que es la compensación natural. Si no queda
-            # ninguno vale uno ANTERIOR: lo que justifica el DF es haber trabajado el festivo, no
-            # el orden. Sin esta vuelta atrás, los festivos de diciembre se quedaban sin compensar
-            # simplemente porque no les quedaba año por delante.
-            hueco = next((f for f in sobrantes if f > festivo), None)
-            if hueco is None:
-                hueco = next((f for f in reversed(sobrantes) if f < festivo), None)
-            if hueco is None:
-                continue                                  # sin día libre donde descontarlo
-            sobrantes.remove(hueco)
-            etiquetas[(trabajador_id, hueco)] = DF
-
-    return etiquetas
-
-
 def escribir_excel(datos: Datos, plan: dict[tuple[str, date], str],
                       nombre: str = "calendario.xlsx") -> Path:
     """Vuelca el cuadrante a XLSX.
@@ -278,7 +216,7 @@ def escribir_excel(datos: Datos, plan: dict[tuple[str, date], str],
     # OJO: nada de forceFullCalc/calcOnSave — eso pide recalcular el libro ENTERO en cada pasada, no
     # solo lo que depende de la celda tocada, y con una hoja de este tamaño se nota mucho, se vuelve
     # lento editar. calcMode="auto" ya basta para que se refresque solo edición a edición.
-    wb.calculation.calcMode = "auto"
+    wb.calculation.calcMode = 'auto'
     wb.calculation.fullCalcOnLoad = True
     ws = wb.active
     ws.title = "Cuadrante"
@@ -348,7 +286,6 @@ def escribir_excel(datos: Datos, plan: dict[tuple[str, date], str],
     ws.row_dimensions[F_FECHA].height = 70
 
     muni = _municipio_trabajador(datos)
-    etiquetas = _etiquetas_descanso(datos, plan)
     fila_de: dict[str, int] = {}
     titulos: set[int] = {F_MES, F_FECHA}
     r = F_DIA + 1
@@ -362,10 +299,10 @@ def escribir_excel(datos: Datos, plan: dict[tuple[str, date], str],
             for j, d in enumerate(fechas):
                 c = ws.cell(r, COL_D0 + j)
                 c.alignment, c.border = centro, borde
-                # Descansos con nombre: el DO viene en el plan (del patrón, o heredado por el
-                # cubridor con el bloque) y DS/DF los reparte `_etiquetas_descanso`.
+                # Descansos con nombre: vienen todos en el plan. DS/DO del patrón (o heredados
+                # por el cubridor con el bloque), y DS/DF de fijos y correturnos (fijos.py).
                 en_plan = plan.get((trab, d))
-                etiqueta = en_plan if en_plan in DESCANSOS else etiquetas.get((trab, d))
+                etiqueta = en_plan if en_plan in DESCANSOS else None
 
                 if not datos.disponible(trab, d):
                     c.value, color = "V", FILL_VAC_XL

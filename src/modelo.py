@@ -24,7 +24,7 @@ sobrecubrir, C4 (descanso entre jornadas), C5 (dias por semana ISO), C6 (horas p
 semana ISO), la jornada anual y el descanso de fin de semana.
 """
 from collections import Counter, defaultdict
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from ortools.sat.python import cp_model
 
 import legal
@@ -355,25 +355,74 @@ def optimizar(modelo, expresion, maximizar, segundos, hilos, log, etiqueta):
     solver.parameters.log_search_progress = log
     estado = solver.Solve(modelo)
     if estado not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-        print(f"  nivel {etiqueta}: {solver.StatusName(estado)}")
+        print(f"  nivel {etiqueta}: {solver.StatusName(estado)} ({solver.WallTime():.0f}s)"
+              f"  [{datetime.now():%H:%M}]", flush=True)
         return None, None
     valor = int(round(solver.ObjectiveValue()))
-    print(f"  nivel {etiqueta}: {valor}  ({solver.StatusName(estado)}, {solver.WallTime():.0f}s)")
+    print(f"  nivel {etiqueta}: {valor}  ({solver.StatusName(estado)}, {solver.WallTime():.0f}s)"
+          f"  [{datetime.now():%H:%M}]", flush=True)
     return valor, solver
 
 
-def sembrar(modelo, x, solucion):
+def sembrar(modelo, solucion, hasta=None):
     """Arranca el siguiente nivel desde la solucion del anterior.
 
-    No es un truco de rendimiento: con la cobertura ya clavada en su optimo, encontrar
+    No es un truco de rendimiento: con los niveles anteriores ya clavados, encontrar
     CUALQUIER solucion valida desde cero es durisimo, y la del nivel anterior ya esta
     dentro de la region.
+
+    Se siembran las variables del modelo por orden de creacion hasta `hasta`: las de
+    decision y las auxiliares de los niveles YA clavados (deficits, contadores,
+    desviaciones), que con muchos niveles clavados el solver no conseguia deducir solo
+    (Valladolid, rotacion: UNKNOWN en 300 s). Las del nivel que se optimiza y las de los
+    siguientes NO: en la solucion anterior valen cualquier cosa, porque aun no contaban,
+    y sembrarlas arranca el nivel desde su peor punto.
     """
     if solucion is None:
         return
     modelo.ClearHints()
-    for var in x.values():
+    n = min(len(modelo.Proto().variables), len(solucion.ResponseProto().solution))
+    if hasta is not None:
+        n = min(n, hasta)
+    for i in range(n):
+        var = modelo.GetIntVarFromProtoIndex(i)
         modelo.AddHint(var, solucion.Value(var))
+
+
+def nivel(modelo, etiqueta, construir, maximizar):
+    """Un nivel del objetivo lexicografico: (etiqueta, expresion, maximizar, primera variable
+    propia). Se anota cuantas variables tenia el modelo ANTES de construir la expresion,
+    que es lo que separa las auxiliares de este nivel de las anteriores (ver `sembrar`)."""
+    inicio = len(modelo.Proto().variables)
+    return etiqueta, construir(), maximizar, inicio
+
+
+# Qué se siembra entre niveles: "completa" = decision + auxiliares de los niveles ya clavados
+# (ver `sembrar`); "decision" = solo las variables de decision, como antes. Lo fija el pipeline.
+SIEMBRA = "completa"
+
+
+def lexicografico(modelo, niveles, segundos, hilos, log, sangria="", decision=()):
+    """Resuelve los niveles en orden: cada uno se clava como restriccion antes del siguiente
+    y se siembra con la solucion del anterior. Si un nivel no encuentra solucion no se clava
+    y se sigue con el siguiente. Devuelve la ultima solucion, o None si no hubo ninguna.
+    `decision` son las variables de decision, para la siembra "decision"."""
+    sol = None
+    for etiqueta, objetivo, maximizar, inicio in niveles:
+        if objetivo is None:
+            continue
+        if SIEMBRA == "decision" and sol is not None:
+            modelo.ClearHints()
+            for var in decision:
+                modelo.AddHint(var, sol.Value(var))
+        else:
+            sembrar(modelo, sol, hasta=inicio)
+        valor, nueva = optimizar(modelo, objetivo, maximizar, segundos, hilos, log, sangria + etiqueta)
+        if valor is None:
+            continue
+        modelo.Add(objetivo >= valor if maximizar else objetivo <= valor)
+        sol = nueva
+    return sol
 
 
 def volcar(datos, plan, libro, x, solucion):
@@ -595,7 +644,7 @@ def resolver(datos, plan, libro, segundos=300, hilos=8, log=False):
     # -- Nivel 2: equidad de horas -------------------------------------------- #
     objetivo = equidad_horas(modelo, datos, x, por_trab, pool, libro)
     if objetivo is not None:
-        sembrar(modelo, x, solucion)
+        sembrar(modelo, solucion)
         valor, sol = optimizar(modelo, objetivo, False, segundos, hilos, log, "2 equidad de horas")
         if valor is not None:
             modelo.Add(objetivo <= valor)
@@ -604,7 +653,7 @@ def resolver(datos, plan, libro, segundos=300, hilos=8, log=False):
     # -- Nivel 3: forma semanal ----------------------------------------------- #
     objetivo = forma_semanal(modelo, datos, x, semanas, pool)
     if objetivo is not None:
-        sembrar(modelo, x, solucion)
+        sembrar(modelo, solucion)
         valor, sol = optimizar(modelo, objetivo, False, segundos, hilos, log, "3 forma semanal")
         if valor is not None:
             solucion = sol

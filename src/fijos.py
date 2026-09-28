@@ -33,21 +33,28 @@ Dos fases:
 La guardia LOCALIZADA no da forma a la semana: se suma a la semana que toque, como hacía el patrón
 de Medina (una semana de mañanas y descansos con la guardia del fin de semana).
 
-Restricciones duras: un turno al día, no sobrecubrir, C4 (optimista por casilla, exacto en la
+Restricciones duras: un turno al día, no sobrecubrir, descanso semanal, C4 (optimista por casilla, exacto en la
 fase de líneas), C5, C6, domingo_ok, descanso de fin de semana y el TECHO de la jornada anual.
 
 Objetivo LEXICOGRÁFICO, cada nivel clavado antes del siguiente y sembrado con el anterior:
 
+  0. compensación de festivos: cada festivo trabajado se devuelve con un día libre más en las
+     SEMANAS_COMPENSACION semanas siguientes. Va delante de todo para que funcione como
+     obligatoria sin volver el modelo infactible si en algún caso no cabe (semanas heredadas)
   1. cobertura
   2. jornada de los fijos: la suma de déficits contra el objetivo, para llevarlos a todos lo más
      cerca posible del límite (el máximo solo se conforma con que nadie pase del peor)
   3. jornada de los fijos: el mayor déficit, para que lo que falte se reparta
   4. jornada de los correturnos: el mayor déficit, repartiendo entre ellos lo que sobre
-  5..8 equidad del número de semanas de cada tipo entre los fijos, dentro de cada municipio y sin
+  5. descanso semanal seguido: semanas en que los dos días libres van juntos
+  6..9 equidad del número de semanas de cada tipo entre los fijos, dentro de cada municipio y sin
      contar las que tienen finde: partido > tarde > noche > mañana
-  9. rotación: no encadenar semanas DURAS (tarde, partido o noche); la mañana rompe la racha. Con
+  10. rotación: no encadenar semanas DURAS (tarde, partido o noche); la mañana rompe la racha. Con
      los recuentos ya fijados por la equidad, solo reordena las semanas de cada uno
-  10. semanas con finde rellenas de mañana
+  11. semanas con finde rellenas de mañana
+
+Descanso semanal (duro): cada semana ISO, al menos DOS días libres que no sean festivo. El festivo
+no trabajado no es descanso semanal, y el trabajado es un día de trabajo más.
 """
 from __future__ import annotations
 
@@ -56,14 +63,18 @@ from datetime import date, timedelta
 
 from ortools.sat.python import cp_model
 
-from cargar_datos import DESCANSOS, turno_de
-from modelo import decimas, lunes_de, optimizar, reparto, sembrar
+from cargar_datos import DESCANSOS, DF, DS, turno_de
+from modelo import decimas, lexicografico, lunes_de, nivel, reparto
 
 # Orden de los niveles de equidad. Hardcodeado a propósito: se ajustará cuando se sepa qué pesa más.
 EQUIDAD = ("partido", "tarde", "noche", "mañana")
 # Semanas que queman si se encadenan. La de mañana es la que rompe la racha.
 DURAS = ("tarde", "partido", "noche")
 LOCALIZADO = "localizado"
+# Días libres por semana ISO, sin contar festivos, y semanas que hay para devolver un festivo
+# trabajado con un día libre más. La ventana es provisional: "próxima", sin cifra de la empresa.
+LIBRES_SEMANA = 2
+SEMANAS_COMPENSACION = 4
 
 
 def pool(datos):
@@ -118,6 +129,7 @@ class Modelo:
         self.m = cp_model.CpModel()
         self.gente = gente
         self.faltan = faltan(datos, plan, lineas_de_fijos(datos))
+        self.de_patron = {c for filas in datos.patrones.values() for fila in filas for c in fila.values()}
 
         # opciones[(w, f)][k] = líneas de la casilla k que puede hacer ese día. Vale también la
         # vía excepcional (v>=1): así el cubridor designado cubre la línea especial de un fijo.
@@ -203,8 +215,38 @@ class Modelo:
                         self.m.AddBoolOr([self.y[(w, f, k1)].Not(),
                                           self.y[(w, f + timedelta(days=1), k2)].Not()])
 
+    def es_festivo(self, w, f):
+        return self.datos.tipo_dia(f, self.datos.trabajadores[w].municipio) == "FEST"
+
+    def heredado(self, w, f):
+        """Un día que ya trae en el plan un turno de patrón (ciclo heredado por un cubridor)."""
+        return turno_de(self.plan, w, f) in self.de_patron
+
+    def cuenta_como_libre(self, w, f):
+        """Un día puede ser descanso (DS o DF) si está dentro del año y no es festivo ni
+        vacaciones. Fuera del año no: el cuadrante no llega ahí para darlo."""
+        return (self.datos.inicio <= f <= self.datos.fin and not self.es_festivo(w, f)
+                and self.datos.disponible(w, f))
+
+    def libre(self, w, f):
+        """1 si ese día es descanso, 0 si no: expresión del modelo, o int si ya está decidido."""
+        return 1 - self.trabaja(w, f) if self.cuenta_como_libre(w, f) else 0
+
+    def libres(self, w, fechas):
+        return sum(self.libre(w, f) for f in fechas)
+
+    def libres_posibles(self, w, fechas):
+        """Los libres que tendría sin trabajar nada nuevo: los que no ha ocupado ya el plan."""
+        return sum(1 for f in fechas if self.cuenta_como_libre(w, f) and turno_de(self.plan, w, f) is None)
+
+    def con_vacaciones(self, w, fechas):
+        """Semana partida, por vacaciones o por el principio o el final del año: no se le exige
+        el descanso semanal."""
+        return any(not (self.datos.inicio <= f <= self.datos.fin) or not self.datos.disponible(w, f)
+                   for f in fechas)
+
     def semanas(self):
-        """C5, C6, domingo_ok y descanso de fin de semana, por semana ISO."""
+        """C5, C6, descanso semanal, domingo_ok y descanso de fin de semana, por semana ISO."""
         datos, cfg = self.datos, self.datos.config
         for w in self.gente:
             muni = datos.trabajadores[w].municipio
@@ -215,6 +257,11 @@ class Modelo:
                     continue
                 previos = [s for s in (turno_de(self.plan, w, f) for f in fechas) if s is not None]
                 self.m.Add(sum(v for _, v in mios) <= cfg.dias_max_semana - len(previos))      # C5
+                # Descanso semanal: dos libres que no sean festivo ni vacaciones, salvo en semanas
+                # partidas por vacaciones. Si lo que ya trae el plan (un ciclo heredado) no los
+                # deja, se tolera: solo se le prohíbe añadir más.
+                if not self.con_vacaciones(w, fechas):
+                    self.m.Add(self.libres(w, fechas) >= min(LIBRES_SEMANA, self.libres_posibles(w, fechas)))
                 self.m.Add(sum(k[2] * v for k, v in mios)                                      # C6
                            <= decimas(cfg.horas_max_semana - sum(datos.turnos[s].horas for s in previos)))
                 if datos.tipo_dia(fechas[6], muni) == "DOM" and (w, fechas[6]) in self.por_dia:
@@ -222,11 +269,14 @@ class Modelo:
                 self.descanso_finde(w, fechas)
 
     def descanso_finde(self, w, fechas):
-        """Sábado Y domingo trabajados → un par de días seguidos libres entre semana."""
+        """Sábado Y domingo trabajados → un par de días seguidos libres entre semana. No se exige
+        en semanas partidas por vacaciones."""
         sab, dom = self.trabaja(w, fechas[5]), self.trabaja(w, fechas[6])
         if (isinstance(sab, int) and sab == 0) or (isinstance(dom, int) and dom == 0):
             return
-        libres = [1 - self.trabaja(w, f) for f in fechas[:5]]
+        if self.con_vacaciones(w, fechas):
+            return
+        libres = [self.libre(w, f) for f in fechas[:5]]
         pares = []
         for a, b, f in zip(libres, libres[1:], fechas):
             if isinstance(a, int) and isinstance(b, int):
@@ -285,6 +335,73 @@ class Modelo:
                 pares.append(par)
         return sum(pares) if pares else None
 
+    def compensacion(self):
+        """Festivos trabajados sin compensar. Por cada semana, el `extra` son los libres (nunca
+        festivo ni vacaciones) por encima de LIBRES_SEMANA; en una semana partida por vacaciones,
+        donde no hay descanso semanal que reservar, todos sus libres. Cada festivo trabajado pide un extra en las SEMANAS_COMPENSACION
+        siguientes, y como varios festivos pueden compartir semanas, se exige para cada tramo de
+        semanas con festivos (Hall): festivos del tramo <= extras de sus ventanas juntas + holgura.
+        Los festivos de un ciclo heredado no cuentan: vienen con el descanso de su patrón.
+        Crea las variables en el modelo base; el nivel 0 minimiza la holgura."""
+        lunes_todos = sorted({lunes_de(f) for f in self.datos.lista_dias_calendario})
+        self.sin_compensar = []
+        for w in self.gente:
+            extra, festivos = {}, {}
+            for lunes in lunes_todos:
+                fechas = [lunes + timedelta(days=i) for i in range(7)]
+                posibles = self.libres_posibles(w, fechas)
+                reserva = 0 if self.con_vacaciones(w, fechas) else LIBRES_SEMANA
+                e = self.m.NewIntVar(0, 7, f"extra_{w}_{lunes:%m%d}")
+                if posibles > reserva:
+                    self.m.Add(e <= self.libres(w, fechas) - reserva)
+                else:
+                    self.m.Add(e == 0)
+                extra[lunes] = e
+                trabajados = [self.trabaja(w, f) for f in fechas
+                              if self.es_festivo(w, f) and not self.heredado(w, f)]
+                if any(not isinstance(t, int) or t for t in trabajados):
+                    festivos[lunes] = sum(trabajados)
+            semanas = sorted(festivos)
+            for i, a in enumerate(semanas):
+                for b in semanas[i:]:
+                    ventana = [l for l in lunes_todos
+                               if a < l <= b + timedelta(weeks=SEMANAS_COMPENSACION)]
+                    if not ventana:
+                        continue                # última semana del año: no hay dónde devolverlo
+                    h = self.m.NewIntVar(0, 7 * len(semanas), f"sin_comp_{w}_{a:%m%d}_{b:%m%d}")
+                    self.m.Add(sum(festivos[l] for l in semanas if a <= l <= b)
+                               <= sum(extra[l] for l in ventana) + h)
+                    self.sin_compensar.append(h)
+
+    def descanso_seguido(self):
+        """Semanas en que la persona tiene dos días libres seguidos, sin contar festivos, dentro
+        de la semana ISO. Solo las semanas en que el modelo decide algo."""
+        seguidas = []
+        semanas = defaultdict(set)
+        for (w, f) in self.por_dia:
+            semanas[w].add(lunes_de(f))
+        for w, lunes_de_w in semanas.items():
+            for lunes in lunes_de_w:
+                fechas = [lunes + timedelta(days=i) for i in range(7)]
+                if self.con_vacaciones(w, fechas):
+                    continue
+                libres = [self.libre(w, f) for f in fechas]
+                pares = []
+                for a, b in zip(libres, libres[1:]):
+                    if isinstance(a, int) and isinstance(b, int):
+                        pares.append(a * b)
+                        continue
+                    p = self.m.NewBoolVar("")
+                    self.m.Add(p <= a)
+                    self.m.Add(p <= b)
+                    pares.append(p)
+                if all(isinstance(p, int) for p in pares):
+                    continue
+                junta = self.m.NewBoolVar(f"seguido_{w}_{lunes:%m%d}")
+                self.m.Add(junta <= sum(pares))
+                seguidas.append(junta)
+        return sum(seguidas) if seguidas else None
+
     def findes_de_manana(self):
         """Semanas con finde cuyo lunes a viernes es de mañana."""
         vs = [z for (w, lunes, zn), z in self.z.items() if zn[1] == "mañana" and self.con_finde(w, lunes)]
@@ -314,33 +431,26 @@ class Modelo:
         self.descanso()
         self.semanas()
         self.jornada()
+        self.compensacion()
         print(f"  {len(self.gente)} personas · {sum(self.faltan.values())} plazas · "
               f"{len(self.y)} casillas · {len(self.z)} zonas")
 
-        variables = {**self.y, **self.z}
-        cubiertas = sum(self.y.values())
-        # (etiqueta, expresión, maximizar)
-        niveles = [("1 cobertura", cubiertas, True),
-                   ("2 jornada fijos, suma de déficits (décimas)", self.suma_deficit("fijo"), False),
-                   ("3 jornada fijos, peor déficit (décimas)", self.peor_deficit("fijo"), False),
-                   ("4 jornada correturnos, peor déficit (décimas)", self.peor_deficit("correturno"), False)]
-        niveles += [(f"{5 + i} equidad semanas de {fr}", self.equidad(fr), False)
+        m = self.m
+        niveles = [nivel(m, "0 festivos sin compensar",
+                         lambda: sum(self.sin_compensar) if self.sin_compensar else None, False),
+                   nivel(m, "1 cobertura", lambda: sum(self.y.values()), True),
+                   nivel(m, "2 jornada fijos, suma de déficits (décimas)", lambda: self.suma_deficit("fijo"), False),
+                   nivel(m, "3 jornada fijos, peor déficit (décimas)", lambda: self.peor_deficit("fijo"), False),
+                   nivel(m, "4 jornada correturnos, peor déficit (décimas)", lambda: self.peor_deficit("correturno"), False)]
+        niveles.append(nivel(m, "5 descanso semanal seguido", self.descanso_seguido, True))
+        niveles += [nivel(m, f"{6 + i} equidad semanas de {fr}", lambda fr=fr: self.equidad(fr), False)
                     for i, fr in enumerate(EQUIDAD)]
-        niveles.append(("9 rotación: semanas duras encadenadas", self.rotacion(), False))
-        niveles.append(("10 semanas con finde de mañana", self.findes_de_manana(), True))
-        sol = None
-        for etiqueta, objetivo, maximizar in niveles:
-            if objetivo is None:
-                continue
-            sembrar(self.m, variables, sol)
-            valor, nueva = optimizar(self.m, objetivo, maximizar, segundos, hilos, log, etiqueta)
-            if valor is None:
-                if sol is None:
-                    return None
-                break
-            self.m.Add(objetivo >= valor if maximizar else objetivo <= valor)
-            sol = nueva
-
+        niveles.append(nivel(m, "10 rotación: semanas duras encadenadas", self.rotacion, False))
+        niveles.append(nivel(m, "11 semanas con finde de mañana", self.findes_de_manana, True))
+        sol = lexicografico(m, niveles, segundos, hilos, log,
+                            decision=[*self.y.values(), *self.z.values()])
+        if sol is None:
+            return None
         return {(w, f): k for (w, f, k), v in self.y.items() if sol.Value(v)}
 
 
@@ -407,6 +517,73 @@ def asignar_lineas(datos, plan, libro, casillas, opciones, pendientes, hilos):
     return sueltos
 
 
+# --------------------------------------------------------------------------- #
+#  Fase 3: los descansos, con nombre
+# --------------------------------------------------------------------------- #
+def senalar_descansos(datos, plan, gente):
+    """Escribe en el plan los DS y DF de cada persona, con las mismas reglas con que el modelo
+    los ha garantizado. Devuelve los festivos que se quedan sin DF.
+
+      * DS — LIBRES_SEMANA por semana ISO, nunca en festivo: la pareja seguida si la hay (la más
+        cercana al fin de semana) y si no, los sueltos. Los DS/DO que ya trae el plan (ciclos
+        heredados) cuentan para el cupo.
+      * DF — uno por festivo trabajado, en un libre que sobre en las SEMANAS_COMPENSACION
+        semanas siguientes. Se colocan en orden de fecha y cada uno en la primera semana que
+        tenga sitio, que es como se resuelve sin fallos un reparto de ventanas así.
+
+    Los libres que sobren después de eso quedan en blanco.
+
+    En una semana partida por vacaciones no se reserva descanso semanal: primero van los DF y,
+    con lo que quede, hasta LIBRES_SEMANA DS. Ni DS ni DF caen nunca en vacaciones."""
+    de_patron = {c for filas in datos.patrones.values() for fila in filas for c in fila.values()}
+    lunes_todos = sorted({lunes_de(f) for f in datos.lista_dias_calendario})
+    sin_df = 0
+
+    def elegir_ds(libres, cupo):
+        """La pareja seguida más cercana al fin de semana si hace falta más de uno; si no, los
+        últimos sueltos."""
+        parejas = [(a, b) for a, b in zip(libres, libres[1:]) if (b - a).days == 1]
+        if cupo >= 2 and parejas:
+            return list(parejas[-1])
+        return libres[-cupo:] if cupo else []
+
+    for w in gente:
+        muni = datos.trabajadores[w].municipio
+        festivo = lambda f: datos.tipo_dia(f, muni) == "FEST"
+        sobrantes, cupos, partidas = {}, {}, set()
+        for lunes in lunes_todos:
+            fechas = [lunes + timedelta(days=i) for i in range(7)]
+            dentro = [f for f in fechas if datos.inicio <= f <= datos.fin]
+            libres = [f for f in dentro if not festivo(f) and datos.disponible(w, f) and (w, f) not in plan]
+            ya = sum(1 for f in fechas if not festivo(f) and plan.get((w, f)) in (DS, "DO"))
+            cupos[lunes] = max(0, LIBRES_SEMANA - ya)
+            if len(dentro) < 7 or any(not datos.disponible(w, f) for f in dentro):
+                partidas.add(lunes)                     # sus DS se ponen después de los DF
+                sobrantes[lunes] = libres
+                continue
+            ds = elegir_ds(libres, cupos[lunes])
+            for f in ds:
+                plan[(w, f)] = DS
+            sobrantes[lunes] = [f for f in libres if f not in ds]
+
+        trabajados = sorted(f for f in datos.lista_dias_calendario if festivo(f)
+                            and (s := turno_de(plan, w, f)) is not None and s not in de_patron)
+        for f in trabajados:
+            lunes = lunes_de(f)
+            ventana = [l for l in lunes_todos
+                       if lunes < l <= lunes + timedelta(weeks=SEMANAS_COMPENSACION) and sobrantes[l]]
+            if not ventana:
+                sin_df += 1
+                continue
+            dia = sobrantes[ventana[0]].pop(0)
+            plan[(w, dia)] = DF
+
+        for lunes in partidas:
+            for f in elegir_ds(sobrantes[lunes], cupos[lunes]):
+                plan[(w, f)] = DS
+    return sin_df
+
+
 def resolver(datos, plan, libro, segundos=120, hilos=8, log=False):
     """Coloca a fijos y correturnos de lunes a viernes, municipio a municipio y el de los
     correturnos el último. Modifica plan y libro."""
@@ -425,6 +602,9 @@ def resolver(datos, plan, libro, segundos=120, hilos=8, log=False):
         sueltos = asignar_lineas(datos, plan, libro, casillas, modelo.opciones, dict(modelo.faltan), hilos)
         print(f"  asignados {len(casillas) - sueltos} días"
               + (f" · {sueltos} sin línea compatible (C4)" if sueltos else ""))
+        sin_df = senalar_descansos(datos, plan, grupos[muni])
+        if sin_df:
+            print(f"  {sin_df} festivos trabajados sin DF en las {SEMANAS_COMPENSACION} semanas siguientes")
         # La jornada se mira en el libro, ya con las líneas puestas: es la que de verdad queda.
         for tipo in ("fijo", "correturno"):
             suyos = [w for w in grupos[muni] if datos.trabajadores[w].tipo == tipo]
