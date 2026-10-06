@@ -1,523 +1,185 @@
 """
-cargar_datos.py — Capa de carga de datos del generador de cuadrantes.
+cargar_datos.py — Lee los ficheros de entrada y construye los objetos del dominio.
 
-Lee config.toml y los 6 CSV de data/input/, deriva lo que el generador necesita (duración,
-intervalo real, franja, localizado, operatividad) y expone consultas:
-  * opera(turno, fecha)          — ¿la línea opera ese día? (festivo manda sobre día de semana)
-  * disponible(trab, fecha)      — ¿no está de vacaciones?
-  * tipo_dia(fecha, municipio)   — LV / SAB / DOM / FEST
-  * elegible(trab, turno, fecha) — (elegible?, es_refuerzo?)  a partir de capacidades
+PROVISIONAL: lee los CSV que hay hoy en data/input. Cuando se sepa de dónde vienen los datos de
+verdad, se cambia este fichero y nada más: el resto del programa solo conoce `dominio.py`.
 
-Base sobre la que se apoya todo el generador. Ejecutado como script imprime un resumen y
-comprobaciones de la instancia cargada.
+Ejecutado como script imprime un resumen de lo cargado.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field, fields
-from datetime import date, datetime, timedelta , time
-from pathlib import Path
 import csv
 import os
 import tomllib
+from collections import defaultdict
+from datetime import date, datetime, timedelta
+from pathlib import Path
+
+from dominio import (ZONAS, Datos, Franja, Patron, Restriccion, TipoDia, TipoTrabajador,
+                     Trabajador, Turno)
 
 RAIZ = Path(__file__).resolve().parents[1]
 # La interfaz (interfaz/app.py) apunta aquí la carpeta de cada escenario; sin ella, data/input.
 DATA = Path(os.environ.get("HT_DATOS") or RAIZ / "data" / "input")
 
-DIAS = ["Lunes", "Martes", "Miercoles", "Jueves", "Viernes", "Sabado", "Domingo"]  # patrones.csv; índice = weekday()
-DS = "DS"
-DO = "DO"
-DF = "DF"                            # descanso por festivo trabajado: no viene de patrón, lo pone fijos.py
-DESCANSOS = frozenset({DS, DO, DF})  # celdas del plan que significan "ese día no se trabaja"
+DIAS = ["Lunes", "Martes", "Miercoles", "Jueves", "Viernes", "Sabado", "Domingo"]  # columnas de patrones.csv
 
 
-def turno_de(plan, trabajador_id, fecha):
-    """El TURNO DE TRABAJO que hace ese día, o None si lo que tiene es un descanso.
-
-    El plan lleva también los descansos etiquetados (DO). Eso es deliberado y tiene dos efectos
-    que NO hay que confundir:
-
-      * OCUPA el día, igual que un turno. Por eso se mete en el plan: así el solver, las cesiones
-        y los traspasos lo respetan sin tener que saber qué es, y un DO heredado llega intacto al
-        final. Para esa pregunta se sigue usando `(trab, fecha) in plan`, que ya lo blinda.
-      * NO es trabajo: no computa horas, no ocupa plaza de ninguna línea y no cuenta para los
-        topes del convenio. Para esa pregunta se usa ESTA función, que devuelve el mismo `None`
-        que se recibía cuando el día venía vacío.
-    """
-    valor = plan.get((trabajador_id, fecha))
-    return None if valor in DESCANSOS else valor
-
-# --------------------------------------------------------------------------- #
-#  Estructuras del dominio
-# --------------------------------------------------------------------------- #
-@dataclass
-class Turno:
-    id: str             #Id del turno (lo suponemos único)
-    municipio: str      #Municipio en el que opera el turno
-    lv: int             #Flag que indica si se trabaja de lunes a viernes 0/1
-    sab: int            #Flag que indica si se trabaja de sabados 0/1
-    dom: int            #Flag que indica si se trabaja de domingos 0/1
-    fes: int            #Flag que indica si se trabaja de festivos 0/1
-    hora_entrada: time  #Hora de entrada del turno
-    hora_salida: time   #Hora de salida del turno
-    dem: int            #Demanda del turno
-    horas: float        # horas de computo
+def _leer(nombre: str) -> list[dict[str, str]]:
+    with open(DATA / nombre, encoding="utf-8", newline="") as archivo:
+        return list(csv.DictReader(archivo))
 
 
-@dataclass
-class Trabajador:
-    id: str                         #Nif único
-    nombre: str                     # nombre y apellidos, solo para la salida a Excel
-    tipo: str                       # fijo | patron | correturno
-    patron: str | None              # id del patrón (solo tipo=patron: noches y UVI)
-    vacaciones: list[tuple[date, date]] #Lista con tupla (inicio_vacaciones,fin_vacaciones)
-    municipio: str = ""             # zona a la que pertenece: define con quien compite en equidad
-    factor_jornada: float = 1.0     # reducción de jornada: escala el objetivo anual. 1.0 = jornada completa
-    fila_inicial: int | None = None  # solo tipo=patron: fila de `patrones.csv` que hace en la PRIMERA
-                                    # semana del horizonte.
+def _hora(texto: str):
+    return datetime.strptime(texto.strip(), "%H:%M").time()
 
 
-@dataclass(frozen=True)             #El uso de forzen impide que se modifique el propio objeto Config (logico la configuracion no deberia modificarse)
-class Config:
-    """
-    Parámetros de la INSTANCIA (`config.toml`): qué año se resuelve y bajo qué convenio.
-    `anio` es obligatorio en config.toml: el horizonte lo declaran los datos, no se deduce.
-    """
-    anio: int                    # Anio sobre el que estamos haciendo el calendario
-    horas_objetivo: int   # jornada anual objetivo (h): techo de todo lo que no sea cubrir
-    descanso_minimo: int                # descanso mínimo entre jornadas (h)              -> C4
-    horas_max_semana: int             # máx. horas en cualquier ventana de 7 días       -> C6
-    dias_max_semana: int                # máx. días trabajados por semana ISO             -> C5
+def _fecha(texto: str) -> date:
+    return datetime.strptime(texto.strip(), "%d/%m/%Y").date()
 
-@dataclass
-class Capacidad:
-    lv: int                         #Trabaja de lunes a viernes flag 0/1
-    sab: int                        #Trabaja los sabados flag 0/1
-    dom: int                        #Trabaja los domingos flag 0/1
-    fest: int                       #Trabaja los festivos flag 0/1
-    v: int                          # Cobertura excepcional, con ORDEN de preferencia:
-                                    #   0 = no es cubridor de esta línea (capacidad normal)
-                                    #   1 = cubridor PRINCIPAL 
-                                    #   2, 3… = suplentes, por orden: solo entran si el principal no
-                                    #           puede (vacaciones, ya ocupado, descanso obligado).
-                                    # El orden es una preferencia BLANDA (ver _preferencia_cubridor):
-                                    # nunca deja una línea sin cubrir por respetarlo.
-
-
-@dataclass
-class Datos:
-    turnos: dict[str, Turno]                       # Lista con nombre de turno y su objeto turno correspondiente
-    trabajadores: dict[str, Trabajador]            # Lista con nif del trabajador y su objeto trabajador
-    calendario_municipio: dict[str, str]           # municipio -> calendario de festivos
-    festivos: dict[str, set[date]]                 # ambito(calendario) -> fechas
-    capacidades: dict[tuple[str, str], Capacidad]  # (id_trab, id_turno) -> flags
-    patrones: dict[str, list[dict[str, str]]]      # patron -> [ {weekday: turno|DS} ]
-    offsets: dict[str, int] = field(default_factory=dict)  # trabajador de patrón -> fila de arranque
-                                                   # (ver `offsets_patron`). Lo deriva `cargar()`.
-    config: Config = field(default_factory=Config)  # año y parámetros del convenio (config.toml)
-
-    # -- Horizonte -------------------------------------------------------- #
-    # El cuadrante es SIEMPRE el año natural de config.toml, así que no se pasa por parámetro.
-    @property
-    def inicio(self) -> date:
-        return date(self.config.anio, 1, 1)
-
-    @property
-    def fin(self) -> date:
-        return date(self.config.anio, 12, 31)
-
-    @property
-    def lista_dias_calendario(self) -> list[date]:
-        """Días del año, del 1 de enero al 31 de diciembre."""
-        return [self.inicio + timedelta(days=i) for i in range((self.fin - self.inicio).days + 1)]
-
-    @property
-    def primer_lunes(self) -> date:
-        """Lunes desde el que se cuentan las semanas de la rotación"""
-        return self.inicio - timedelta(days=self.inicio.weekday())    
-
-    # -- Consultas derivadas ------------------------------------------------- #
-    def es_festivo(self, fecha: date, municipio: str) -> bool:
-        """Retorna true si esa fecha es festivo en ese municipio"""
-        calendario = self.calendario_municipio.get(municipio, municipio)
-        return fecha in self.festivos.get("Nacional", set()) or fecha in self.festivos.get(calendario, set())
-
-    def tipo_dia(self, fecha: date, municipio: str) -> str:
-        """Devuelve el tipo de dia en LV | SAB | DOM | FEST """
-        if self.es_festivo(fecha, municipio):
-            return "FEST"
-        dia_semana = fecha.weekday()
-        return "LV" if dia_semana < 5 else "SAB" if dia_semana == 5 else "DOM"
-
-    def opera(self, turno_id: str, fecha: date) -> bool:
-        """Devuelve si opera el turno en esa fecha teniendo en cuenta municipio y dias semana"""
-        turno = self.turnos[turno_id]
-        if self.es_festivo(fecha, turno.municipio):
-            return turno.fes == 1
-        dia_semana = fecha.weekday()
-        return (turno.lv if dia_semana < 5 else turno.sab if dia_semana == 5 else turno.dom) == 1
-
-    def intervalo(self, turno_id: str, fecha: date) -> tuple[datetime, datetime]:
-        """ Metodo que retorna el objeto datetime de inicio y datetime de fin, su finalidad es detectar aquellos turnos
-        que trascurren pasada las 0:00 con el objetivo de medir correctamente descansos"""
-        turno = self.turnos[turno_id]
-        inicio = datetime.combine(fecha, turno.hora_entrada)
-        fin = datetime.combine(fecha, turno.hora_salida)
-        if fin <= inicio:
-            fin += timedelta(days=1)
-        return inicio, fin
-
-    def franja(self, turno_id: str) -> str:
-        """Tramo del día en que se trabaja: mañana | partido | tarde | noche | localizado. Es la
-        unidad de estabilidad semanal de un titular: toda la semana en la misma franja.
-
-        El partido es el que dura más de reloj de lo que computa (10 h con 2 de interrupción), y
-        un turno que entra de tarde sigue siendo de tarde aunque acabe a medianoche."""
-        turno = self.turnos[turno_id]
-        if self.localizado(turno_id):
-            return "localizado"
-        if turno.hora_entrada.hour >= 21:
-            return "noche"
-        if self.duracion(turno_id) > turno.horas:
-            return "partido"
-        return "mañana" if turno.hora_entrada.hour < 13 else "tarde"
-
-    def localizado(self, turno_id: str) -> bool:
-        """Guardia de LOCALIZACIÓN: 24 h de reloj (entrada = salida) que computan 8. No es
-        presencia física sino disponibilidad, así que no ocupa el día siguiente por eso los
-        patrones la encadenan con otros turnos sin contradicción.
-        """
-        return self.duracion(turno_id) == 24
-
-    def duracion(self, turno_id: str) -> float:
-        """Horas REALES que dura el turno de reloj a reloj. No es lo mismo que `Turno.horas`, que
-        son las computadas por convenio (el partido y el de 24 h computan 8)"""
-        inicio, fin = self.intervalo(turno_id, date(2000, 1, 1))
-        return (fin - inicio).total_seconds() / 3600
-
-    def disponible(self, trab_id: str, fecha: date) -> bool:
-        """Devuelve si el trabajador esta disponible en esa fecha en base a sus vacaciones"""
-        return not any(ini <= fecha <= fin for ini, fin in self.trabajadores[trab_id].vacaciones)
-
-    def elegible(self, trab_id: str, turno_id: str, fecha: date) -> tuple[bool, bool]:
-        """Devuelve (elegible, es_refuerzo)
-        Solo si la línea opera y el trabajador está disponible.
-        Normal si su capacidad cubre el tipo de día, si no, de refuerzo si tiene v=1.
-        """
-        if not self.opera(turno_id, fecha) or not self.disponible(trab_id, fecha):
-            return (False, False)
-        cap = self.capacidades.get((trab_id, turno_id))
-        if cap is None:
-            return (False, False)
-        td = self.tipo_dia(fecha, self.turnos[turno_id].municipio)
-        normal = {"LV": cap.lv, "SAB": cap.sab, "DOM": cap.dom, "FEST": cap.fest}[td] == 1
-        if normal:
-            return (True, False)
-        if cap.v >= 1:          # cubridor: principal (v=1) o suplente (v>=2); el orden lo pesa el modelo
-            return (True, True)
-        return (False, False)
-
-
-# --------------------------------------------------------------------------- #
-#  Carga: una función por fichero
-# --------------------------------------------------------------------------- #
 
 def _cargar_turnos() -> dict[str, Turno]:
+    columnas = {TipoDia.LV: "lv", TipoDia.SABADO: "sabado", TipoDia.DOMINGO: "domingo",
+                TipoDia.FESTIVO: "festivo"}
     turnos = {}
-    with open(DATA / "turnos.csv", mode="r", encoding="utf-8",newline="") as archivo:
-        lector = csv.DictReader(archivo)
-        for fila in lector:
-            hora_entrada = datetime.strptime(fila["hora_entrada"].strip(),"%H:%M").time()
-            hora_salida = datetime.strptime(fila["hora_salida"].strip(),"%H:%M").time()
-            horas = float(fila["horas_computadas"].strip())
-            crudo_dem = (fila.get("dem") or "").strip()
-            turnos[fila["id_turno"]] = Turno(
-                id=fila["id_turno"],
-                municipio=fila["municipio"],
-                lv=int(fila["lv"]),
-                sab=int(fila["sabado"]),
-                dom=int(fila["domingo"]),
-                fes=int(fila["festivo"]),
-                hora_entrada=hora_entrada,
-                hora_salida=hora_salida,
-                dem=int(crudo_dem) if crudo_dem else 1,
-                horas=horas,
-            )
+    for fila in _leer("turnos.csv"):
+        turnos[fila["id_turno"]] = Turno(
+            id_turno=fila["id_turno"],
+            base=fila["municipio"],
+            franja=Franja(fila["franja"].strip().lower()),
+            hora_entrada=_hora(fila["hora_entrada"]),
+            hora_salida=_hora(fila["hora_salida"]),
+            dias={tipo for tipo, columna in columnas.items() if fila[columna] == "1"},
+            minutos_computo=round(float(fila["horas_computadas"]) * 60),
+            ayudante=fila.get("ayudante") == "1",
+        )
     return turnos
 
 
 def _cargar_trabajadores() -> dict[str, Trabajador]:
     trabajadores = {}
-    with open(DATA / "trabajadores.csv", mode="r", encoding="utf-8",newline="") as archivo:
-        lector = csv.DictReader(archivo)
-        for fila in lector:
-            vac1 = datetime.strptime(fila["vac1_inicio"].strip(), "%d/%m/%Y").date()
-            vac2 = datetime.strptime(fila["vac2_inicio"].strip(), "%d/%m/%Y").date()
-
-            # factor_jornada: columna OPCIONAL (default 1.0). Reducción de jornada -> (0,1].
-            crudo = (fila.get("factor_jornada") or "").strip().replace(",", ".")
-            factor = float(crudo) if crudo else 1.0
-            if not (0 < factor <= 1):
-                raise ValueError(
-                    f"factor_jornada de {fila['id_trab']} fuera de rango (0,1]: {factor}"
-                )
-
-            # fila_inicial: columna OPCIONAL (solo tipo=patron). Vacía -> None: el offset se deduce
-            # del orden dentro del grupo, como se hacía antes de existir la columna.
-            crudo_fila = (fila.get("fila_inicial") or "").strip()
-            if crudo_fila:
-                try:
-                    fila_inicial = int(crudo_fila)
-                except ValueError:
-                    raise ValueError(
-                        f"fila_inicial de {fila['id_trab']} no es un entero: '{crudo_fila}'"
-                    ) from None
-                if fila_inicial < 0:
-                    raise ValueError(
-                        f"fila_inicial de {fila['id_trab']} es negativa ({fila_inicial})"
-                    )
-            else:
-                fila_inicial = None
-
-            trabajadores[fila["id_trab"]] = Trabajador(
-                id=fila["id_trab"],
-                tipo=fila["tipo"],
-                patron=(fila.get("patron") or "").strip() or None,
-                municipio=(fila.get("municipio") or "").strip(),
-                vacaciones = [(vac1, vac1 + timedelta(days=14)),(vac2, vac2 + timedelta(days=14))],
-                factor_jornada=factor,
-                fila_inicial=fila_inicial,
-                nombre=(fila.get("nombre") or "").strip(),
-            )
+    for fila in _leer("trabajadores.csv"):
+        if fila["tipo"].strip() == TipoTrabajador.PATRON.value and not fila["fila_inicial"].strip():
+            raise ValueError(f"trabajadores.csv: {fila['id_trab']} es de patrón y no tiene fila_inicial")
+        vacaciones = [_fecha(fila["vac1_inicio"]), _fecha(fila["vac2_inicio"])]
+        trabajadores[fila["id_trab"]] = Trabajador(
+            id=fila["id_trab"],
+            nombre=fila["nombre"].strip(),
+            tipo=TipoTrabajador(fila["tipo"].strip()),
+            patron=fila["patron"].strip() or None,
+            vacaciones=[(inicio, inicio + timedelta(days=14)) for inicio in vacaciones],
+            base=fila["municipio"].strip(),
+            fila_inicial=int(fila["fila_inicial"]) if fila["fila_inicial"].strip() else None,
+        )
     return trabajadores
 
 
-def _cargar_calendarios() -> dict[str, str]:
+def _cargar_patrones() -> dict[str, Patron]:
+    filas = defaultdict(list)
+    for fila in _leer("patrones.csv"):
+        filas[fila["patron"]].append((int(fila["fila"]), [fila[dia] for dia in DIAS]))
+    return {patron: Patron(patron, [celdas for _, celdas in sorted(lista)])
+            for patron, lista in filas.items()}
+
+
+def _cargar_festivos(bases: set[str]) -> dict[str, set[date]]:
+    """base -> sus festivos: los nacionales más los del calendario que sigue esa base."""
+    calendario = {fila["municipio"]: fila["calendario_festivos"] for fila in _leer("calendarios_municipio.csv")}
+    por_ambito = defaultdict(set)
+    for fila in _leer("festivos.csv"):
+        por_ambito[fila["ambito"].strip()].add(_fecha(fila["fecha"]))
+    return {base: por_ambito["Nacional"] | por_ambito[calendario.get(base, base)] for base in bases}
+
+
+def _aplicar_capacidades(turnos: dict[str, Turno], trabajadores: dict[str, Trabajador]) -> None:
+    """capacidades.csv: una fila por (trabajador, línea).
+
+      * v >= 1                       -> cubridor de esa línea, en orden de v
+      * v = 0 y lv = 1               -> titular de esa línea
+      * v = 0 y solo sab/dom/fest    -> puede hacer esa línea esos días: esos días, solo las
+                                        líneas que tenga así declaradas (una Restriccion)
     """
-    Cargar calendarios permite un mapping de municipio al calendario de festivos que sigue
-    Iscar -> Valladolid
-    Medina -> Medina
-    Peñafiel -> Valladolid
-    """
-    calendario = {}
-    with open(DATA / "calendarios_municipio.csv", mode="r", encoding="utf-8",newline="") as archivo:
-        lector = csv.DictReader(archivo)
-        for fila in lector:
-            calendario[fila["municipio"]] = fila["calendario_festivos"]
-    return calendario
+    columnas = {TipoDia.SABADO: "sab", TipoDia.DOMINGO: "dom", TipoDia.FESTIVO: "fest"}
+    capacidad = defaultdict(lambda: defaultdict(set))       # trabajador -> tipo de día -> líneas
+    for fila in sorted(_leer("capacidades.csv"), key=lambda f: (int(f["v"]), f["id_trab"])):
+        trabajador_id, turno = fila["id_trab"], turnos[fila["id_turno"]]
+        if int(fila["v"]) >= 1:
+            if trabajador_id not in turno.cubridores:
+                turno.cubridores.append(trabajador_id)
+        elif fila["lv"] == "1":
+            if trabajador_id not in turno.titulares:
+                turno.titulares.append(trabajador_id)
+        else:
+            for tipo, columna in columnas.items():
+                if fila[columna] == "1":
+                    capacidad[trabajador_id][tipo].add(fila["id_turno"])
+    for trabajador_id, por_dia in capacidad.items():
+        for tipo, lineas in por_dia.items():
+            trabajadores[trabajador_id].restricciones.append(Restriccion({tipo}, lineas=lineas))
 
 
-def _cargar_festivos() -> dict[str, set[date]]:
-    """
-    Festivos es de la forma diccionario con key y valor un set:
-    Nacional = (01/01/2026, 24/12/2026..)
-    Valladolid = (13/05/2026,08/09/2026)
-    """
-    festivos = {}
-    with open(DATA / "festivos.csv", mode="r", encoding="utf-8",newline="") as archivo:
-        lector = csv.DictReader(archivo)
-        for fila in lector:
-            ambito = fila["ambito"].strip()
-            festivos.setdefault(ambito, set()).add(datetime.strptime(fila["fecha"].strip(), "%d/%m/%Y").date())
-    return festivos
-
-
-def _cargar_capacidades() -> dict[tuple[str, str], Capacidad]:
-    capacidades = {}
-    with open(DATA / "capacidades.csv", mode="r", encoding="utf-8",newline="") as archivo:
-        lector = csv.DictReader(archivo)
-        for fila in lector:
-            capacidades[(fila["id_trab"], fila["id_turno"])] = Capacidad(
-            lv=int(fila["lv"]),
-            sab=int(fila["sab"]),
-            dom=int(fila["dom"]),
-            fest=int(fila["fest"]),
-            v=int(fila["v"]),
-        )
-    return capacidades
-
-
-def _cargar_config() -> Config:
-    """Lee `config.toml`. Los parámetros del convenio son opcionales (caen a los defaults); `anio`
-    no. Que los valores tengan sentido lo dice `validar_datos.py`, como con los CSV."""
-    ruta = DATA / "config.toml"
-    valores: dict[str, object] = {}
-    if ruta.is_file():
-        with open(ruta, "rb") as archivo:              # tomllib exige binario
-            datos = tomllib.load(archivo)
-        campos = {f.name for f in fields(Config)}
-        for seccion, variable in datos.items():
-            if not isinstance(variable, dict):
-                raise ValueError(f"config.toml: '{seccion}' está suelto; todo va dentro de una "
-                                 f"sección ([horizonte], [jornada], [convenio])")
-            for clave, valor in variable.items():
-                if clave not in campos:
-                    raise ValueError(f"config.toml: '{clave}' (en [{seccion}]) no es un parámetro; "
-                                     f"los que hay son {sorted(campos)}")
-                if valor is None:
-                    raise ValueError(f"config.toml: {clave}={valor!r} debería ser un valor")
-                valores[clave] = valor
-    return Config(**valores)                            # type: ignore[arg-type]
-
-
-def _cargar_patrones() -> dict[str, list[dict[str, str]]]:
-    sin_ordenar = {}
-    with open(DATA / "patrones.csv", mode="r", encoding="utf-8",newline="") as archivo:
-        lector = csv.DictReader(archivo)
-        for fila in lector:
-            semana = {dia: fila[dia] for dia in DIAS}
-            sin_ordenar.setdefault(fila["patron"], []).append((int(fila["fila"]), semana))
-
-    patrones = {}
-    for patron, filas in sin_ordenar.items():
-        filas.sort()                                  # por índice de fila
-        patrones[patron] = [semana for _, semana in filas]
-    return patrones
-
-
-def _anadir_capacidades_patron(
-    trabajadores: dict[str, Trabajador],
-    patrones: dict[str, list[dict[str, str]]],
-    turnos: dict[str, Turno],
-    capacidades: dict[tuple[str, str], Capacidad],
-) -> int:
-    """
-    Deriva las capacidades de los trabajadores de patron a partir de la estructura del patrón y
-    las introduce en el conjunto de capacidades.
-    """
-    # Turnos (excluye DS y cualquier celda vacía) que rota cada patrón.
-    turnos_por_patron: dict[str, set[str]] = {}
-    for patron_id, filas_patron in patrones.items():
-        rotados = {turno for fila in filas_patron for turno in fila.values()
-                   if turno and turno not in DESCANSOS and turno in turnos}
-        turnos_por_patron[patron_id] = rotados
-
-    anadidas = 0
-    for trabajador_id, trabajador in trabajadores.items():
-        if trabajador.tipo != "patron" or not trabajador.patron:
-            continue
-        for turno_id in turnos_por_patron.get(trabajador.patron, ()):
-            if (trabajador_id, turno_id) not in capacidades:               # respeta lo que ya venga del CSV
-                capacidades[(trabajador_id, turno_id)] = Capacidad(lv=1, sab=1, dom=1, fest=1, v=0) #Suponemos que puede hacer cualquier dia ese turno
-                anadidas += 1
-    return anadidas
-
-
-def _anadir_capacidades_fijo(
-    trabajadores: dict[str, Trabajador],
-    turnos: dict[str, Turno],
-    capacidades: dict[tuple[str, str], Capacidad],
-    patrones: dict[str, list[dict[str, str]]],
-) -> int:
-    """Un FIJO sin nada declarado puede hacer cualquier línea con demanda de su municipio, salvo
-    las de cobertura especial (alguien con v>=1) y las que cubre un patrón. Lo que declare en
-    capacidades.csv vale sea del municipio que sea: así se cubre un pueblo sin plantilla propia.
-
-    Si en capacidades.csv tiene alguna fila con un flag lv/sab/dom/fest, SOLO puede lo declarado y
-    no se deriva nada: es el caso del fijo con una línea L-V. Las filas solo-v (flags a 0) son
-    cobertura excepcional: se quedan como vienen y no restringen. Devuelve el nº de capacidades
-    añadidas."""
-    especiales = {turno for (_, turno), cap in capacidades.items() if cap.v >= 1}
-    de_patron = {celda for filas in patrones.values() for fila in filas for celda in fila.values()}
-    con_filas_restrictivas = {trab for (trab, _), cap in capacidades.items()
-                              if cap.lv or cap.sab or cap.dom or cap.fest}
-
-    anadidas = 0
-    for trabajador_id, trabajador in trabajadores.items():
-        if trabajador.tipo != "fijo" or trabajador_id in con_filas_restrictivas:
-            continue
-        for turno_id, turno in turnos.items():
-            if turno.dem <= 0 or turno_id in especiales or turno_id in de_patron:
-                continue
-            if turno.municipio != trabajador.municipio:
-                continue
-            if (trabajador_id, turno_id) not in capacidades:
-                capacidades[(trabajador_id, turno_id)] = Capacidad(lv=1, sab=1, dom=1, fest=1, v=0)
-                anadidas += 1
-    return anadidas
-
-
-def _anadir_capacidades_correturno(
-    trabajadores: dict[str, Trabajador],
-    turnos: dict[str, Turno],
-    capacidades: dict[tuple[str, str], Capacidad],
-) -> int:
-    """Un CORRETURNO puede hacer cualquier línea: esa es su función. En vez de enumerarle 67 filas
-    una a una, se derivan todas, y en `capacidades.csv` solo se declaran sus EXCEPCIONES.
-    
-    Las filas explícitas MANDAN sobre lo derivado, por si hiciera falta declarar una excepción.
-    Devuelve el nº de capacidades añadidas."""
-    # Orden más alto ya declarado en cada línea (0 = nadie designado para ella)
-    orden_max: dict[str, int] = {}
-    for (_, turno), cap in capacidades.items():
-        if cap.v >= 1:
-            orden_max[turno] = max(orden_max.get(turno, 0), cap.v)
-
-    anadidas = 0
-    for trabajador_id, trabajador in trabajadores.items():
-        if trabajador.tipo != "correturno":
-            continue
-        for turno in turnos:
-            if (trabajador_id, turno) in capacidades:            # excepción declarada: manda ella, prevalece algo designado
-                continue
-            if orden_max.get(turno):                 # línea con designados: no es para el, debe ceder su capacidad
-                continue
-            capacidades[(trabajador_id, turno)] = Capacidad(lv=1, sab=1, dom=1, fest=1, v=0)
-            anadidas += 1
-    return anadidas
-
-
-def offsets_patron(
-    trabajadores: dict[str, Trabajador],
-    patrones: dict[str, list[dict[str, str]]],
-) -> dict[str, int]:
-    """Fila de la rotación en que arranca cada trabajador de patrón: {id_trab -> offset}.
-    Cada anio tenemos que los trabajadores de patron deben adaptarse al fin de la semana que hizo en 
-    el cuadrante anterior, esto puede venir implicito en los datos o bien que se asigne automaticamente por 
-    orden alfabetico, aunque por defecto suele ser indicarlo
-    """
-    grupos: dict[str, list[str]] = {}
-    for trabajador_id, trabajador in trabajadores.items():
-        if trabajador.tipo == "patron" and trabajador.patron:
-            grupos.setdefault(trabajador.patron, []).append(trabajador_id)
-
-    offsets: dict[str, int] = {}
-    for patron_id, lista_trabajadores_id in grupos.items():
-        T = len(patrones.get(patron_id) or ())
-        if not T:
-            continue                                   # patrón sin filas: no hay rotación que anclar
-        for orden, trabajador_id in enumerate(sorted(lista_trabajadores_id)):
-            declarada = trabajadores[trabajador_id].fila_inicial
-            offsets[trabajador_id] = (declarada if declarada is not None else orden) % T
-    return offsets
+def _aplicar_restricciones(turnos: dict[str, Turno], trabajadores: dict[str, Trabajador]) -> None:
+    """restricciones.csv: una fila por restricción. `dias` y `lineas` separados por `|`.
+    `lineas` vacío = sin límite de líneas; NINGUNA = ninguna línea. `desde`/`hasta` vacíos = sin
+    ventana horaria. Si el fichero no está, nadie tiene restricciones de este tipo."""
+    if not (DATA / "restricciones.csv").exists():
+        return
+    for fila in _leer("restricciones.csv"):
+        texto = fila["lineas"].strip()
+        if texto == "NINGUNA":
+            lineas = set()
+        elif texto:
+            lineas = set(texto.split("|"))
+            desconocidas = lineas - turnos.keys()
+            if desconocidas:
+                raise ValueError(f"restricciones.csv: {fila['id_trab']} cita líneas que no existen: {sorted(desconocidas)}")
+        else:
+            lineas = None
+        if fila["id_trab"] not in trabajadores:
+            raise ValueError(f"restricciones.csv: el trabajador {fila['id_trab']} no existe")
+        trabajadores[fila["id_trab"]].restricciones.append(Restriccion(
+            dias={TipoDia(dia) for dia in fila["dias"].split("|")},
+            lineas=lineas,
+            desde=_hora(fila["desde"]) if fila["desde"].strip() else None,
+            hasta=_hora(fila["hasta"]) if fila["hasta"].strip() else None,
+        ))
 
 
 def cargar() -> Datos:
+    with open(DATA / "config.toml", "rb") as archivo:
+        config = tomllib.load(archivo)
     turnos = _cargar_turnos()
     trabajadores = _cargar_trabajadores()
-    capacidades = _cargar_capacidades()
-    patrones = _cargar_patrones()
-    # Capacidades de los trabajadores de patrón: derivadas de la estructura del patrón (no están en
-    # capacidades.csv porque esa info ya vive en patrones.csv).
-    _anadir_capacidades_patron(trabajadores, patrones, turnos, capacidades)
-    config = _cargar_config()
-    # Fijos sin nada declarado: todo su municipio menos lo especial y
-    # lo de patrón. Los que declaran filas se quedan con lo declarado.
-    _anadir_capacidades_fijo(trabajadores, turnos, capacidades, patrones)
-    # Correturnos: pueden con cualquier línea, así que se derivan todas; en las que tienen cubridor
-    # designado entran como último recurso. Va DESPUÉS para ver los órdenes ya declarados.
-    _anadir_capacidades_correturno(trabajadores, turnos, capacidades)
+    _aplicar_capacidades(turnos, trabajadores)
+    _aplicar_restricciones(turnos, trabajadores)
+    bases = {t.base for t in turnos.values()} | {t.base for t in trabajadores.values()}
     return Datos(
+        anio=config["horizonte"]["anio"],
+        zona=ZONAS[config["horizonte"]["zona"]],
         turnos=turnos,
         trabajadores=trabajadores,
-        calendario_municipio=_cargar_calendarios(),
-        festivos=_cargar_festivos(),
-        capacidades=capacidades,
-        patrones=patrones,
-        # Fila de arranque de cada trabajador de patrón: `fila_inicial` si la declara, orden
-        # alfabético si no. Única fuente para todo lo que prescribe la rotación.
-        offsets=offsets_patron(trabajadores, patrones),
-        # Año y parámetros del convenio (config.toml). Única fuente: todas las etapas, la salida
-        # y el validador leen de aquí.
-        config=config,
+        patrones=_cargar_patrones(),
+        festivos=_cargar_festivos(bases),
     )
+
+
+if __name__ == "__main__":
+    datos = cargar()
+    print(f"{DATA}\nZona {datos.zona.nombre} · año {datos.anio} · {len(datos.turnos)} turnos · "
+          f"{len(datos.trabajadores)} trabajadores · {len(datos.patrones)} patrones")
+    for base, festivos in sorted(datos.festivos.items()):
+        print(f"  festivos de {base}: {len(festivos)}")
+    print("Restricciones:")
+    for t in datos.trabajadores.values():
+        for r in t.restricciones:
+            lineas = "" if r.lineas is None else f" solo {', '.join(sorted(r.lineas)) or 'ninguna'}"
+            horario = (f" de {r.desde:%H:%M} a {r.hasta:%H:%M}" if r.desde or r.hasta else "")
+            print(f"  {t.id} {'/'.join(d.value for d in r.dias)}:{lineas}{horario}")
+    print("Ficha de líneas: titulares → cubridores → pool")
+    for turno_id, turno in datos.turnos.items():
+        pool = datos.pools[turno_id]
+        fijos = sum(1 for w in pool if datos.trabajadores[w].tipo == TipoTrabajador.FIJO)
+        print(f"  {turno_id:10} {turno.base:10} {turno.hora_entrada:%H:%M}-{turno.hora_salida:%H:%M} "
+              f"{'/'.join(d.value for d in sorted(turno.dias, key=lambda d: list(TipoDia).index(d))):24} "
+              f"tit [{', '.join(turno.titulares)}] → cub [{', '.join(turno.cubridores)}] → "
+              f"pool {fijos} fijos + {len(pool) - fijos} correturnos")

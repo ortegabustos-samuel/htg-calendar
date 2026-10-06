@@ -1,0 +1,1258 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[spanish,es-noshorthands]{babel}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage[margin=2.5cm]{geometry}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage[hidelinks]{hyperref}
+\usepackage{tikz}
+\usetikzlibrary{positioning,arrows.meta,fit,backgrounds,patterns,decorations.pathreplacing,calc}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\floatname{algorithm}{Algoritmo}
+\algrenewcommand\algorithmicfor{\textbf{para}}
+\algrenewcommand\algorithmicdo{\textbf{hacer}}
+\algrenewcommand\algorithmicwhile{\textbf{mientras}}
+\algrenewcommand\algorithmicif{\textbf{si}}
+\algrenewcommand\algorithmicthen{\textbf{entonces}}
+\algrenewcommand\algorithmicelse{\textbf{si no}}
+\algrenewcommand\algorithmicend{\textbf{fin}}
+\algrenewcommand\algorithmicrequire{\textbf{Entrada:}}
+\algrenewcommand\algorithmicensure{\textbf{Salida:}}
+\algrenewcommand\algorithmiccomment[1]{\hfill\(\triangleright\) #1}
+
+\newtheorem{definicion}{Definición}
+\newcommand{\Dias}{\mathcal{D}}
+\newcommand{\Sem}{\mathcal{S}}
+\newcommand{\Bases}{\mathcal{B}}
+\newcommand{\Lin}{\mathcal{L}}
+\newcommand{\Trab}{\mathcal{W}}
+\newcommand{\Tipos}{\mathcal{T}}
+\newcommand{\Franjas}{\Phi}
+\newcommand{\Desc}{\mathcal{R}}
+
+\title{Generador de cuadrantes anuales\\[0.3em]
+       \large Modelo matemático y algoritmo}
+\author{}
+\date{Octubre de 2026}
+
+\begin{document}
+\maketitle
+
+% =========================================================================== %
+\section{Resumen}
+% =========================================================================== %
+
+El generador construye el \emph{cuadrante anual} de una zona de transporte sanitario no urgente:
+para cada trabajador y cada día del año, qué turno hace o qué descanso tiene. Parte de tres
+fuentes de datos: el \emph{plan funcional} (las líneas que hay que cubrir, con sus horarios y los
+días en que operan), la \emph{plantilla} (quién trabaja, con sus vacaciones y condiciones) y el
+\emph{calendario} de festivos de cada base.
+
+Un cuadrante válido tiene que cumplir el convenio colectivo (descanso mínimo entre jornadas,
+tope de días y de horas por semana, jornada anual) y las reglas de organización de la zona
+(descanso semanal y fines de semana). Entre todos los
+cuadrantes válidos se busca, por este orden de prioridad:
+\begin{enumerate}[nosep]
+  \item La máxima \textbf{cobertura} de las plazas del plan funcional
+  \item Que cada trabajador quede lo más cerca posible de su \textbf{jornada anual}, para optimizar su uso
+  \item Un reparto \textbf{equitativo} de los turnos duros (noches, tardes, partidos) y de los
+        fines de semana
+  \item Conseguir una \textbf{rotación} reconocible: semanas estables, sin repetir seguidas las mismas
+        semanas duras.
+\end{enumerate}
+
+El problema completo, planteado como un único modelo de optimización, es demasiado grande para
+resolverse con garantías en un tiempo razonable, ya fue intentado al comienzo, y, además, sería difícil de explicar. Por eso pensé en
+\textbf{descomponer en pasos}, cada uno de los cuales parte del cuadrante que deja el anterior y lo
+completa:
+\begin{itemize}[nosep]
+  \item Por un lado los pasos \emph{deterministas} colocan lo que ya viene decidido o lo que se reparte bien
+        por turnos (los patrones pactados, sus cesiones, los fines de semana y festivo)
+  \item Los pasos de \emph{optimización} (modelos de programación con restricciones, CP-SAT)
+        deciden lo que de verdad necesita una visión global del año: las semanas de lunes a
+        viernes de la plantilla fija y de los correturnos. Aunque se ha considerado usar una version greedy.
+\end{itemize}
+Cada paso respeta lo que dejaron los anteriores como constante, y todos comparten la misma
+definición de las restricciones legales.
+
+% =========================================================================== %
+\section{El problema y la notación}
+% =========================================================================== %
+
+\subsection{El calendario}
+
+Sea $\Dias$ el conjunto de días del año y $\Sem$ el de sus semanas ISO (de lunes a domingo) para
+cada día $d$, $s(d) \in \Sem$ es su semana. Sea $\Bases$ el conjunto de \emph{bases} (los
+municipios desde los que se opera). Cada base $b$ tiene su conjunto de festivos
+$F_b \subseteq \Dias$, que incluye los nacionales y los de su calendario local.
+
+\begin{definicion}[Tipo de día]
+Para una base $b$, el tipo del día $d$ es
+\[
+  \tau_b(d) =
+  \begin{cases}
+    \mathrm{FES} & \text{si } d \in F_b \text{ es festivo}\\
+    \mathrm{LV}  & \text{si } d \notin F_b \text{ y } d \text{ es de lunes a viernes},\\
+    \mathrm{SAB} & \text{si } d \notin F_b \text{ y } d \text{ es sábado},\\
+    \mathrm{DOM} & \text{si } d \notin F_b \text{ y } d \text{ es domingo},
+  \end{cases}
+\]
+con $\Tipos = \{\mathrm{LV}, \mathrm{SAB}, \mathrm{DOM}, \mathrm{FES}\}$. El festivo manda sobre
+el día de la semana: un sábado festivo es de tipo $\mathrm{FES}$.
+\end{definicion}
+
+\subsection{Las líneas}
+
+Una \emph{línea} $l \in \Lin$ es un turno del plan funcional que se repite todos los días en que
+opera. Cada línea tiene:
+\begin{itemize}[nosep]
+  \item Su base $b(l) \in \Bases$ y los tipos de día en que opera, $O(l) \subseteq \Tipos$
+  \item Su horario: hora de entrada y de salida. Para un día $d$, su intervalo real es
+        $[\,\mathrm{ini}_l(d), \mathrm{fin}_l(d)\,)$, que acaba al día siguiente si la salida
+        no es posterior a la entrada (las noches)
+  \item Su franja $\varphi(l) \in \Franjas = \{\text{mañana}, \text{tarde}, \text{noche},
+        \text{partido}, \text{localizado}\}$ vienen definido en los datos
+  \item Los minutos que computa para la jornada, $m(l) \in \mathbb{N}$ (no siempre coinciden con
+        la duración del horario: un partido tiene una interrupción, y una guardia localizada de
+        24~h computa 8h) el uso de minutos es para facilitar operaciones evitando punto flotante.
+  \item Las personas que pide cada día, $p(l) \in \{1\}$ (por ahora solo he tratado turnos de 1).
+\end{itemize}
+La línea $l$ \emph{opera} el día $d$ si $\tau_{b(l)}(d) \in O(l)$, y entonces pide $p(l)$
+personas ese día.
+
+\subsection{La plantilla}
+
+El conjunto de trabajadores $\Trab$ se divide en tres tipos:
+\[
+  \Trab = \Trab_{\mathrm{pat}} \;\cup\; \Trab_{\mathrm{fij}} \;\cup\; \Trab_{\mathrm{cor}},
+\]
+\begin{itemize}[nosep]
+  \item \textbf{De patrón}: siguen una rotación pactada semana a semana (en la zona estudiada,
+        las noches y las UVI)
+  \item \textbf{Fijos}: trabajan en las líneas de su base o pertenecen al conjunto global que debe seguir una rotación en la que se garantice estabilidad pero a su vez equidad entre semanas de diferente tipo de turnos.
+  \item \textbf{Correturnos}: cubren lo que queda, en cualquier base, con más flexibilidad
+\end{itemize}
+Cada trabajador $w$ tiene una base $b(w)$, unos días de vacaciones $V(w) \subseteq \Dias$ y una
+jornada anual $H(w)$ en minutos (la del convenio, 1776~h, escalada si tiene reducción de
+jornada).
+
+\subsection{El cuadrante}
+
+El resultado es una función parcial
+\[
+  P : \Trab \times \Dias \rightharpoonup \Lin \cup \Desc,
+  \qquad \Desc = \{\mathrm{DS}, \mathrm{DO}\},
+\]
+donde $P(w,d) = l$ significa que $w$ hace la línea $l$ el día $d$, y los valores de $\Desc$ son
+descansos con nombre: descanso semanal (DS) y descanso obligatorio tras una guardia (DO). Si $P(w,d)$ no está definida, ese día es un \emph{hueco}: no
+tiene nada asignado y se puede rellenar. Un descanso no es un hueco: ocupa el día igual que un
+turno.
+
+Escribimos $t(w,d) = P(w,d)$ si $P(w,d) \in \Lin$, y $t(w,d) = \bot$ en otro caso (descansa o
+está en hueco). A partir de $P$ se definen:
+\begin{align*}
+  \text{cobertura:}\quad & c(l,d) = \bigl|\{\, w \in \Trab : t(w,d) = l \,\}\bigr|
+                           \;\le\; p(l), \text{l es línea,d día y }p(l) \text{ su demanda}\\
+  \text{plazas sin cubrir:}\quad & h(l,d) = p(l) - c(l,d)
+                           \quad \text{si $l$ opera el día $d$}, \\
+  \text{minutos trabajados:}\quad & M(w) = \sum_{d \in \Dias,\; t(w,d) \neq \bot} m\bigl(t(w,d)\bigr).
+\end{align*}
+
+% =========================================================================== %
+\section{Restricciones}
+% =========================================================================== %
+
+Las restricciones se dividen en dos familias. Las del \emph{convenio} son comunes a todas las
+zonas que se rigen por él: el algoritmo las define una sola vez y solo cambian sus parámetros.
+Las de \emph{organización} son propias de cada zona: cómo se reparten los descansos y los fines
+de semana. Todas son \textbf{duras}: ningún objetivo puede comprarse a costa de incumplir una.
+
+Hay una excepción deliberada: los \emph{patrones pactados} (noches y UVI) se dan por válidos
+tal como vienen, porque están acordados con los trabajadores al menos esa es la casuística de Valladolid.
+ Las restricciones se aplican a
+todo lo que el algoritmo decide, no a los ciclos de patrón que se copian.
+
+\subsection{Básicas}
+
+Por construcción, $P$ asigna como mucho un valor a cada trabajador y día, así que nadie hace dos
+turnos el mismo día. Además, para todo $w \in \Trab$, $d \in \Dias$ y $l \in \Lin$:
+\begin{align*}
+  & d \in V(w) \;\Rightarrow\; P(w,d) \text{ no está definida}
+      && \text{(nadie trabaja ni descansa con nombre en vacaciones)}\\
+  & t(w,d) = l \;\Rightarrow\; l \text{ opera el día } d
+      && \\
+  & c(l,d) \le p(l)
+      && \text{(no se cubren más plazas de las que hay)}
+\end{align*}
+y quién puede hacer cada línea lo fija la sección~\ref{sec:quien}.
+
+\subsection{Convenio}
+
+El convenio fija cuatro parámetros: el descanso mínimo entre jornadas $\delta$ (12~h), el máximo
+de días trabajados por semana $D_{\max}$ (6), el máximo de horas por semana $H_{\mathrm{sem}}$
+(48~h) y la jornada anual (1776~h, de donde sale $H(w)$). Al menos así lo dicta el de CYL
+
+\paragraph{C4 · Descanso entre jornadas.} Entre el fin de un turno y el inicio del siguiente, en
+días consecutivos, median al menos $\delta$ horas:
+\[
+  t(w,d) = l,\;\; t(w,d+1) = l' \;\;\Rightarrow\;\;
+  \mathrm{ini}_{l'}(d+1) - \mathrm{fin}_{l}(d) \;\ge\; \delta,
+\]
+salvo que $l$ o $l'$ sea una guardia localizada: es disponibilidad y no presencia, así que ni
+exige descanso después ni lo consume antes. Solo hay que mirar días consecutivos: con un día
+entero de por medio, el descanso se cumple solo.
+
+\paragraph{C5 · Días por semana.} Para cada semana $s \in \Sem$:
+\[
+  \bigl|\{\, d \in s : t(w,d) \neq \bot \,\}\bigr| \;\le\; D_{\max}.
+\]
+
+\paragraph{C6 · Horas por semana.} Para cada semana $s \in \Sem$, en minutos:
+\[
+  \sum_{d \in s,\; t(w,d) \neq \bot} m\bigl(t(w,d)\bigr) \;\le\; 60\, H_{\mathrm{sem}}.
+\]
+C5 y C6 se cuentan por semana ISO, de lunes a domingo, y no en cualquier ventana de siete días.
+Es la interpretación que se aplica en las zonas de este convenio, y admite, a sabiendas, rachas
+por encima del tope a caballo entre dos semanas.
+
+\paragraph{Jornada anual.} Nadie pasa de su jornada:
+\[
+  M(w) \;\le\; H(w).
+\]
+Es un techo duro. Quedarse lo más cerca posible de él es un \emph{objetivo}, no una restricción
+(sección~\ref{sec:fijos}).
+
+\subsection{Organización de la zona}
+
+Para estas reglas hace falta saber qué días cuentan como \emph{libres}. Un día $d$ es libre para
+$w$ si no trabaja ni está de vacaciones, y no es un festivo de lunes a viernes:
+\[
+  \mathrm{libre}(w,d) \iff t(w,d) = \bot,\;\; d \notin V(w),\;\;
+  \neg\bigl(\tau_{b(w)}(d) = \mathrm{FES} \text{ y } d \text{ es de lunes a viernes}\bigr).
+\]
+Un festivo entre semana que no se trabaja es un descanso \emph{de más}, no el semanal; uno en
+sábado o domingo sí cuenta como descanso semanal.
+
+\paragraph{Descanso semanal.} En cada semana completa (sin vacaciones y dentro del año), al menos
+dos días libres:
+\[
+  \bigl|\{\, d \in s : \mathrm{libre}(w,d) \,\}\bigr| \;\ge\; 2 .
+\]
+Al final se les pone nombre: son los DS del cuadrante. En algunas zonas estan fijado ciertos días, por ahora
+no lo he implementado puesto que no he llegado.
+
+\paragraph{Domingo con sábado.} Nadie trabaja un domingo sin trabajar el sábado de ese fin de
+semana
+
+\paragraph{Descanso de fin de semana.} Quien trabaja sábado y domingo tiene, esa misma semana,
+dos días libres seguidos de lunes a viernes:
+\[
+  t(w,\mathrm{sab}_s) \neq \bot,\;\; t(w,\mathrm{dom}_s) \neq \bot \;\;\Rightarrow\;\;
+  \exists\, d \in \{\mathrm{lun}_s, \dots, \mathrm{jue}_s\} :\;
+  \mathrm{libre}(w,d) \,\wedge\, \mathrm{libre}(w,d+1).
+\]
+
+\subsection{Resumen}
+
+\begin{center}
+\begin{tabular}{@{}lll@{}}
+  \toprule
+  Regla & Ámbito & Qué limita \\
+  \midrule
+  Un turno al día, vacaciones, cobertura & básica & cada día \\
+  C4 · descanso entre jornadas & convenio & cada par de días seguidos \\
+  C5 · días por semana & convenio & cada semana ISO \\
+  C6 · horas por semana & convenio & cada semana ISO \\
+  Jornada anual & convenio & el año \\
+  Descanso semanal & zona & cada semana completa \\
+  Domingo con sábado & zona & cada fin de semana \\
+  Descanso de fin de semana & zona & cada semana con finde trabajado \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+% =========================================================================== %
+\section{Quién puede hacer cada línea}
+\label{sec:quien}
+% =========================================================================== %
+
+No todo el mundo puede hacer cualquier línea. Para cada línea, los datos declaran quién la tiene
+asignada y quién la cubre si falta. Esto generalmente viene por escrito o como anotación en algún excel
+estoy contemplando realizar de alguna manera una interfaz que permita indicarlo porque recogerlo como fichero
+me parece complejo. El resto se deduce de unas pocas reglas según el tipo de
+trabajador. El resultado son tres \emph{grupos} que se consultan siempre en el mismo orden.
+
+\subsection{Titulares, cubridores y pool}
+
+Para cada línea $l$:
+\begin{itemize}[nosep]
+  \item $T(l) \subseteq \Trab$ son sus \textbf{titulares}: quienes la tienen asignada. Esos días
+        la hacen ellos y no hacen otra. Los trabajadores de patrón son titulares de las líneas
+        que recorre su patrón sin necesidad de declararlo.
+  \item $C(l) \subseteq \Trab$ son sus \textbf{cubridores}: designados para cubrirla cuando
+        falta un titular, en un orden de preferencia (principal y suplentes). Son el último
+        recurso.
+  \item $Q(l) \subseteq \Trab$ es su \textbf{pool}: quién más puede hacerla por la regla de su
+        tipo. Con los fijos de su base que no son titulares de nada y los correturnos que la
+        admiten,
+        \[
+          Q_{\mathrm{fij}}(l) = \{\, w \in \Trab_{\mathrm{fij}} \setminus \mathcal{T} : b(w) = b(l) \,\},
+          \qquad
+          Q_{\mathrm{cor}}(l) = \{\, w \in \Trab_{\mathrm{cor}} : \mathrm{admite}(w,l) \,\},
+        \]
+        el pool es
+        \[
+          Q(l) =
+          \begin{cases}
+            \varnothing & \text{si } C(l) \neq \varnothing,\\[2pt]
+            Q_{\mathrm{cor}}(l) & \text{si } C(l) = \varnothing \text{ y } T(l) \neq \varnothing,\\[2pt]
+            Q_{\mathrm{fij}}(l) \cup Q_{\mathrm{cor}}(l) & \text{en otro caso,}
+          \end{cases}
+        \]
+        donde $\mathcal{T} = \bigcup_{l'} T(l')$ son los titulares de alguna línea (quien tiene
+        líneas asignadas solo hace las suyas), y un correturno no hace noches ni guardias
+        localizadas de una base que no es la suya pero si mañanas,tardes y partido:
+        \[
+          \mathrm{admite}(w,l) \iff \neg\bigl(\varphi(l) \in \{\text{noche}, \text{localizado}\}
+          \;\wedge\; b(l) \neq b(w)\bigr).
+        \]
+\end{itemize}
+En palabras: una línea con cubridores es exclusiva de sus titulares y sus cubridores; una línea
+con titulares y sin cubridores la hacen sus titulares y, cuando faltan, los correturnos; y una
+línea sin titulares es de todo el pool de su base.
+
+\begin{center}
+\begin{tabular}{@{}llll@{}}
+  \toprule
+  Línea & Titulares & Cubridores & Pool \\
+  \midrule
+  sin titulares ni cubridores & --- & --- & fijos de su base y correturnos \\
+  con titulares & los declarados & --- & solo correturnos \\
+  con titulares y cubridores & los declarados & los designados & nadie \\
+  de patrón & los del patrón & los designados & nadie \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Conciliaciones}
+
+Algunos trabajadores tienen \emph{restricciones} propias: conciliaciones o días que no trabajan.
+Cada restricción $r$ de $w$ es una terna $(T_r, L_r, J_r)$: los tipos de día a los que se aplica
+$T_r \subseteq \Tipos$, las líneas que esos días puede hacer $L_r \subseteq \Lin$ (o todas), y la
+ventana horaria $J_r$ dentro de la que tiene que caer el turno (o ninguna). Por ejemplo,
+\emph{``de lunes a viernes, solo de 8:00 a 16:00''} o \emph{``sábados, domingos y festivos,
+ninguna línea''}. Que $w$ \emph{pueda} hacer $l$ el día $d$ es:
+\[
+  \mathrm{puede}(w,l,d) \iff d \notin V(w) \;\wedge\;
+  \forall r : \tau_{b(l)}(d) \in T_r \Rightarrow
+  \bigl( l \in L_r \;\wedge\; [\,\mathrm{ini}_l(d), \mathrm{fin}_l(d)\,) \subseteq J_r \bigr).
+\]
+Las restricciones solo quitan opciones; nunca dan acceso a una línea.
+
+\subsection{Los grupos de un día}
+
+Juntando todo, quién puede hacer la línea $l$ el día $d$ son tres grupos, en orden. Si $l$ opera
+el día $d$,
+\[
+  \mathrm{grupos}(l,d) = \bigl( T_d(l),\; C_d(l),\; Q_d(l) \bigr),
+  \qquad
+  X_d(l) = \{\, w \in X(l) : \mathrm{puede}(w,l,d) \,\},
+\]
+y tres conjuntos vacíos si no. Los pasos del algoritmo consultan los
+grupos en ese orden: se pasa al siguiente solo si en el anterior no hay nadie a quien poner
+\emph{legalmente} con lo que ya tiene en el cuadrante. Así, un titular que ese día no puede
+porque incumpliría el descanso de C4 no bloquea la línea: la cubre un cubridor o alguien del
+pool.
+
+Esta función responde a \emph{quién puede}, no a \emph{si es legal} (eso son las
+restricciones de la sección anterior, que dependen del resto del cuadrante) ni a \emph{a quién
+se prefiere} dentro de cada grupo (eso lo decide cada paso).
+
+% =========================================================================== %
+\section{Arquitectura y orden de los pasos}
+% =========================================================================== %
+
+\subsection{Tres capas}
+
+El generador separa tres cosas que cambian a ritmos distintos:
+\begin{itemize}[nosep]
+  \item \textbf{El convenio}: los límites legales de la sección 3 (C4, C5, C6, jornada). Es
+        común a todas las zonas de una comunidad y cambia cada pocos años. En el código es un
+        objeto con sus parámetros, no un dato que se pueda escribir mal.
+  \item \textbf{La zona}: cómo se organiza el trabajo en ella. Sus reglas de reparto (descanso
+        semanal, fines de semana) y su \emph{receta}: qué pasos se
+        dan y en qué orden. Cada zona es un problema independiente, con su plantilla y sus
+        líneas.
+  \item \textbf{Los datos}: el plan funcional, la plantilla y los festivos de un año.
+\end{itemize}
+Con esta separación, una zona nueva no obliga a rehacer lo anterior: se añade su receta,
+reutilizando los pasos que comparta con otras, y las restricciones del convenio y la salida
+siguen siendo las mismas.
+
+\subsection{Los pasos}
+
+El algoritmo construye el cuadrante $P$ por pasos. Cada paso recibe el cuadrante que deja el
+anterior, lo trata como constante (lo ya asignado ocupa el día y gasta jornada) y lo completa.
+La figura~\ref{fig:pasos} muestra el orden en la zona estudiada.
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[
+    node distance=5mm and 8mm,
+    paso/.style={draw, rounded corners=2pt, align=center, text width=6.6cm,
+                 minimum height=9mm, font=\small},
+    muestra/.style={draw, rounded corners=2pt, minimum width=8mm, minimum height=4mm},
+    regla/.style={paso, fill=gray!12},
+    optim/.style={paso, fill=blue!12, draw=blue!50!black},
+    flecha/.style={-{Stealth[length=2.5mm]}, thick},
+    nota/.style={font=\footnotesize, align=left, text width=4.6cm}
+  ]
+  \node[regla] (carga)  {Carga de datos\\{\footnotesize plan funcional, plantilla, festivos}};
+  \node[regla, below=of carga] (esq) {Esqueleto\\{\footnotesize patrones pactados; vacaciones como ausencia}};
+  \node[regla, below=of esq] (lib) {Libranzas\\{\footnotesize ausencias y exceso de horas de los patrones}};
+  \node[regla, below=of lib] (fin) {Fines de semana y festivos\\{\footnotesize reparto greedy por turnos}};
+  \node[optim, below=of fin] (fij) {Fijos, de lunes a viernes\\{\footnotesize CP-SAT anual, una base cada vez}};
+  \node[optim, below=of fij] (cor) {Correturnos\\{\footnotesize CP-SAT anual sobre lo que queda}};
+  \node[regla, below=of cor] (des) {Descanso semanal\\{\footnotesize DS en su día}};
+  \node[regla, below=of des] (sal) {Comprobación del convenio y Excel};
+
+  \foreach \a/\b in {carga/esq, esq/lib, lib/fin, fin/fij, fij/cor, cor/des, des/sal}
+    \draw[flecha] (\a) -- (\b);
+
+  \begin{scope}[on background layer]
+    \node[draw=black!60, dashed, rounded corners=4pt, inner sep=3mm,
+          fit=(lib)(fin)(fij)(cor)(des)] (zona) {};
+  \end{scope}
+
+  \node[nota, right=8mm of esq.east |- carga] {\textbf{Común} a todas las zonas};
+  \node[nota, right=8mm of zona.east] {\textbf{Receta de la zona}: qué pasos y en qué orden;
+        otra zona puede tener otros};
+  \node[nota, right=8mm of esq.east |- sal] {\textbf{Común}: el convenio y la salida no
+        dependen de la zona};
+
+  \node[muestra, fill=gray!12, below=9mm of sal.south west, anchor=north west] (lr) {};
+  \node[right=1mm of lr, font=\footnotesize] (tr) {regla determinista};
+  \node[muestra, fill=blue!12, draw=blue!50!black, right=8mm of tr] (lo) {};
+  \node[right=1mm of lo, font=\footnotesize] {modelo de optimización};
+\end{tikzpicture}
+\caption{Los pasos del algoritmo en la zona estudiada. Los del recuadro forman la receta de la
+zona; los demás son comunes.}
+\label{fig:pasos}
+\end{figure}
+
+El orden no es arbitrario: cada paso coloca antes lo que está más atado, para que los
+siguientes, que tienen más libertad, se adapten a ello.
+\begin{enumerate}[nosep]
+  \item El \textbf{esqueleto} pinta lo que ya viene decidido: los ciclos de los patrones
+        pactados.
+  \item Las \textbf{libranzas} resuelven lo que esos ciclos no pueden cumplir por sí solos: quién
+        hace el ciclo de un titular de vacaciones y cómo devuelve un patrón las horas que pasa de
+        su jornada.
+  \item Los \textbf{fines de semana y festivos} se reparten antes que el lunes a viernes porque
+        son la parte más escasa y la que más pesa en la equidad, y porque determinan qué semanas
+        necesitan libres entre semana.
+  \item Los \textbf{fijos} se resuelven antes que los correturnos porque necesitan estabilidad
+        (semanas enteras de la misma franja) y llegar a su jornada; los correturnos, que son la
+        parte flexible de la plantilla, recogen lo que queda.
+  \item Los \textbf{descansos semanales} se escriben al final, cuando ya se sabe qué días quedan
+        libres. Los modelos anteriores ya garantizan que haya sitio para ellos.
+\end{enumerate}
+
+% =========================================================================== %
+\section{Pasos deterministas}
+% =========================================================================== %
+
+Los tres primeros pasos no optimizan nada: aplican reglas fijas, en un orden fijo, y con los mismos
+datos dan siempre el mismo cuadrante.
+
+\subsection{Esqueleto: los patrones pactados}
+
+Un patrón $\pi$ es una matriz $A_\pi$ de $R_\pi$ filas por 7 columnas: cada fila es una semana
+de lunes a domingo, y cada celda es una línea, un descanso de $\Desc$ o nada. Todos los
+trabajadores del patrón recorren las mismas filas, una por semana, cada uno desde la suya,
+$f_0(w)$, que es la fila que le toca en la primera semana del año y da continuidad de un año al
+siguiente.
+
+Si $k(d) = \lfloor (d - d_0)/7 \rfloor$ es el número de semana del día $d$ contado desde el lunes
+$d_0$ de la semana del 1 de enero, y $j(d) \in \{0,\dots,6\}$ su día de la semana, lo que el
+patrón prescribe a $w$ ese día es
+\[
+  \mathrm{pres}(w,d) = A_\pi\bigl[\,(f_0(w) + k(d)) \bmod R_\pi,\; j(d)\,\bigr].
+\]
+El esqueleto es
+\[
+  P(w,d) = \mathrm{pres}(w,d)
+  \qquad \text{si } d \notin V(w) \text{ y } \bigl(\mathrm{pres}(w,d) \in \Desc
+  \text{ o la línea opera el día } d\bigr),
+\]
+y nada en otro caso. Las vacaciones no se pintan: son ausencia. Tampoco se comprueba ninguna
+restricción, porque los patrones se dan por válidos (sección~3).
+
+\subsection{Libranzas: ausencias y exceso de horas}
+
+Los patrones dejan dos problemas que el esqueleto no resuelve. En la zona estudiada todas las
+líneas de patrón tienen cubridores, así que los dos se resuelven del mismo modo: un cubridor
+\emph{hereda} días del titular, haciendo lo que el patrón le prescribe a este, turnos y
+descansos:
+\[
+  P(c,d) \leftarrow \mathrm{pres}(w,d) \qquad \text{para los días } d \text{ heredados}.
+\]
+Lo que se hereda nunca se comprueba: si el ciclo era válido para el titular, lo es para quien lo
+sustituye.
+
+\paragraph{Vacaciones del titular.} Los días de $V(w)$, el patrón de $w$ queda sin nadie. Se
+hereda a un cubridor el periodo entero. Se elige el primero, en el orden de preferencia, que
+esté \emph{intacto} esos días (disponible y sin que nadie haya tocado lo suyo) y que no venga de
+cubrir algo a menos de 15 días; si todos vienen de cubrir algo cerca, el que lo tenga más lejos.
+Esa separación es la que reparte las coberturas entre el principal y los suplentes: sin ella, el
+principal encadena una quincena tras otra y el suplente no entra nunca. Si nadie puede el
+periodo entero, se reparte en tramos.
+
+\paragraph{Exceso de horas.} Un patrón suele prescribir más horas de las de la jornada, porque
+no está hecho a la medida del año: $\sum_{d} m(\mathrm{pres}(w,d))$ puede superar $H(w)$. El
+exceso
+\[
+  e(w) = M(w) - H(w) > 0
+\]
+se \emph{cede}: el titular deja de hacer algunos días, que hereda un cubridor. La unidad de cesión
+es un \emph{bloque}: una racha máxima de días de trabajo del patrón seguida de los descansos que
+la compensan. Ceder bloques enteros respeta la forma del ciclo, y lo que hereda el cubridor es un
+trozo con sentido (un turno de noches con sus libres), no días sueltos.
+
+Mientras $e(w) > 0$, se cede un bloque más. Entre los bloques que siguen intactos y para los que
+hay un cubridor libre, se elige por dos criterios, en orden:
+\begin{enumerate}[nosep]
+  \item que el bloque caiga en días en que la base tenga \emph{holgura}, porque el cubridor que
+        se va deja un hueco que alguien tendrá que cubrir. La holgura de un día estima cuánto
+        le sobra a la plantilla de la base:
+        \[
+          \mathrm{holg}(d) = \rho \cdot \bigl|\{\, w' \text{ libres el día } d \,\}\bigr|
+                             \;-\; \mathrm{dem}(d),
+          \qquad \rho = \frac{1776}{8 \cdot 365} \approx 0{,}6,
+        \]
+        donde $\rho$ es la fracción de días que trabaja de media una persona y
+        $\mathrm{dem}(d)$ las plazas de la base que ese día puede cubrir esa plantilla. Se prefiere
+        un bloque con holgura media no negativa;
+  \item a igualdad, el que quede más lejos de lo que el cubridor ya tiene comprometido.
+\end{enumerate}
+
+\paragraph{Recorte del último bloque.} Ceder siempre bloques enteros puede dejar al titular muy
+por debajo de su jornada: un bloque de noches son unas 60 horas. Por eso, si la racha entera
+quita más de lo que sobra, solo se cede su final. Si la racha son los días $d_1 < \dots < d_n$
+con minutos $m_1, \dots, m_n$ y $\sum_i m_i > e(w)$, se ceden los días $d_j, \dots, d_n$ con
+\[
+  j = \max\Bigl\{\, j : \sum_{i=j}^{n} m_i \ge e(w) \,\Bigr\},
+\]
+es decir, las últimas jornadas justas para no pasar de la jornada. El titular acorta su racha y
+conserva sus descansos, y el cubridor hace el final. Así cada titular acaba a menos de un turno
+por debajo de $H(w)$.
+
+\subsection{Fines de semana y festivos}
+
+Sábados, domingos y festivos se reparten antes que el lunes a viernes, entre fijos y
+correturnos, con una regla \emph{greedy}: se recorre el año en orden y cada plaza se da al
+candidato que menos lleva de esa clase. Es un turno rotatorio: quien acaba de trabajar un
+domingo pasa al final de la cola de los domingos, y no le vuelve a tocar hasta que los demás le
+alcanzan. Si todos estuvieran siempre disponibles, sería un turno exacto y los recuentos de un
+mismo grupo diferirían como mucho en uno, las vacaciones, las conciliaciones y la legalidad lo
+alteran, pero la regla siempre corrige hacia la igualdad. Además, como la cola obliga a esperar
+el turno, los fines de semana de cada persona quedan espaciados por el año sin medirlo
+explícitamente.
+
+Se hacen tres pasadas, una por clase de día $\kappa$, en el orden
+$\mathrm{FES} \to \mathrm{DOM} \to \mathrm{SAB}$. Un sábado festivo es de clase $\mathrm{FES}$ y
+así, cuando llega su domingo, ya tiene gente.
+
+\paragraph{Candidatos.} Para la plaza de la línea $l$ el día $d$, los candidatos son los del
+primer grupo de $\mathrm{grupos}(l,d)$ (sección~\ref{sec:quien}) en el que hay alguien a quien se
+le puede poner $l$ ese día sin incumplir ninguna restricción con lo que ya tiene en el
+cuadrante, ni pasar de su jornada.
+
+\paragraph{El sábado va con su domingo.} La regla del domingo con sábado no se comprueba
+después: se cumple por construcción. Si a quien coge un domingo no le toca trabajar ese sábado,
+se le asigna a la vez una plaza pendiente de ese sábado, buscando primero la misma línea. Si no
+hay ninguna con la que el domingo sea legal, no es candidato para ese domingo. Esos sábados ya
+cuentan cuando empieza la pasada de los sábados.
+
+\paragraph{Qué plaza y a quién.} Cada día se cubre primero la plaza con \emph{menos candidatos},
+la misma idea que la heurística de la variable más restringida en satisfacción de restricciones:
+no gastar en una plaza fácil a alguien que era el único posible para otra. Entre los candidatos
+se elige el mínimo, en orden lexicográfico, de
+\[
+  \mathrm{clave}(w) = \bigl(\, \neg\,\mathrm{misma}(w),\;\; n_\kappa(w),\;\; -(d - u(w)),\;\;
+  n_{\mathrm{FES}}(w) + n_{\mathrm{DOM}}(w) + n_{\mathrm{SAB}}(w) \,\bigr),
+\]
+donde
+\begin{itemize}[nosep]
+  \item $\mathrm{misma}(w)$, solo los domingos: si con esta asignación $w$ hace la misma línea el
+        sábado y el domingo. Así el fin de semana de una guardia localizada es de una sola
+        persona, sin tratarlo como caso aparte
+  \item $n_\kappa(w)$: cuántos días de la clase $\kappa$ lleva ya, contando los que trae el
+        cuadrante de los pasos anteriores (los ciclos heredados);
+  \item $u(w)$: el último fin de semana que trabajó, para preferir a quien lleva más tiempo sin
+        trabajar uno;
+  \item el total de fines de semana y festivos, como último desempate.
+\end{itemize}
+
+\begin{algorithm}[ht]
+\caption{Reparto de sábados, domingos y festivos}
+\label{alg:findes}
+\begin{algorithmic}[1]
+  \Require el cuadrante $P$ tras las libranzas
+  \For{$\kappa \in (\mathrm{FES}, \mathrm{DOM}, \mathrm{SAB})$}
+    \For{cada día $d$ de clase $\kappa$, en orden}
+      \While{quedan plazas pendientes de clase $\kappa$ el día $d$}
+        \State $\Omega(l) \gets$ candidatos de cada plaza pendiente $l$, cada uno con su sábado
+               si $\kappa = \mathrm{DOM}$
+        \State $l^\ast \gets \arg\min_l |\Omega(l)|$
+          \Comment{la plaza más restringida}
+        \If{$\Omega(l^\ast) = \varnothing$}
+          \State marcar $l^\ast$ como sin cubrir
+        \Else
+          \State $w \gets \arg\min_{w \in \Omega(l^\ast)} \mathrm{clave}(w)$
+          \State $P(w,d) \gets l^\ast$, y su plaza de sábado si la lleva
+          \State actualizar $n_\kappa(w)$ y $u(w)$
+        \EndIf
+      \EndWhile
+    \EndFor
+  \EndFor
+\end{algorithmic}
+\end{algorithm}
+
+Las líneas de patrón no entran en este paso: ya las cubren el esqueleto y las libranzas. Lo que
+el reparto no consigue cubrir no se reintenta: queda como plaza sin cubrir.
+
+% =========================================================================== %
+\section{El modelo de los fijos}
+\label{sec:fijos}
+% =========================================================================== %
+
+Con los fines de semana y festivos repartidos, queda el lunes a viernes: el grueso del año y la
+parte que más condiciona la vida de la plantilla fija, que quiere semanas estables y un reparto
+justo de las semanas duras. Es el primer paso que necesita ver el año entero a la vez, porque la
+jornada, las cuotas y la rotación son restricciones anuales: una decisión de
+marzo cambia lo que se puede hacer en noviembre. Se plantea como un problema de programación con
+restricciones sobre variables booleanas y se resuelve con CP-SAT.
+
+\subsection{La idea, en palabras}
+
+Antes de las fórmulas, conviene ver qué pregunta responde el modelo. Para cada fijo y cada día
+laborable del año, decide \textbf{si trabaja y en qué tipo de trabajo}: por ejemplo, ``mañana de
+8 horas en Valladolid''. No decide todavía la línea concreta, porque para el resto del año da
+igual cuál de las mañanas de 8 horas haga. Eso se resuelve después, semana a semana.
+
+Sobre esa decisión se imponen las reglas de la sección 3, y una más que es propia de este
+modelo: \textbf{cada semana, un solo tipo de trabajo}. Así la semana sale estable por
+construcción: quien hace mañanas un lunes las hace toda la semana.
+
+Lo que ya dejaron los pasos anteriores (los sábados y domingos repartidos, los ciclos heredados
+de un patrón, las vacaciones) no se toca: entra en el modelo como dato. Si alguien trabaja el
+sábado, ese sábado cuenta para sus días de la semana, sus horas y su descanso.
+
+La figura~\ref{fig:semana} muestra una semana de un fijo tal como la ve el modelo.
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[
+    x=1.05cm, y=0.62cm,
+    celda/.style={draw=black!40, minimum width=1.05cm, minimum height=0.62cm, anchor=center},
+    si/.style={celda, fill=blue!25},
+    fijo/.style={celda, fill=gray!30},
+    nada/.style={celda, fill=white},
+    fuera/.style={celda, pattern=north east lines, pattern color=black!25},
+    rot/.style={font=\footnotesize, anchor=east}
+  ]
+  % cabecera de días
+  \foreach \d [count=\i] in {L,M,X,J,V,S,D}
+    \node[font=\small\bfseries] at (\i,1) {\d};
+  % fila: lo que ya viene dado
+  \node[rot] at (0.4,0) {ya decidido};
+  \foreach \i in {1,...,5} \node[nada] at (\i,0) {};
+  \node[fijo, font=\scriptsize] at (6,0) {finde};
+  \node[nada] at (7,0) {};
+  % filas de casillas
+  \node[rot] at (0.4,-1.3) {mañana · 8 h};
+  \node[rot] at (0.4,-2.3) {tarde · 8 h};
+  \node[rot] at (0.4,-3.3) {partido · 10 h};
+  \foreach \i/\v in {1/1,2/1,3/0,4/1,5/1} {
+    \ifnum\v=1 \node[si, font=\scriptsize] at (\i,-1.3) {1}; \else \node[nada, font=\scriptsize] at (\i,-1.3) {0}; \fi
+    \node[nada, font=\scriptsize] at (\i,-2.3) {0};
+    \node[nada, font=\scriptsize] at (\i,-3.3) {0};
+  }
+  \foreach \i in {6,7} \foreach \r in {-1.3,-2.3,-3.3} \node[fuera] at (\i,\r) {};
+  % columna de zona
+  \node[font=\small\bfseries] at (8.6,1) {zona};
+  \node[si, font=\scriptsize] at (8.6,-1.3) {1};
+  \node[nada, font=\scriptsize] at (8.6,-2.3) {0};
+  \node[nada, font=\scriptsize] at (8.6,-3.3) {0};
+  % fila de trabaja
+  \node[rot] at (0.4,-4.6) {trabaja $x_{w,d}$};
+  \foreach \i/\v in {1/1,2/1,3/0,4/1,5/1,6/1,7/0}
+    \node[nada, font=\scriptsize] at (\i,-4.6) {\v};
+  % llaves y notas
+  \node[font=\footnotesize, align=left, anchor=west] at (9.3,-1.3) {una sola zona\\en la semana};
+  \node[font=\footnotesize, align=left, anchor=west] at (9.3,-4.6) {5 días ($\le 6$),\\libres: X y D};
+\end{tikzpicture}
+\caption{Una semana de un fijo vista por el modelo. Arriba, lo que dejaron los pasos anteriores
+(el sábado de su fin de semana). En medio, las variables $y$: un 1 en una casilla y día es que
+ese día trabaja en ese tipo de trabajo. Los fines de semana no tienen variables (rayado): ya
+están decididos. A la derecha, la zona de la semana: solo una puede valer 1, y todas las
+casillas marcadas tienen que ser de ella. Abajo, lo que trabaja cada día, que es lo que miran
+C5, C6, la jornada y el descanso.}
+\label{fig:semana}
+\end{figure}
+
+Entre todas las formas de rellenar el año que cumplen las reglas, el modelo elige por orden:
+primero la que cubre más plazas; entre esas, la que deja a cada fijo más cerca de su jornada;
+y entre esas, la que reparte mejor las semanas duras. El resto de la sección precisa cada una de
+estas piezas.
+
+\subsection{Descomposición}
+
+Un fijo solo hace líneas de su base, así que \textbf{cada base es un problema independiente}: se
+resuelve un modelo por base, y uno pequeño se resuelve mejor y antes que uno grande. Dentro de
+cada base el problema se divide en dos fases:
+\begin{enumerate}[nosep]
+  \item un \textbf{modelo anual} que decide, para cada fijo y cada día laborable, \emph{en qué
+        tipo de trabajo} está, sin elegir la línea concreta;
+  \item una \textbf{asignación directa} que, semana a semana, elige la línea concreta dentro de
+        ese tipo.
+\end{enumerate}
+
+\subsection{Casillas y zonas}
+
+Ese ``tipo de trabajo'' es lo que llamamos \emph{casilla}. Muchas líneas son intercambiables para
+todas las restricciones del año: dos mañanas de la misma base que computan lo mismo gastan la
+misma jornada, cuentan igual en C5 y C6 y pesan lo mismo en las cuotas. Decidir entre ellas
+dentro del modelo multiplicaría las variables y, sobre todo, las soluciones simétricas, sin
+mejorar nada.
+
+Para agrupar líneas se usan tres datos. La \emph{bolsa} $\beta(l)$ de una línea es el conjunto
+de líneas que rota la misma gente: si $l$ no tiene titulares, las abiertas de su base; si los
+tiene, las de ese mismo grupo de titulares. Con ella,
+\[
+  \mathrm{cas}(l) = \bigl(\beta(l),\; \varphi(l),\; m(l)\bigr) \in K,
+  \qquad
+  \zeta(l) = \bigl(\beta(l),\; \varphi(l)\bigr),
+\]
+son su \emph{casilla} (bolsa, franja y minutos) y su \emph{zona} (bolsa y franja). La casilla es
+lo que se decide cada día; la zona es lo que tiene que ser igual toda la semana. Los minutos
+separan las líneas que no computan lo mismo, para que la jornada y C6 salgan exactas; la zona
+los ignora, porque hacer una mañana de 7 horas el lunes y una de 9 el martes sigue siendo una
+semana de mañanas (figura~\ref{fig:casillas}).
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[
+    node distance=3mm and 14mm,
+    lin/.style={draw, rounded corners=2pt, font=\small, minimum width=2.6cm, minimum height=6mm},
+    cas/.style={draw, rounded corners=2pt, font=\small, minimum width=3.1cm, minimum height=6mm, fill=blue!10},
+    zon/.style={draw, rounded corners=2pt, font=\small, minimum width=2.6cm, minimum height=6mm, fill=blue!25},
+    flecha/.style={-{Stealth[length=2mm]}, black!60}
+  ]
+  \node[font=\small\bfseries] at (0,0.9) {Líneas};
+  \node[font=\small\bfseries] at (4.9,0.9) {Casillas};
+  \node[font=\small\bfseries] at (9.0,0.9) {Zonas};
+  \node[lin] (l1) at (0,0)    {A · mañana · 7 h};
+  \node[lin] (l2) at (0,-0.9) {B · mañana · 8 h};
+  \node[lin] (l3) at (0,-1.8) {C · mañana · 8 h};
+  \node[lin] (l4) at (0,-2.7) {D · mañana · 9 h};
+  \node[lin] (l5) at (0,-3.8) {E · tarde · 8 h};
+  \node[lin] (l6) at (0,-4.7) {F · tarde · 8 h};
+  \node[cas] (c1) at (4.9,0)     {mañana · 7 h};
+  \node[cas] (c2) at (4.9,-1.35) {mañana · 8 h};
+  \node[cas] (c3) at (4.9,-2.7)  {mañana · 9 h};
+  \node[cas] (c4) at (4.9,-4.25) {tarde · 8 h};
+  \node[zon] (z1) at (9.0,-1.35) {mañana};
+  \node[zon] (z2) at (9.0,-4.25) {tarde};
+  \foreach \a/\b in {l1/c1, l2/c2, l3/c2, l4/c3, l5/c4, l6/c4} \draw[flecha] (\a.east) -- (\b.west);
+  \foreach \a/\b in {c1/z1, c2/z1, c3/z1, c4/z2} \draw[flecha] (\a.east) -- (\b.west);
+
+  \node[font=\footnotesize, align=center] at (0,-5.7)   {se elige en la\\segunda fase};
+  \node[font=\footnotesize, align=center] at (4.9,-5.7) {se decide\\cada día ($y$)};
+  \node[font=\footnotesize, align=center] at (9.0,-5.7) {una por\\semana ($z$)};
+\end{tikzpicture}
+\caption{Un ejemplo con seis líneas ficticias de una misma bolsa. Las dos mañanas de 8 horas son
+la misma casilla; las cuatro mañanas, la misma zona.}
+\label{fig:casillas}
+\end{figure}
+
+Para escribir el modelo hacen falta las plazas pendientes y, para cada fijo, sus opciones. Sea
+$n(l,d)$ el número de plazas de la línea $l$ que el día laborable $d$ siguen sin cubrir tras los
+pasos anteriores, sin contar las de patrón. Las plazas de una casilla son
+$N(k,d) = \sum_{\mathrm{cas}(l)=k} n(l,d)$. Las \emph{opciones} de un fijo $w$ el día $d$ en la
+casilla $k$ son las líneas de esa casilla con plaza libre que puede hacer:
+\[
+  \Lambda(w,d,k) = \bigl\{\, l : \mathrm{cas}(l) = k,\;\; n(l,d) > 0,\;\;
+    w \in T_d(l) \cup C_d(l) \cup Q_d(l) \,\bigr\},
+\]
+siempre que $P(w,d)$ esté vacío y $l$ cumpla C4 con lo que ya tiene el día anterior y el
+siguiente.
+
+\subsection{Variables}
+
+Son las dos capas de la figura~\ref{fig:semana}. Para cada $(w,d,k)$ con
+$\Lambda(w,d,k) \neq \varnothing$, una booleana
+\[
+  y_{w,d,k} = 1 \iff w \text{ trabaja el día } d \text{ en una línea de la casilla } k,
+\]
+y para cada fijo, semana y zona posible, una booleana $z_{w,s,\zeta}$: si esa semana trabaja en
+la zona $\zeta$. Con ellas, que $w$ trabaje el día $d$ es
+\[
+  x_{w,d} =
+  \begin{cases}
+    1 & \text{si } P(w,d) \in \Lin \text{ ya estaba decidido},\\
+    0 & \text{si } P(w,d) \in \Desc,\\
+    \sum_k y_{w,d,k} & \text{si } P(w,d) \text{ está vacío,}
+  \end{cases}
+\]
+es decir, lo que dejaron los pasos anteriores entra como constante. En la base de Valladolid
+salen unas 20.000 variables $y$ y 4.400 variables $z$ para 51 fijos.
+
+\subsection{Restricciones}
+
+Son las de la sección 3, escritas sobre estas variables, más la de una zona por semana. Para
+cada fijo $w$:
+
+\paragraph{Un turno al día y cobertura.} Cada día marca como mucho una casilla, y en cada casilla
+no entran más personas que plazas libres tiene:
+\[
+  \sum_k y_{w,d,k} \le 1,
+  \qquad
+  \sum_w y_{w,d,k} \le N(k,d).
+\]
+Además, quienes solo pueden hacer una línea $l$ de la casilla no pueden ser más que las plazas de
+esa línea: sin esto el recuento por casilla cuadraría, pero la segunda fase no tendría dónde
+ponerlos.
+
+\paragraph{Una zona por semana.} Una casilla solo se puede marcar si su zona es la de la semana,
+la zona solo vale 1 si de verdad se trabaja en ella, y cada semana tiene como mucho una zona:
+\[
+  y_{w,d,k} \le z_{w,s(d),\zeta(k)}, \qquad
+  z_{w,s,\zeta} \le \sum_{d \in s,\; \zeta(k) = \zeta} y_{w,d,k}, \qquad
+  \sum_\zeta z_{w,s,\zeta} \le 1.
+\]
+La segunda desigualdad evita que los niveles de cuotas marquen semanas vacías para cuadrar. Hay
+una excepción: los días en que $w$ solo puede entrar como \emph{cubridor} de una línea no forman
+zona, porque cubrir no es parte de ningún reparto. Sin esa excepción, un cubridor que tiene que
+cubrir un día suelto perdería el resto de su semana.
+
+\paragraph{C4 entre días seguidos.} Dos casillas en días consecutivos solo se prohíben si ninguna
+de sus líneas descansa lo suficiente entre una y otra:
+\[
+  y_{w,d,k} + y_{w,d+1,k'} \le 1
+  \quad \text{si ningún par } (l,l') \in \Lambda(w,d,k) \times \Lambda(w,d+1,k')
+  \text{ cumple C4.}
+\]
+La restricción es \emph{optimista}: basta con que exista un par de líneas compatible. Lo exacto
+lo comprueba la segunda fase al elegir la línea.
+
+\paragraph{Semana: C5, C6 y descansos.} Se cuentan los días y los minutos de cada semana,
+incluidos los que ya venían decididos:
+\[
+  \sum_{d \in s} x_{w,d} \le D_{\max},
+  \qquad
+  \sum_{d \in s} \Bigl( \sum_k m(k)\, y_{w,d,k} + m_0(w,d) \Bigr) \le 60\, H_{\mathrm{sem}},
+\]
+donde $m(k)$ son los minutos de la casilla y $m_0(w,d)$ los de lo que ya estaba en el
+cuadrante. El descanso semanal y el de fin de semana se escriben con los indicadores
+$1 - x_{w,d}$ de los días que cuentan como libres (sección 3); el par de libres seguidos usa una
+booleana auxiliar por cada par de días consecutivos.
+
+\paragraph{Jornada.} Nadie pasa de su jornada, y lo que le falta para llegar es su
+\emph{déficit} $\delta_w$. Con $M_0(w)$ los minutos que ya trae del cuadrante,
+\[
+  M_0(w) + \sum_{d,k} m(k)\, y_{w,d,k} \;\le\; H(w),
+  \qquad
+  \delta_w = H(w) - M_0(w) - \sum_{d,k} m(k)\, y_{w,d,k} \;\ge\; 0.
+\]
+
+\subsection{Cuotas de semanas duras}
+
+Las franjas \emph{duras} son la noche, el partido y la tarde. La idea es sencilla: si un tercio
+de las plazas del año de una bolsa son de tarde, a cada fijo de esa bolsa le toca, más o menos,
+un tercio de sus semanas de tarde. Eso es su \emph{cuota}.
+
+Formalmente, cada fijo que puede elegir entre varias franjas de su bolsa tiene una cuota de cada
+franja dura. Si $\pi(\beta,\varphi)$ es la proporción de plazas de la franja $\varphi$ en la
+bolsa $\beta$ y $a_w$ el número de semanas en que $w$ está disponible,
+\[
+  q_{w,\varphi} = \bigl\lfloor \pi(\beta(w), \varphi) \cdot a_w \bigr\rfloor,
+  \qquad
+  Z_{w,\varphi} = \sum_s z_{w,s,(\beta(w),\varphi)},
+\]
+y se mide lo que se aleja de ella, por arriba o por abajo, con
+$\mathrm{dev}_{w,\varphi} \ge |Z_{w,\varphi} - q_{w,\varphi}|$ (dos desigualdades lineales).
+
+\paragraph{Ejemplo.} En la bolsa abierta de Valladolid, el 36\,\% de las plazas de lunes a
+viernes son de tarde. Un fijo disponible 48 semanas tiene una cuota de
+$\lfloor 0{,}36 \cdot 48 \rfloor = \lfloor 17{,}3 \rfloor = 17$ semanas de tarde.
+
+El redondeo hacia abajo es deliberado: las semanas que sobran se quedan para los correturnos, en
+la misma proporción, y así no se les cargan solo las duras. Si una franja no la puede hacer
+ningún correturno (las noches de Medina), no hay a quién dejar las semanas que sobran. Entonces
+la cuota es la parte proporcional de las semanas que hagan falta en total, y con
+$A = \sum_v a_v$ se pide
+\[
+  \mathrm{dev}_{w,\varphi} \;\ge\; \Bigl|\, A \cdot Z_{w,\varphi} - a_w \sum_v Z_{v,\varphi} \,\Bigr|,
+\]
+que es lo que se aleja de su parte, multiplicado por $A$ para no usar números racionales.
+
+Quien solo puede una franja (titular de una única línea o con una conciliación) no tiene cuota:
+su semana ya viene dada.
+
+\subsection{Rotación}
+
+Cumplir la cuota no basta: siete semanas de tarde seguidas cumplen la cuota y son un mal
+cuadrante. La plantilla espera una rotación reconocible, y se impone como restricción dura. La
+idea es repartir las semanas duras de cada persona a lo largo del año dejando entre ellas, como
+poco, la distancia que les tocaría si estuvieran espaciadas por igual.
+
+Para cada fijo con cuota $q > 0$ en una franja dura $\varphi$, se fija la \emph{ventana}
+\[
+  g_{w,\varphi} = \max\bigl(2,\; \lfloor a_w / q_{w,\varphi} \rfloor\bigr)
+\]
+y se pide como mucho una semana de esa franja en cada $g$ semanas seguidas:
+\[
+  \sum_{j=i}^{i+g-1} z_{w,s_j,(\beta(w),\varphi)} \;\le\; 1
+  \qquad \text{para todo } i.
+\]
+Con 7 semanas de tarde en 49 disponibles, la ventana es de 7: una tarde cada 7 semanas como
+poco (figura~\ref{fig:rotacion}). Con la cuota del ejemplo anterior, 17 tardes en 48 semanas, la
+ventana es de 2: nunca dos tardes seguidas. Como $g \ge 2$ siempre, nunca hay dos semanas
+seguidas de la misma franja dura, pero sí puede haber una de tarde junto a una de noche.
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[x=0.62cm, y=0.62cm]
+  \foreach \i in {1,...,21} {
+    \pgfmathtruncatemacro{\t}{(\i==2 || \i==9 || \i==16) ? 1 : 0}
+    \pgfmathtruncatemacro{\p}{(\i==5 || \i==12 || \i==19) ? 1 : 0}
+    \ifnum\t=1
+      \node[draw=black!50, fill=orange!45, minimum size=0.55cm, font=\scriptsize] at (\i,0) {T};
+    \else\ifnum\p=1
+      \node[draw=black!50, fill=green!30, minimum size=0.55cm, font=\scriptsize] at (\i,0) {P};
+    \else
+      \node[draw=black!50, fill=blue!12, minimum size=0.55cm, font=\scriptsize] at (\i,0) {M};
+    \fi\fi
+    \node[font=\tiny, black!60] at (\i,-0.75) {\i};
+  }
+  \draw[thick, decorate, decoration={brace, amplitude=5pt}] (5.6,0.55) -- (12.4,0.55)
+    node[midway, above=6pt, font=\footnotesize] {cualquier ventana de 7 semanas: como mucho una T};
+  \draw[thick, decorate, decoration={brace, amplitude=5pt, mirror}] (2,-1.2) -- (9,-1.2)
+    node[midway, below=6pt, font=\footnotesize] {7 semanas entre dos tardes};
+  \node[font=\footnotesize, anchor=west] at (21.8,0) {\dots};
+\end{tikzpicture}
+\caption{Rotación de un fijo con 7 semanas de tarde (T) en 49 disponibles: ventana de 7. Las
+semanas de partido (P) tienen su propia ventana. Las mañanas (M) no tienen cuota ni ventana: son
+lo que rellena entre medias.}
+\label{fig:rotacion}
+\end{figure}
+
+En las franjas sin correturnos, donde la cuota aún no se conoce, se estima por arriba (las plazas
+del año a cuatro días por semana, repartidas según $a_w$), para que la ventana no deje sin cubrir
+lo que nadie más puede hacer.
+
+\subsection{Objetivo lexicográfico}
+
+Los criterios de la sección 1 no se mezclan en una suma ponderada: elegir pesos obliga a decidir
+cuántas semanas de equidad vale una plaza sin cubrir, y una mala elección compra equidad con
+cobertura. Se optimizan en orden estricto, por \emph{niveles}. Cada nivel elige, entre las
+soluciones que dejó el anterior, las mejores según su criterio; el conjunto de soluciones se va
+estrechando como en un embudo (figura~\ref{fig:niveles}).
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[
+    niv/.style={draw, rounded corners=2pt, align=center, font=\small, minimum height=8mm},
+    flecha/.style={-{Stealth[length=2mm]}, thick}
+  ]
+  \node[niv, minimum width=11cm, fill=gray!10] (r) {Cuadrantes que cumplen todas las restricciones};
+  \node[niv, minimum width=9cm, fill=blue!8, below=6mm of r] (n1) {Niveles 0 y 1: los que cubren más plazas};
+  \node[niv, minimum width=7cm, fill=blue!15, below=6mm of n1] (n2) {Niveles 2 y 3: los que dejan menos déficit de jornada};
+  \node[niv, minimum width=5cm, fill=blue!25, below=6mm of n2] (n3) {Niveles 4 a 6: cuotas de semanas duras};
+  \node[niv, minimum width=2.5cm, fill=blue!40, below=6mm of n3] (n4) {Cuadrante};
+  \foreach \a/\b in {r/n1, n1/n2, n2/n3, n3/n4} \draw[flecha] (\a) -- (\b);
+  \node[font=\footnotesize, align=left, anchor=west] at ([xshift=6mm]n2.east) {en cada paso: se clava\\el valor alcanzado y se\\siembra la solución};
+\end{tikzpicture}
+\caption{El objetivo por niveles. Cada nivel solo puede elegir entre las soluciones que dejan
+intactos los valores de los niveles anteriores.}
+\label{fig:niveles}
+\end{figure}
+
+\begin{center}
+\begin{tabular}{@{}cll@{}}
+  \toprule
+  Nivel & Objetivo & Expresión \\
+  \midrule
+  0 & cobertura de lo que solo pueden hacer fijos & $\max \sum y_{w,d,k}$, casillas sin correturnos \\
+  1 & cobertura & $\max \sum y_{w,d,k}$ \\
+  2 & jornada: suma de déficits & $\min \sum_w \delta_w$ \\
+  3 & jornada: peor déficit & $\min \max_w \delta_w$ \\
+  4--6 & cuotas de noche, partido y tarde & $\min \sum_w \mathrm{dev}_{w,\varphi}$ \\
+  \bottomrule
+\end{tabular}
+\end{center}
+El nivel 0 va primero porque lo que no cubran los fijos lo cubren después los correturnos, salvo
+las plazas a las que ellos no llegan (noches y guardias de otra base, líneas con cubridores). Si
+los fijos no llegan a todo, que lo que quede sea lo que un correturno sí puede hacer. Los niveles
+2 y 3 van juntos por la misma razón que en un reparto cualquiera: el primero acerca a todos a su
+jornada; el segundo, entre las soluciones igual de buenas en total, evita que el déficit se
+concentre en una sola persona.
+
+Cada nivel $i$ se resuelve con su objetivo $f_i$; al terminar, su valor $v_i$ se \emph{clava} como
+restricción ($f_i \ge v_i$ o $f_i \le v_i$) y se pasa al siguiente. Así ningún nivel puede
+empeorar uno anterior. Cada nivel tiene un tiempo límite y, si no llega a demostrar el óptimo, se
+clava el mejor valor encontrado: sigue siendo cierto que los niveles siguientes no lo empeoran.
+
+Cada nivel arranca \emph{sembrado} con la solución del anterior: se le da como pista al solver.
+No es solo una mejora de velocidad. Con los niveles anteriores clavados, encontrar \emph{alguna}
+solución factible desde cero es muy difícil, y la del nivel anterior ya lo es por construcción.
+Se siembran las variables de decisión y las auxiliares de los niveles ya clavados, pero no las
+del nivel que empieza, que en la solución anterior valían cualquier cosa.
+
+\subsection{Segunda fase: la línea concreta}
+
+El modelo dice, por ejemplo, que $w$ trabaja de lunes a jueves en la casilla
+(Valladolid, mañana, 480). Falta elegir la línea. Se hace sin solver, semana a semana y casilla a
+casilla:
+\begin{enumerate}[nosep]
+  \item se atiende primero a quien tiene menos líneas posibles en común entre sus días;
+  \item a cada uno se le da una línea que le valga \emph{todos} sus días de la semana (con plaza
+        libre y C4 exacto contra lo que ya tiene), prefiriendo la de la semana anterior;
+  \item si ninguna le vale la semana entera, se elige día a día, prefiriendo las que ya lleva esa
+        semana.
+\end{enumerate}
+Así, siempre que se puede, una persona hace la misma línea toda la semana, y la misma que la
+semana anterior si sigue en esa casilla. Como el modelo ya garantiza que el número de personas
+por casilla cabe en sus plazas, esta fase casi nunca falla. Si queda algún día sin línea
+compatible por C4, se informa. En los datos de 2027 no ha quedado ninguno. Antes de llegar a
+esto se probó a resolver esta fase con un pequeño CP-SAT por semana: tardaba unos 150 segundos
+frente a uno, y el resultado era peor en estabilidad.
+
+% =========================================================================== %
+\section{Correturnos y descansos}
+% =========================================================================== %
+
+\subsection{El modelo de los correturnos}
+
+Lo que los fijos no cubren de lunes a viernes lo cubren los correturnos. El modelo es el mismo
+que el de los fijos, con las mismas variables $y$ y las mismas restricciones: un turno al día,
+no sobrecubrir, C4, C5, C6, descanso semanal, descanso de fin de semana y techo de jornada. Lo
+que cambia responde a lo que es un correturno: la parte flexible de la plantilla.
+\begin{itemize}[nosep]
+  \item \textbf{Un solo modelo para toda la zona.} Un correturno trabaja en cualquier base (con
+        la salvedad de noches y guardias de otra base, sección~\ref{sec:quien}), así que el
+        problema ya no se separa por bases.
+  \item \textbf{Cada línea es su propia casilla:}
+        $\mathrm{cas}(l) = \bigl(b(l), \varphi(l), m(l), l\bigr)$. Como quedan pocas plazas, el
+        modelo puede elegir la línea directamente, sin segunda fase, y C4 es exacto.
+  \item \textbf{Sin zona semanal, sin cuotas y sin rotación.} Los correturnos absorben la
+        inestabilidad que los fijos no tienen. La coherencia de su semana es solo una
+        preferencia, el último nivel del objetivo.
+  \item \textbf{No tienen que llegar a su jornada.} La jornada sigue siendo un techo, pero no
+        hay déficit que minimizar: hay más horas de correturno que plazas por cubrir.
+\end{itemize}
+En la zona estudiada entran 8 correturnos, con 1.086 plazas pendientes y unas 7.750 variables.
+
+\paragraph{Medida de desigualdad.} Para repartir algo con equidad entre $N$ personas con
+recuentos $h_1, \dots, h_N$ y suma $S = \sum_v h_v$, se usa
+\[
+  \mathrm{Des}(h) \;=\; \sum_{w} \bigl| N h_w - S \bigr| \;+\; N\bigl(\max_w h_w - \min_w h_w\bigr).
+\]
+El primer término es $N$ veces la desviación de cada uno respecto a la media, escalada para no
+usar números racionales; el segundo es el rango. Cada uno por separado es ciego a algo: con la
+desviación sola, da igual que dos personas estén muy por encima o cuatro un poco por encima; con
+el rango solo, únicamente cuentan los dos extremos. Ambos se linealizan con variables auxiliares
+y las restricciones de máximo y mínimo del solver.
+
+\paragraph{Objetivo.} Por niveles, igual que en los fijos:
+\begin{center}
+\begin{tabular}{@{}cll@{}}
+  \toprule
+  Nivel & Objetivo & Expresión \\
+  \midrule
+  1 & cobertura & $\max \sum y_{w,d,l}$ \\
+  2 & equidad de horas & $\min \mathrm{Des}(h)$, con $h_w = M(w)$ \\
+  3 & equidad de días duros & $\min \mathrm{Des}(u)$, con $u_w$ los días de tarde, partido o noche \\
+  4 & coherencia semanal & $\min \sum_{w,s} \bigl( \sum_\zeta o_{w,s,\zeta} - t_{w,s} \bigr)$ \\
+  \bottomrule
+\end{tabular}
+\end{center}
+En el nivel 4, $o_{w,s,\zeta} = \max_{d \in s,\; \zeta(l) = \zeta} y_{w,d,l}$ indica si $w$ usa
+la zona $\zeta$ (base y franja) en la semana $s$, y $t_{w,s} = \max_\zeta o_{w,s,\zeta}$ si
+trabaja esa semana. El término cuenta las zonas que usa por encima de la primera: vale 0 si toda
+la semana es de la misma base y franja. La equidad va antes que la coherencia porque, si
+alguien tiene que cargar con la inestabilidad, que sea por igual.
+
+\subsection{Descansos semanales}
+
+Los dos modelos garantizan que cada semana completa tenga al menos dos días que pueden ser
+descanso semanal, pero no dicen cuáles. El último paso los coloca, sin optimizar, para cada fijo
+y cada correturno. Un día es candidato si está libre en el sentido de la sección 3: sin nada
+asignado, sin vacaciones y sin ser un festivo entre semana.
+
+Para cada semana completa $s$, hacen falta $\max(0,\, 2 - r_s)$ descansos, donde $r_s$ son los DS
+y DO que ya trae el cuadrante (de un ciclo de patrón heredado). Se eligen así:
+\begin{itemize}[nosep]
+  \item si hacen falta dos, el \textbf{par de días libres seguidos más cercano al fin de semana}:
+        dos días de descanso juntos valen más que dos sueltos, y pegados al fin de semana más
+        todavía;
+  \item si no hay ningún par, o solo hace falta uno, los últimos días libres de la semana.
+\end{itemize}
+En las semanas partidas por vacaciones o por el principio o el final del año no se exige el
+descanso semanal: se ponen hasta dos con los días libres que queden.
+
+Como los modelos ya reservan el sitio, este paso solo puede fallar en una semana completa si lo
+que traían los pasos anteriores ya no dejaba dos días libres; en ese caso los modelos lo toleran
+y no añaden más trabajo esa semana. En la ejecución con los datos de 2027 no ha quedado ningún
+descanso sin colocar.
+
+% =========================================================================== %
+\section{Resultados y limitaciones}
+% =========================================================================== %
+
+\subsection{El caso estudiado}
+
+Los resultados corresponden a la zona de Valladolid para el año 2027:
+\begin{itemize}[nosep]
+  \item \textbf{6 bases}: Valladolid, Medina, Íscar, Mayorga, Tordesillas y Peñafiel;
+  \item \textbf{71 líneas}: 40 de mañana, 19 de tarde, 6 de partido, 3 de noche y 3 guardias
+        localizadas;
+  \item \textbf{87 trabajadores}: 8 de patrón (4 patrones: dos de noches y dos de UVI), 71 fijos y
+        8 correturnos;
+  \item jornada de 1776~h, descanso mínimo de 12~h, 6 días y 48~h por semana como máximo.
+\end{itemize}
+Se ha ejecutado con un tiempo límite de 600~s por nivel de cada modelo y 8 hilos. La ejecución
+completa tarda unos 70 minutos; casi todo ese tiempo se va en los niveles que agotan su límite
+sin demostrar el óptimo.
+
+\subsection{Cobertura}
+
+\begin{center}
+\begin{tabular}{@{}lrrr@{}}
+  \toprule
+  Paso & Plazas & Cubiertas & Sin cubrir \\
+  \midrule
+  Festivos, sábados y domingos (voraz) & --- & todas & 0 \\
+  Lunes a viernes: fijos & 15.189 & 14.122 & 1.067 \\
+  Lunes a viernes: correturnos & 1.067 & 995 & 72 \\
+  \midrule
+  Total de lunes a viernes & 15.189 & 15.117 & \textbf{72} (0,5\,\%) \\
+  \bottomrule
+\end{tabular}
+\end{center}
+Las plazas de lunes a viernes son las que quedan tras los patrones y sus libranzas. Las 72 que
+quedan sin cubrir son sobre todo de mañana:
+\begin{center}
+\begin{tabular}{@{}lrrr@{}}
+  \toprule
+  Base & Mañana & Tarde & Partido \\
+  \midrule
+  Valladolid & 18 & 15 & 9 \\
+  Íscar & 9 & 3 & --- \\
+  Tordesillas & 3 & 7 & --- \\
+  Medina & 5 & --- & --- \\
+  Mayorga & 3 & --- & --- \\
+  \bottomrule
+\end{tabular}
+\end{center}
+La cobertura del modelo de correturnos es óptima demostrada: con lo que dejan los pasos
+anteriores, no se puede cubrir ni una plaza más sin incumplir alguna restricción. Los fijos ya
+están en su jornada, así que esas plazas solo se cubrirían con más plantilla o cambiando
+decisiones de pasos anteriores.
+
+\subsection{Legalidad}
+
+El cuadrante final no tiene ningún incumplimiento de C4, C5 ni C6 en lo que decide el
+algoritmo, y todos los descansos semanales caben: ninguna semana completa se queda sin sus dos
+DS. Las únicas formas fuera del convenio son las de los patrones pactados, que se dan por
+válidas (sección 3).
+
+\subsection{Jornada}
+
+\begin{itemize}[nosep]
+  \item \textbf{Fijos}: 70 de 71 terminan exactamente en su jornada (mediana y máximo de
+        1776~h). El único que se queda por debajo, con 1744~h, es un cubridor de UVI, cuyo año
+        está condicionado por los ciclos que hereda.
+  \item \textbf{Correturnos}: entre 1200 y 1208~h. La diferencia entre ellos es de un turno. No
+        llegan a su jornada porque no hay trabajo para ello: quedan unas 570~h de cada uno sin
+        usar, que es la holgura de la plantilla.
+\end{itemize}
+
+\subsection{Equidad}
+
+\paragraph{Fines de semana y festivos.} Recuento por persona dentro de cada base:
+\begin{center}
+\begin{tabular}{@{}lrccc@{}}
+  \toprule
+  Base & Personas & Sábados & Domingos & Festivos \\
+  \midrule
+  Valladolid (con correturnos) & 53 & 15--16 & 6--7 & 3--5 \\
+  Medina & 8 & 12--13 & 6--7 & 3--4 \\
+  Íscar & 3 & 16--17 & --- & 4--5 \\
+  Tordesillas & 3 & 16--17 & --- & 4--5 \\
+  Mayorga & 4 & 12--13 & --- & 3--4 \\
+  \bottomrule
+\end{tabular}
+\end{center}
+La diferencia es de un día como mucho, salvo en los festivos de Valladolid (dos). Además quedan
+espaciados: nadie trabaja más de 3 fines de semana seguidos, y el hueco más largo entre dos
+fines de semana trabajados es de 9 semanas (6,3 de media).
+
+\paragraph{Semanas duras.} De los 58 fijos con cuota de semanas de tarde, 54 la cumplen
+exactamente, 3 se quedan a una semana y 1 a dos. En las noches de Medina, 5 de 8 la cumplen
+exactamente. Entre los correturnos, los días duros son entre el 43\,\% y el 45\,\% de sus días
+de lunes a viernes.
+
+\subsection{Rotación y estabilidad}
+
+\begin{itemize}[nosep]
+  \item Ningún fijo encadena dos semanas seguidas de la misma franja dura, y ninguna separación
+        entre dos semanas de una misma franja queda por debajo de su ventana (922 separaciones).
+  \item Sí hay 43 pares de semanas duras de franjas distintas seguidas (una de tarde junto a
+        una de noche, por ejemplo). Es lo que permite la restricción, y lo que se decidió.
+  \item Los correturnos trabajan en una sola zona (base y franja) entre 38 y 42 de sus unas 48
+        semanas con trabajo.
+\end{itemize}
+
+\subsection{Comportamiento del solver}
+
+Los modelos de las bases pequeñas (Íscar, Mayorga, Tordesillas y Peñafiel) se resuelven al
+óptimo demostrado en todos sus niveles en segundos. En Medina, la cobertura y la jornada llegan
+al óptimo; las cuotas, no. En Valladolid, la cobertura agota los 600~s sin demostrar el óptimo
+y se queda en el mismo valor que con 60~s, señal de que está muy cerca de su máximo; la jornada
+sí se demuestra óptima. En los correturnos, la cobertura es óptima en un segundo, y la
+equidad de horas y la coherencia semanal se quedan en factible.
+
+Que un nivel no demuestre su óptimo no rompe el orden de prioridades: el valor encontrado se
+clava igual y ningún nivel posterior lo empeora. Lo que se pierde es la garantía de que no
+existía algo mejor en ese nivel.
+
+\subsection{Limitaciones y trabajo futuro}
+
+\begin{itemize}
+  \item \textbf{Una sola zona.} El diseño separa convenio, zona y datos, pero solo existe la
+        receta de Valladolid. Cada zona nueva necesita la suya, y es probable que obligue a
+        sacar a la parte común piezas que hoy son de Valladolid.
+  \item \textbf{Datos provisionales.} La carga de datos lee ficheros CSV preparados a mano. Su
+        formato cambiará cuando se conecte con las fuentes reales de la empresa, y el resto del
+        algoritmo no debería verse afectado.
+  \item \textbf{Restricciones no modeladas.} Las conciliaciones admiten tipos de día, líneas y
+        ventanas horarias, pero no reglas del tipo \emph{``como mucho un domingo al mes''}.
+  \item \textbf{Huecos agrupados.} Las plazas que quedan sin cubrir están dispersas. Una mejora
+        con valor práctico es un nivel que, sin perder cobertura, las concentre en las mismas
+        líneas y semanas seguidas, de modo que se puedan cubrir con contratos temporales en
+        lugar de días sueltos.
+  \item \textbf{Optimalidad.} Los niveles grandes no demuestran su óptimo en el tiempo dado. El
+        problema se ejecuta una vez al año, así que se prefiere dar más tiempo a recortar
+        niveles; aun así, la descomposición en pasos hace que el resultado sea óptimo dentro de
+        cada paso, no para el año completo.
+\end{itemize}
+
+\end{document}

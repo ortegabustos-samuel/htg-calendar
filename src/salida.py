@@ -19,6 +19,9 @@ de nombres), una métrica por nombre (`Sabados`, `Domingos`, `Festivos`, `Vacaci
 `Calendario` (la rejilla entera) y un rango por mes (`CalendarioEnero`...). Así nadie tiene que
 buscar celdas por su texto.
 
+Cada turno se pinta con el color de su FRANJA (mañana, tarde, noche, partido, localizado), y en
+negrita si ese día es finde o festivo; arriba del calendario va la leyenda de colores.
+
 La hoja Conversión Comité lleva el plan funcional (una fila por línea, con su demanda y su
 "Asignados" en vivo) y una columna Leyenda Comité en blanco para que el comité la rellene, una
 leyenda por turno.
@@ -35,7 +38,7 @@ from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 from openpyxl.workbook.defined_name import DefinedName
 
-from cargar_datos import DESCANSOS, DF, DO, DS, Datos
+from dominio import Datos, Franja, Plan, TipoDescanso, TipoDia
 
 RAIZ = Path(__file__).resolve().parents[1]
 SALIDA = Path(os.environ.get("HT_SALIDA") or RAIZ / "data" / "output")   # la interfaz la cambia por escenario
@@ -64,34 +67,26 @@ FILL_VAC_XL = "FFFF00"
 FILL_COBERTURA_OK, FILL_COBERTURA_EXCESO, FILL_COBERTURA_FALTA = "C6EFCE", "FFEB9C", "FFC7CE"
 
 # Las tres clases de descanso que se rotulan en el cuadrante. Ninguna se calcula aquí: todas vienen
-# en el plan y aquí solo se pintan. El estilo es provisional, para distinguirlas de un vistazo.
-#   DS — descanso semanal: dos por semana ISO, nunca en festivo (del patrón, o de fijos.py).
-#   DF — descanso por festivo trabajado, en las semanas siguientes (fijos.py).
+# en el plan y aquí solo se pintan.
+#   DS — descanso semanal: dos por semana ISO (del patrón, o de descansos.py).
+#   DF — descanso por festivo trabajado. El pipeline no lo marca (se hace a mano): sale si lo trae el plan.
 #   DO — descanso obligatorio: el que da un turno de 24 h, del patrón o heredado con el bloque.
-FILL_DESCANSO = {DS: "D9E1F2", DF: "E4DFEC", DO: "D9D9D9"}
+FILL_DESCANSO = {TipoDescanso.DS: "D9E1F2", TipoDescanso.DF: "E4DFEC", TipoDescanso.DO: "D9D9D9"}
 
-# PROVISIONAL, para validar la equidad a ojo: con VER_FRANJAS cada turno se pinta por la franja
-# de su línea (`Datos.franja`) en vez de por el tipo de día, y los findes y festivos van en
-# negrita. El tipo de día se sigue leyendo en la cabecera de la columna. Se quitará.
-VER_FRANJAS = False
-FILL_FRANJA = {"mañana": "9BC2E6", "tarde": "F4B084", "partido": "A9D08E",
-               "noche": "7030A0", "localizado": "B4A7D6"}
-
-
-def _municipio_trabajador(datos: Datos) -> dict[str, str]:
-    """Municipio de referencia de cada trabajador, para saber qué festivos le afectan: el que
-    declara en `trabajadores.csv`. Solo se usa para PINTAR el calendario; cuando el trabajador tiene
-    turno asignado ese día se usa el municipio de ese turno, que es exacto."""
-    return {w: t.municipio or "Valladolid" for w, t in datos.trabajadores.items()}
+# Cada turno se pinta por la franja de su línea. El tipo de día se lee en la cabecera de la
+# columna, y los findes y festivos van además en negrita.
+FILL_FRANJA = {Franja.MANANA: "9BC2E6", Franja.TARDE: "F4B084", Franja.PARTIDO: "A9D08E",
+               Franja.NOCHE: "7030A0", Franja.LOCALIZADO: "B4A7D6"}
+LETRA_BLANCA = {Franja.NOCHE}                 # fondos oscuros: texto en blanco
 
 
-def _categoria(datos: Datos, d: date, municipio: str | None = None) -> str:
-    """Categoría de un día PARA UN MUNICIPIO concreto: festivo, finde o laborable. Si no se pasa
-    municipio se mira solo el calendario común (para la cabecera, que es de toda la plantilla)."""
-    if municipio is None:
-        if d in datos.festivos.get("Nacional", set()):
+def _categoria(datos: Datos, d: date, base: str | None = None) -> str:
+    """Categoría de un día PARA UNA BASE concreta: festivo, finde o laborable. Si no se pasa base
+    se miran los festivos comunes a todas (para la cabecera, que es de toda la plantilla)."""
+    if base is None:
+        if d in set.intersection(*datos.festivos.values()):
             return "festivo"
-    elif datos.es_festivo(d, municipio):
+    elif datos.es_festivo(d, base):
         return "festivo"
     return "finde" if d.weekday() >= 5 else "lv"
 
@@ -123,16 +118,12 @@ def _ajustar_anchos(ws, desde_fila: int = 1, saltar: set[int] | None = None,
 
 
 def _calendarios_festivos(datos: Datos) -> dict[str, set[date]]:
-    """calendario -> fechas festivas EFECTIVAS (las comunes más las suyas). Es lo que mira
-    `Datos.es_festivo`, resuelto de una vez para poder volcarlo como banderas por día."""
-    nacionales = datos.festivos.get("Nacional", set())
-    municipio = {datos.calendario_municipio.get(t.municipio, t.municipio) for t in datos.turnos.values()}
-    return {municipio: nacionales.union(datos.calendario_municipio.get(municipio,set()))} #Union festivos nacionales y municipio
+    """base -> sus fechas festivas, nacionales incluidas: lo que mira `Datos.es_festivo`."""
+    return {b: datos.festivos.get(b, set()) for b in sorted({t.base for t in datos.turnos.values()})}
 
 
 def _calendario_de(datos: Datos, turno: str) -> str:
-    t = datos.turnos[turno]
-    return datos.calendario_municipio.get(t.municipio, t.municipio)
+    return datos.turnos[turno].base
 
 
 TIPOS = ("fijo", "patron", "correturno")
@@ -144,8 +135,8 @@ def _bloques(datos: Datos) -> list[tuple[str, list[str]]]:
     tamano: dict[str, int] = {}
     grupos: dict[tuple[str, str], list[str]] = {}
     for w, t in datos.trabajadores.items():
-        grupos.setdefault((t.municipio, t.tipo), []).append(w)
-        tamano[t.municipio] = tamano.get(t.municipio, 0) + 1
+        grupos.setdefault((t.base, t.tipo.value), []).append(w)
+        tamano[t.base] = tamano.get(t.base, 0) + 1
     orden = sorted(grupos, key=lambda g: (-tamano[g[0]], g[0],
                                           TIPOS.index(g[1]) if g[1] in TIPOS else len(TIPOS)))
     return [(f"{m} · {tipo}", sorted(grupos[(m, tipo)],
@@ -154,9 +145,9 @@ def _bloques(datos: Datos) -> list[tuple[str, list[str]]]:
 
 
 def _rotulo(datos: Datos, trab: str) -> str:
-    """Nombre con municipio y tipo al lado, para validar. Provisional."""
+    """Nombre con base y tipo al lado, para validar. Provisional."""
     t = datos.trabajadores[trab]
-    return f"{t.nombre} ({t.municipio}, {t.tipo})"
+    return f"{t.nombre} ({t.base}, {t.tipo.value})"
 
 
 def _meses(fechas: list[date]) -> list[tuple[str, str, int, int]]:
@@ -176,16 +167,16 @@ def _meses(fechas: list[date]) -> list[tuple[str, str, int, int]]:
             for (a, m), j0, j1 in bloques]
 
 
-def _cobertura(plan: dict[tuple[str, date], str]) -> dict[tuple[str, date], int]:
+def _cobertura(plan: Plan) -> dict[tuple[str, date], int]:
     contador: dict[tuple[str, date], int] = {}
     for (_, f), s in plan.items():
-        if s in DESCANSOS:              # un DO ocupa el día, pero no cubre plaza de nada
+        if isinstance(s, TipoDescanso):     # un descanso ocupa el día, pero no cubre plaza de nada
             continue
         contador[(s, f)] = contador.get((s, f), 0) + 1
     return contador
 
 
-def escribir_excel(datos: Datos, plan: dict[tuple[str, date], str],
+def escribir_excel(datos: Datos, plan: Plan,
                       nombre: str = "calendario.xlsx") -> Path:
     """Vuelca el cuadrante a XLSX.
 
@@ -230,8 +221,8 @@ def escribir_excel(datos: Datos, plan: dict[tuple[str, date], str],
     negro = Font(color="000000", bold=True)
 
     cobertura = _cobertura(plan)
-    demanda = sum(t.dem for s, t in datos.turnos.items() for f in fechas if datos.opera(s, f))
-    faltan = {(s, f): max(0, t.dem - cobertura.get((s, f), 0))
+    demanda = sum(t.personas for s, t in datos.turnos.items() for f in fechas if datos.opera(s, f))
+    faltan = {(s, f): max(0, t.personas - cobertura.get((s, f), 0))
               for s, t in datos.turnos.items() for f in fechas if datos.opera(s, f)}
     n_deficit = sum(faltan.values())
 
@@ -246,7 +237,7 @@ def escribir_excel(datos: Datos, plan: dict[tuple[str, date], str],
             ).font = Font(bold=True, size=14)
     ws.cell(2, 1, f"Cobertura {demanda - n_deficit}/{demanda} "
                   f"({(demanda - n_deficit) / demanda:.1%})  |  sin cubrir {n_deficit}  |  "
-                  f"{len(plan)} asignaciones").alignment = izq
+                  f"{sum(1 for _, v in plan.items() if isinstance(v, str))} asignaciones").alignment = izq
     ndias = len(fechas)
     COL_DN = COL_D0 + ndias - 1
     L_D0, L_DN = get_column_letter(COL_D0), get_column_letter(COL_DN)
@@ -285,7 +276,20 @@ def escribir_excel(datos: Datos, plan: dict[tuple[str, date], str],
         c.alignment, c.font, c.border, c.fill = centro, negrita, borde, relleno
     ws.row_dimensions[F_FECHA].height = 70
 
-    muni = _municipio_trabajador(datos)
+    # Leyenda de colores, encima del calendario: una celda por franja, descanso y vacaciones
+    ws.cell(1, COL_D0, "Leyenda:").font = negrita
+    leyenda = [(fr.value, FILL_FRANJA[fr], fr in LETRA_BLANCA) for fr in Franja]
+    presentes = {v for _, v in plan.items() if isinstance(v, TipoDescanso)}   # solo los que salen
+    leyenda += [(d.value, FILL_DESCANSO[d], False) for d in TipoDescanso if d in presentes]
+    leyenda += [("V vacaciones", FILL_VAC_XL, False)]
+    for k, (texto, color, blanca) in enumerate(leyenda):
+        col = COL_D0 + 2 + 3 * k
+        ws.merge_cells(start_row=1, start_column=col, end_row=1, end_column=col + 2)
+        c = ws.cell(1, col, texto)
+        c.fill, c.alignment, c.border = PatternFill("solid", fgColor=color), centro, borde
+        c.font = Font(bold=True, color="FFFFFF" if blanca else "000000")
+    ws.cell(2, COL_D0, "Negrita: finde o festivo. La cabecera de cada día lleva su tipo.").font = Font(italic=True)
+
     fila_de: dict[str, int] = {}
     titulos: set[int] = {F_MES, F_FECHA}
     r = F_DIA + 1
@@ -300,9 +304,9 @@ def escribir_excel(datos: Datos, plan: dict[tuple[str, date], str],
                 c = ws.cell(r, COL_D0 + j)
                 c.alignment, c.border = centro, borde
                 # Descansos con nombre: vienen todos en el plan. DS/DO del patrón (o heredados
-                # por el cubridor con el bloque), y DS/DF de fijos y correturnos (fijos.py).
-                en_plan = plan.get((trab, d))
-                etiqueta = en_plan if en_plan in DESCANSOS else None
+                # por el cubridor con el bloque), y DS de fijos y correturnos (descansos.py).
+                en_plan = plan.get(trab, d)
+                etiqueta = en_plan if isinstance(en_plan, TipoDescanso) else None
 
                 if not datos.disponible(trab, d):
                     c.value, color = "V", FILL_VAC_XL
@@ -310,19 +314,19 @@ def escribir_excel(datos: Datos, plan: dict[tuple[str, date], str],
                 elif etiqueta is not None:
                     # Llevan su propio color en vez del color de categoría del día: qué día es
                     # (festivo, finde) se sigue leyendo en la cabecera de la columna.
-                    c.value, color = etiqueta, FILL_DESCANSO[etiqueta]
+                    c.value, color = etiqueta.value, FILL_DESCANSO[etiqueta]
                     c.font = negro
                 else:
-                    turno = plan.get((trab, d), "")
-                    # El festivo se mira con el municipio de SU turno de ese día, que es exacto; si
-                    # libra, con el municipio de referencia del trabajador.
-                    m = datos.turnos[turno].municipio if turno else muni[trab]
-                    c.value, color = turno, CAT_FILL[_categoria(datos, d, m)]
-                    if VER_FRANJAS and turno in datos.turnos:
-                        franja = datos.franja(turno)
+                    turno = en_plan or ""
+                    # El festivo se mira con la base de SU turno de ese día, que es exacto; si
+                    # libra, con la base del trabajador.
+                    b = datos.turnos[turno].base if turno else t.base
+                    c.value, color = turno, CAT_FILL[_categoria(datos, d, b)]
+                    if turno:
+                        franja = datos.turnos[turno].franja
                         color = FILL_FRANJA[franja]
-                        c.font = Font(bold=_categoria(datos, d, m) != "lv",
-                                      color="FFFFFF" if franja == "noche" else "000000")
+                        c.font = Font(bold=_categoria(datos, d, b) != "lv",
+                                      color="FFFFFF" if franja in LETRA_BLANCA else "000000")
                 c.fill = PatternFill("solid", fgColor=color)
             fila_de[trab] = r
             r += 1
@@ -376,7 +380,7 @@ def escribir_excel(datos: Datos, plan: dict[tuple[str, date], str],
         t = datos.turnos[s]
         ws.cell(fr, 1, f"dem {s}")
         for j, d in enumerate(fechas):
-            ws.cell(fr, COL_D0 + j, t.dem if datos.opera(s, d) else 0)
+            ws.cell(fr, COL_D0 + j, t.personas if datos.opera(s, d) else 0)
         ws.row_dimensions[fr].hidden = True
     titulos.update(range(dem_fila0, dem_fila0 + len(lineas)))
 
@@ -406,8 +410,8 @@ def escribir_excel(datos: Datos, plan: dict[tuple[str, date], str],
     ws2 = wb.create_sheet("Conversión Comité")
     ws2.cell(1, 1, "PLAN FUNCIONAL").font = Font(bold=True, size=12)
     PF_HDR = 2
-    CAMPOS = ("Línea", "Municipio", "LV", "Sábado", "Domingo", "Festivo", "Entrada", "Salida",
-              "Horas","Leyenda Comité")
+    CAMPOS = ("Línea", "Base", "LV", "Sábado", "Domingo", "Festivo", "Entrada", "Salida",
+              "Horas", "Franja", "Leyenda Comité")
     for k, titulo in enumerate(CAMPOS):
         c = ws2.cell(PF_HDR, 1 + k, titulo)
         c.alignment, c.font, c.border = centro, negrita, borde
@@ -416,8 +420,9 @@ def escribir_excel(datos: Datos, plan: dict[tuple[str, date], str],
     for i, s in enumerate(lineas):
         t, fr = datos.turnos[s], PF0 + i
         opera = sum(1 for d in fechas if datos.opera(s, d))
-        vals = (s, t.municipio, t.lv, t.sab, t.dom, t.fes,
-                f"{t.hora_entrada:%H:%M}", f"{t.hora_salida:%H:%M}", t.horas,None)
+        dias = [1 if tipo in t.dias else 0 for tipo in (TipoDia.LV, TipoDia.SABADO, TipoDia.DOMINGO, TipoDia.FESTIVO)]
+        vals = (s, t.base, *dias, f"{t.hora_entrada:%H:%M}", f"{t.hora_salida:%H:%M}",
+                t.minutos_computo / 60, t.franja.value, None)
         for k, v in enumerate(vals):
             c = ws2.cell(fr, 1 + k, v)
             c.alignment, c.border = (izq if k < 2 else centro), borde
@@ -501,6 +506,5 @@ def escribir_excel(datos: Datos, plan: dict[tuple[str, date], str],
     wb.save(ruta)
     # La carpeta de salida puede estar fuera del proyecto (la elige la interfaz vía HT_SALIDA).
     visible = ruta.relative_to(RAIZ) if ruta.is_relative_to(RAIZ) else ruta
-    print(f"\nCuadrante: {visible}  "
-          f"(asignaciones={len(plan)}, sin cubrir={n_deficit})")
+    print(f"\nCuadrante: {visible}  (sin cubrir={n_deficit})")
     return ruta

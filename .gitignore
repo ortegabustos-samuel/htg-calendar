@@ -6,3 +6,11 @@ __pycache__/
 *.pyc
 .superpowers/
 /escenarios/*
+
+# compilación de LaTeX (doc/): se versionan el .tex y el .pdf
+*.aux
+*.fdb_latexmk
+*.fls
+*.log
+*.out
+*.synctex.gz
